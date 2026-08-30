@@ -951,6 +951,20 @@ export function isThreadNotFoundError(error: unknown): boolean {
   return message.includes('thread not found') || message.includes('no rollout found for thread id')
 }
 
+/**
+ * Codex app-server uses these messages when another process already owns the
+ * local thread writer.  A resume request from a second browser is only trying
+ * to materialize the conversation for display, so it can safely downgrade to
+ * a read instead of surfacing a misleading HTTP 502.
+ */
+function isActiveThreadWriterError(error: unknown): boolean {
+  const message = getErrorMessage(error, '').toLowerCase()
+  return message.includes('already has an active writer')
+    || message.includes('already has a live local writer')
+    || message.includes('failed to acquire thread writer lock')
+    || message.includes('failed to acquire thread writer coordination lock')
+}
+
 function readStreamTurnId(params: Record<string, unknown>): string {
   const directTurnId = readNonEmptyString(params.turnId) || readNonEmptyString(params.turn_id)
   if (directTurnId) return directTurnId
@@ -8103,18 +8117,30 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             // second Codex writer lock.
             rpcResult = await appServer.rpc('thread/read', rpcParams)
           } else if (rpcThreadId && body.method === 'thread/resume') {
-            rpcResult = await threadBroker.runExclusive(rpcThreadId, async () => {
-              if (threadBroker.isWriterReady(rpcThreadId)) {
-                return await appServer.rpc('thread/read', rpcParams)
-              }
-              const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
-              threadBroker.markWriterReady(rpcThreadId)
-              return result
-            })
+            try {
+              rpcResult = await threadBroker.runExclusive(rpcThreadId, async () => {
+                if (threadBroker.isWriterReady(rpcThreadId)) {
+                  return await appServer.rpc('thread/read', rpcParams)
+                }
+                const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+                threadBroker.markWriterReady(rpcThreadId)
+                return result
+              })
+            } catch (error) {
+              if (!isActiveThreadWriterError(error)) throw error
+              // A different app-server process owns this thread.  Preserve the
+              // observer contract by returning the current read-only snapshot.
+              rpcResult = await appServer.rpc('thread/read', rpcParams)
+            }
           } else if (rpcThreadId && ['turn/steer', 'turn/interrupt', 'thread/rollback'].includes(body.method)) {
             rpcResult = await threadBroker.runExclusive(
               rpcThreadId,
-              async () => callRpcWithArchiveRecovery(appServer, body.method, rpcParams),
+              async () => {
+                await threadBroker.ensureWriterReady(rpcThreadId, async () => {
+                  await appServer.rpc('thread/resume', { threadId: rpcThreadId })
+                })
+                return await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+              },
             )
           } else {
             rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)

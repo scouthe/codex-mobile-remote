@@ -9,6 +9,7 @@ function installFakeSharedBridge(options: {
   blockResume?: boolean
   failFirstTurnStart?: boolean
   rejectDuplicateResume?: boolean
+  rejectResumeWithActiveWriter?: boolean
 } = {}) {
   const globalScope = globalThis as typeof globalThis & { __codexRemoteSharedBridge__?: unknown }
   const previous = globalScope.__codexRemoteSharedBridge__
@@ -23,6 +24,9 @@ function installFakeSharedBridge(options: {
     async rpc(method: string, params: unknown): Promise<unknown> {
       calls.push({ method, params })
       if (method === 'thread/resume') {
+        if (options.rejectResumeWithActiveWriter) {
+          throw new Error('thread already has an active writer')
+        }
         if (options.rejectDuplicateResume && calls.filter((call) => call.method === 'thread/resume').length > 1) {
           throw new Error('thread already has an active writer')
         }
@@ -167,6 +171,61 @@ describe('shared thread observer HTTP path', () => {
       expect(response.status).toBe(200)
       expect(fake.turnStartCalls).toBe(2)
       expect(fake.calls.filter((call) => call.method === 'thread/resume')).toHaveLength(1)
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+    }
+  })
+
+  it('materializes a read-only thread before a rollback mutation', async () => {
+    const fake = installFakeSharedBridge({ blockResume: false })
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/rpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          method: 'thread/rollback',
+          params: { threadId: 'shared-thread', numTurns: 1 },
+        }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(fake.calls.map((call) => call.method)).toEqual(['thread/resume', 'thread/rollback'])
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+    }
+  })
+
+  it('falls back to a read when another app-server owns the thread writer', async () => {
+    const fake = installFakeSharedBridge({ rejectResumeWithActiveWriter: true })
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/rpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: 'thread/resume', params: { threadId: 'shared-thread' } }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(fake.calls.map((call) => call.method)).toEqual(['thread/resume', 'thread/read'])
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
       instance.dispose()
