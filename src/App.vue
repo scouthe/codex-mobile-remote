@@ -523,7 +523,12 @@
         :style="contentStyle"
       >
         <span v-if="isVirtualKeyboardOpen" class="content-keyboard-spacer" aria-hidden="true" />
-        <ContentHeader :title="contentTitle" :accent="isSkillsRoute || isAutomationsRoute">
+        <ContentHeader
+          :title="contentTitle"
+          :accent="isSkillsRoute || isAutomationsRoute"
+          :status="isMobile && isSelectedThreadInProgress ? 'working' : undefined"
+          :status-label="t('Working')"
+        >
           <template #leading>
             <SidebarThreadControls
               v-if="isSidebarCollapsed || isMobile"

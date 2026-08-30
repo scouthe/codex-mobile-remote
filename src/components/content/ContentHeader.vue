@@ -4,6 +4,14 @@
       <slot name="leading" />
     </div>
     <h1 class="content-title" :class="{ 'is-accent': accent }" :title="title">{{ title }}</h1>
+    <span
+      v-if="status"
+      class="content-header-status-indicator"
+      :data-status="status"
+      role="status"
+      :aria-label="statusLabel || status"
+      :title="statusLabel || status"
+    />
     <div class="content-actions">
       <slot name="actions" />
     </div>
@@ -14,6 +22,8 @@
 defineProps<{
   title: string
   accent?: boolean
+  status?: 'working'
+  statusLabel?: string
 }>()
 </script>
 
@@ -36,6 +46,10 @@ defineProps<{
   @apply ml-auto flex shrink-0 items-center justify-end gap-1;
 }
 
+.content-header-status-indicator {
+  @apply inline-block h-3.5 w-3.5 shrink-0 rounded-full border-2 border-zinc-400 border-t-transparent animate-spin;
+}
+
 .content-leading {
   @apply flex shrink-0 items-center gap-1;
 }
@@ -46,5 +60,9 @@ defineProps<{
 
 :global(:root.dark) .content-title.is-accent {
   @apply text-zinc-100;
+}
+
+:global(:root.dark) .content-header-status-indicator {
+  @apply border-zinc-500 border-t-transparent;
 }
 </style>
