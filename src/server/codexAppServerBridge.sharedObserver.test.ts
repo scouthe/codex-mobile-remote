@@ -5,7 +5,11 @@ import { ThreadSessionBroker } from './threadSessionBroker.js'
 
 type RpcCall = { method: string; params: unknown }
 
-function installFakeSharedBridge() {
+function installFakeSharedBridge(options: {
+  blockResume?: boolean
+  failFirstTurnStart?: boolean
+  rejectDuplicateResume?: boolean
+} = {}) {
   const globalScope = globalThis as typeof globalThis & { __codexRemoteSharedBridge__?: unknown }
   const previous = globalScope.__codexRemoteSharedBridge__
   const calls: RpcCall[] = []
@@ -13,13 +17,22 @@ function installFakeSharedBridge() {
   const resumeGate = new Promise<void>((resolve) => {
     releaseResume = resolve
   })
+  let turnStartCalls = 0
   let generation = 1
   const appServer = {
     async rpc(method: string, params: unknown): Promise<unknown> {
       calls.push({ method, params })
       if (method === 'thread/resume') {
-        await resumeGate
+        if (options.rejectDuplicateResume && calls.filter((call) => call.method === 'thread/resume').length > 1) {
+          throw new Error('thread already has an active writer')
+        }
+        if (options.blockResume !== false) await resumeGate
         return { thread: { id: 'shared-thread', turns: [] } }
+      }
+      if (method === 'turn/start' && options.failFirstTurnStart) {
+        turnStartCalls += 1
+        if (turnStartCalls === 1) throw new Error('thread not found: shared-thread')
+        return { turn: { id: 'turn-2' } }
       }
       if (method === 'thread/read') {
         return { thread: { id: 'shared-thread', turns: [] } }
@@ -75,6 +88,7 @@ function installFakeSharedBridge() {
 
   return {
     calls,
+    get turnStartCalls() { return turnStartCalls },
     releaseResume,
     restore() {
       if (previous === undefined) delete globalScope.__codexRemoteSharedBridge__
@@ -118,6 +132,40 @@ describe('shared thread observer HTTP path', () => {
       expect(firstResponse.status).toBe(200)
       expect(secondResponse.status).toBe(200)
       expect(fake.calls.map((call) => call.method)).toContain('thread/read')
+      expect(fake.calls.filter((call) => call.method === 'thread/resume')).toHaveLength(1)
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+    }
+  })
+
+  it('does not duplicate resume during turn recovery after the writer is ready', async () => {
+    const fake = installFakeSharedBridge({
+      blockResume: false,
+      failFirstTurnStart: true,
+      rejectDuplicateResume: true,
+    })
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/rpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          method: 'turn/start',
+          params: { threadId: 'shared-thread', input: [{ type: 'text', text: 'hello' }] },
+        }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(fake.turnStartCalls).toBe(2)
       expect(fake.calls.filter((call) => call.method === 'thread/resume')).toHaveLength(1)
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))

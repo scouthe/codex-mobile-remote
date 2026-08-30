@@ -2523,6 +2523,7 @@ export async function callRpcWithArchiveRecovery(
   appServer: RpcExecutor,
   method: string,
   params: unknown,
+  options: { resumeThread?: (threadId: string) => Promise<void> } = {},
 ): Promise<unknown> {
   try {
     const result = await callRpcWithRateLimitDecodeRecovery(appServer, method, params)
@@ -2534,7 +2535,11 @@ export async function callRpcWithArchiveRecovery(
     const threadId = readNonEmptyString(paramsRecord?.threadId)
 
     if (method === 'turn/start' && threadId && isThreadNotFoundError(error)) {
-      await appServer.rpc('thread/resume', { threadId })
+      if (options.resumeThread) {
+        await options.resumeThread(threadId)
+      } else {
+        await appServer.rpc('thread/resume', { threadId })
+      }
       return appServer.rpc(method, params ?? null)
     }
 
@@ -8074,12 +8079,23 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           const rpcParams = body.params ?? null
           const rpcThreadId = readNonEmptyString(asRecord(rpcParams)?.threadId)
           if (rpcThreadId && body.method === 'turn/start') {
+            const ensureThreadWriter = (threadId: string) => threadBroker.ensureWriterReady(
+              threadId,
+              async () => {
+                await appServer.rpc('thread/resume', { threadId })
+              },
+            )
             rpcResult = await threadBroker.runTurn(
               rpcThreadId,
               async () => {
                 await appServer.rpc('thread/resume', { threadId: rpcThreadId })
               },
-              async () => callRpcWithArchiveRecovery(appServer, body.method, rpcParams),
+              async () => callRpcWithArchiveRecovery(appServer, body.method, rpcParams, {
+                // Recovery runs inside the same broker lock.  Reuse the
+                // generation-aware writer state instead of issuing a second
+                // thread/resume for the same client.
+                resumeThread: ensureThreadWriter,
+              }),
             )
           } else if (rpcThreadId && body.method === 'thread/resume' && threadBroker.isWriterReady(rpcThreadId)) {
             // A second browser opening an already materialized thread should
