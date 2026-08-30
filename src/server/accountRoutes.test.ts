@@ -104,4 +104,38 @@ describe('account routes with a Codex provider', () => {
     const data = res.json().data as { accounts: unknown[] }
     expect(data.accounts[0]).toMatchObject({ accountKind: 'codex-provider' })
   })
+
+  it('does not expose a nested profile provider as the active top-level Codex provider', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-mobile-account-'))
+    tempHomes.push(codexHome)
+    vi.stubEnv('CODEX_HOME', codexHome)
+    await writeFile(join(codexHome, 'config.toml'), [
+      '[profiles.work]',
+      'model_provider = "nested-provider"',
+      '',
+      '[model_providers.nested-provider]',
+      'name = "Nested API"',
+    ].join('\n'))
+
+    const appServer = {
+      rpc: vi.fn().mockResolvedValue({
+        config: {
+          model_provider: 'nested-provider',
+          model_providers: { 'nested-provider': { name: 'Nested API' } },
+        },
+      }),
+      listPendingServerRequests: () => [],
+      dispose: () => undefined,
+    }
+    const res = responseCapture()
+    await handleAccountRoutes(
+      { method: 'GET', url: '/codex-api/accounts' } as never,
+      res as never,
+      new URL('http://localhost/codex-api/accounts'),
+      { appServer },
+    )
+
+    expect(res.statusCode).toBe(200)
+    expect(res.json().data.accounts).toEqual([])
+  })
 })

@@ -404,6 +404,49 @@ type ConfiguredCodexProvider = {
   model: string | null
 }
 
+function stripTomlCommentForProvider(line: string): string {
+  let quote: 'single' | 'double' | null = null
+  let escaped = false
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]
+    if (quote === 'double' && escaped) {
+      escaped = false
+      continue
+    }
+    if (quote === 'double' && character === '\\') {
+      escaped = true
+      continue
+    }
+    if (character === '"' && quote !== 'single') {
+      quote = quote === 'double' ? null : 'double'
+      continue
+    }
+    if (character === "'" && quote !== 'double') {
+      quote = quote === 'single' ? null : 'single'
+      continue
+    }
+    if (character === '#' && !quote) return line.slice(0, index)
+  }
+  return line
+}
+
+function readTopLevelModelProvider(configRaw: string): string {
+  let inTopLevelTable = true
+  for (const rawLine of configRaw.split(/\r?\n/u)) {
+    const content = stripTomlCommentForProvider(rawLine).trim()
+    if (!content) continue
+    if (/^\[\[?[^\]]+\]?\]$/u.test(content)) {
+      inTopLevelTable = false
+      continue
+    }
+    if (!inTopLevelTable) continue
+    const match = content.match(/^(?:model_provider|"model_provider"|'model_provider')\s*=\s*(?:"([^"]*)"|'([^']*)')\s*$/u)
+    const provider = match?.[1] ?? match?.[2] ?? ''
+    if (provider.trim()) return provider.trim()
+  }
+  return ''
+}
+
 async function readConfiguredCodexProvider(appServer: AppServerLike): Promise<ConfiguredCodexProvider | null> {
   try {
     // The bridge may inject OpenRouter/Zen compatibility providers into the
@@ -411,7 +454,7 @@ async function readConfiguredCodexProvider(appServer: AppServerLike): Promise<Co
     // config.toml should be represented as the local Codex account row.
     const configPath = join(getCodexHomeDir(), 'config.toml')
     const configRaw = await readFile(configPath, 'utf8')
-    const configuredProvider = configRaw.match(/^\s*model_provider\s*=\s*["']([^"']+)["']/mu)?.[1]?.trim() ?? ''
+    const configuredProvider = readTopLevelModelProvider(configRaw)
     if (!configuredProvider) return null
 
     const payload = asRecord(await appServer.rpc('config/read', {}))
