@@ -136,6 +136,7 @@ describe('account routes with a Codex provider', () => {
     )
 
     expect(res.statusCode).toBe(200)
-    expect(res.json().data.accounts).toEqual([])
+    const data = res.json().data as { accounts: unknown[] }
+    expect(data.accounts).toEqual([])
   })
 })
