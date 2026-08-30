@@ -313,6 +313,10 @@ export type UiAccountEntry = {
   quotaError: string | null
   unavailableReason: UiAccountUnavailableReason | null
   isActive: boolean
+  /** `codex-provider` is a read-only view of the provider configured in Codex.
+   * It is not a switchable ChatGPT account and has no quota endpoint. */
+  accountKind?: 'chatgpt' | 'codex-provider'
+  providerId?: string | null
 }
 
 export type ChatMessage = {

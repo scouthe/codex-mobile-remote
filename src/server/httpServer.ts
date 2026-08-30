@@ -272,12 +272,26 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
         })
       })
 
-      wss.on('connection', (ws: WebSocket) => {
-        ws.send(JSON.stringify({ method: 'ready', params: { ok: true }, atIso: new Date().toISOString() }))
+      wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+        const url = new URL(req.url ?? '', 'http://localhost')
+        const afterSeqRaw = url.searchParams.get('afterSeq')?.trim() ?? ''
+        const afterSeq = afterSeqRaw ? Number.parseInt(afterSeqRaw, 10) : Number.NaN
         const unsubscribe = bridge.subscribeNotifications((notification) => {
           if (ws.readyState !== 1) return
           ws.send(JSON.stringify(notification))
         })
+
+        // Replay missed app-server events before the ready marker.  This
+        // preserves sequence ordering for clients reconnecting after a
+        // temporary Wi-Fi/Tailscale interruption.
+        if (Number.isFinite(afterSeq)) {
+          const replay = bridge.getStreamEventsSince(afterSeq)
+          for (const event of replay.events) {
+            if (ws.readyState !== 1) break
+            ws.send(JSON.stringify(event))
+          }
+        }
+        ws.send(JSON.stringify({ method: 'ready', params: { ok: true, ...bridge.getStreamCursor() }, atIso: new Date().toISOString() }))
 
         ws.on('close', unsubscribe)
         ws.on('error', unsubscribe)

@@ -533,6 +533,8 @@ function normalizeAccountEntry(
     unavailableReason: normalizeAccountUnavailableReason(record.unavailableReason)
       ?? (isPaymentRequiredErrorMessage(readString(record.quotaError)) ? 'payment_required' : null),
     isActive: readBoolean(record.isActive) ?? (storageId === activeStorageId || accountId === activeAccountId),
+    accountKind: record.accountKind === 'codex-provider' ? 'codex-provider' : 'chatgpt',
+    providerId: readString(record.providerId),
   }
 }
 
@@ -729,6 +731,22 @@ export type ThreadTurnPage = {
   turnIndexByTurnId: ThreadTurnIndexById
 }
 
+export type ThreadLiveState = {
+  model: string
+  modelProvider: string
+  messages: UiMessage[]
+  inProgress: boolean
+  activeTurnId: string
+  hasMoreOlder: boolean
+  turnIndexByTurnId: ThreadTurnIndexById
+  streamCursor: {
+    streamEpoch: string
+    latestSeq: number
+    oldestSeq: number | null
+  } | null
+  liveStateError: string | null
+}
+
 async function getThreadGroupsPageV2(cursor: string | null, limit: number): Promise<ThreadGroupsPage> {
   const payload = await callRpc<ThreadListResponse>('thread/list', {
     archived: false,
@@ -869,6 +887,62 @@ export async function getThreadDetail(threadId: string): Promise<{
     return await getThreadDetailV2(threadId)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load thread ${threadId}`, 'thread/read')
+  }
+}
+
+export async function getThreadLiveState(threadId: string): Promise<ThreadLiveState> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) {
+    throw new Error('Missing thread id')
+  }
+
+  try {
+    const response = await fetch(`/codex-api/thread-live-state?threadId=${encodeURIComponent(normalizedThreadId)}`)
+    const payload = await response.json() as unknown
+    if (!response.ok) {
+      throw new Error(`Live thread state request failed with ${response.status}`)
+    }
+
+    const record = asRecord(payload)
+    const thread = asRecord(record?.thread)
+    const conversationState = asRecord(record?.conversationState)
+    const turns = Array.isArray(conversationState?.turns)
+      ? conversationState.turns
+      : Array.isArray(thread?.turns)
+        ? thread.turns
+        : []
+    const threadPayload = {
+      thread: {
+        ...(thread ?? {}),
+        id: readString(thread?.id) ?? normalizedThreadId,
+        turns,
+      },
+      model: readString(record?.model) ?? readString(thread?.model) ?? '',
+      modelProvider: readString(record?.modelProvider) ?? readString(thread?.modelProvider) ?? '',
+      threadTurnStartIndex: typeof record?.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
+    } as unknown as ThreadReadResponse
+    const cursorRecord = asRecord(record?.streamCursor)
+    const streamCursor = cursorRecord && typeof cursorRecord.streamEpoch === 'string'
+      ? {
+        streamEpoch: cursorRecord.streamEpoch,
+        latestSeq: typeof cursorRecord.latestSeq === 'number' ? Math.floor(cursorRecord.latestSeq) : 0,
+        oldestSeq: typeof cursorRecord.oldestSeq === 'number' ? Math.floor(cursorRecord.oldestSeq) : null,
+      }
+      : null
+    const liveStateErrorRecord = asRecord(record?.liveStateError)
+    return {
+      model: normalizeThreadModelFromPayload(threadPayload),
+      modelProvider: normalizeThreadModelProviderFromPayload(threadPayload),
+      messages: normalizeThreadMessagesV2(threadPayload, readThreadTurnStartIndex(threadPayload)),
+      inProgress: record?.isInProgress === true || readThreadInProgressFromResponse(threadPayload),
+      activeTurnId: readActiveTurnIdFromResponse(threadPayload),
+      hasMoreOlder: readThreadTurnStartIndex(threadPayload) > 0,
+      turnIndexByTurnId: buildTurnIndexByTurnId(threadPayload, readThreadTurnStartIndex(threadPayload)),
+      streamCursor,
+      liveStateError: readString(liveStateErrorRecord?.message),
+    }
+  } catch (error) {
+    throw normalizeCodexApiError(error, `Failed to load live thread state ${normalizedThreadId}`, 'thread-live-state')
   }
 }
 
@@ -2643,6 +2717,32 @@ export async function setThreadQueueState(nextState: ThreadQueueState): Promise<
   })
   if (!response.ok) {
     throw new Error('Failed to save thread queue state')
+  }
+}
+
+export async function enqueueThreadMessage(
+  threadId: string,
+  message: StoredQueuedMessage,
+): Promise<{ inserted: boolean; queue: StoredQueuedMessage[] }> {
+  const response = await fetch('/codex-api/thread-queue/enqueue', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ threadId, message: normalizeStoredQueuedMessage(message) }),
+  })
+  const payload = await response.json() as unknown
+  if (!response.ok) {
+    throw new Error(getErrorMessageFromPayload(payload, 'Failed to enqueue thread message'))
+  }
+  const record = asRecord(payload)
+  const queue = Array.isArray(record?.data)
+    ? record.data.flatMap((item) => {
+      const normalized = normalizeStoredQueuedMessage(item)
+      return normalized ? [normalized] : []
+    })
+    : []
+  return {
+    inserted: record?.inserted === true,
+    queue,
   }
 }
 

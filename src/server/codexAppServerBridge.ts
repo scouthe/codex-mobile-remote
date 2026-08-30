@@ -41,6 +41,7 @@ import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { handleZenProxyRequest } from './zenProxy.js'
 import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
 import { ThreadTerminalManager } from './terminalManager.js'
+import { ThreadSessionBroker } from './threadSessionBroker.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
@@ -1050,6 +1051,21 @@ export async function hasUsableCodexAuth(): Promise<boolean> {
     const raw = await readFile(authPath, 'utf8')
     const auth = JSON.parse(raw) as CodexAuth
     return Boolean(auth.tokens?.access_token?.trim() || auth.tokens?.refresh_token?.trim())
+  } catch (error) {
+    if (getErrorCode(error) !== 'ENOENT') {
+      warnCodexAuthReadFailure(authPath, error)
+    }
+    return false
+  }
+}
+
+/** Official ChatGPT OAuth is the only mode with account/rate-limit metadata. */
+export async function hasChatgptAccountAuth(): Promise<boolean> {
+  const authPath = getCodexAuthPath()
+  try {
+    const raw = await readFile(authPath, 'utf8')
+    const auth = JSON.parse(raw) as CodexAuth
+    return Boolean(auth.tokens?.access_token?.trim() && auth.tokens?.account_id?.trim())
   } catch (error) {
     if (getErrorCode(error) !== 'ENOENT') {
       warnCodexAuthReadFailure(authPath, error)
@@ -4619,6 +4635,9 @@ export async function refreshChatgptAuthTokensForExternalAuth(
   const authPath = getCodexAuthPath()
   const raw = await readFile(authPath, 'utf8')
   const auth = JSON.parse(raw) as CodexAuth
+  if (!auth.tokens?.account_id?.trim()) {
+    throw new Error('ChatGPT OAuth account metadata is unavailable for the configured Codex provider.')
+  }
   const currentRefreshToken = auth.tokens?.refresh_token?.trim() ?? ''
   if (!currentRefreshToken) {
     throw new Error('No ChatGPT refresh token is available. Please sign in again.')
@@ -4707,6 +4726,16 @@ function hasUsableCodexAuthSync(): boolean {
     const raw = readFileSync(getCodexAuthPath(), 'utf8')
     const auth = JSON.parse(raw) as CodexAuth
     return Boolean(auth.tokens?.access_token?.trim())
+  } catch {
+    return false
+  }
+}
+
+function hasChatgptAccountAuthSync(): boolean {
+  try {
+    const raw = readFileSync(getCodexAuthPath(), 'utf8')
+    const auth = JSON.parse(raw) as CodexAuth
+    return Boolean(auth.tokens?.access_token?.trim() && auth.tokens?.account_id?.trim())
   } catch {
     return false
   }
@@ -5673,6 +5702,25 @@ async function appendThreadQueuedMessage(threadId: string, message: StoredQueued
   }))
 }
 
+async function enqueueThreadQueuedMessage(
+  threadId: string,
+  message: StoredQueuedMessage,
+): Promise<{ state: ThreadQueueState; inserted: boolean }> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) throw new Error('threadId is required')
+  return await withThreadQueueStateUpdate<{ state: ThreadQueueState; inserted: boolean }>((state) => {
+    const queue = state[normalizedThreadId] ?? []
+    if (queue.some((entry) => entry.id === message.id)) {
+      return { nextState: state, result: { state, inserted: false } }
+    }
+    const nextState = {
+      ...state,
+      [normalizedThreadId]: [...queue, message],
+    }
+    return { nextState, result: { state: nextState, inserted: true } }
+  })
+}
+
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
   const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
   return typeof value === 'string' && allowed.includes(value as ReasoningEffort)
@@ -6350,11 +6398,24 @@ async function fetchConnectorLogo(rawUrl: string): Promise<{ contentType: string
 }
 
 const STREAM_EVENT_BUFFER_LIMIT = 400
+const STREAM_EVENT_HISTORY_LIMIT = 2000
 
 type StreamEventFrame = {
+  seq: number
+  streamEpoch: string
+  threadId: string
   method: string
   params: unknown
   atIso: string
+}
+
+type AppServerNotification = {
+  method: string
+  params: unknown
+  seq?: number
+  streamEpoch?: string
+  threadId?: string
+  atIso?: string
 }
 
 type CapturedItem = {
@@ -6372,15 +6433,19 @@ const MERGEABLE_ITEM_TYPES = new Set([
 
 class AppServerProcess {
   private process: ChildProcessWithoutNullStreams | null = null
+  private processGeneration = 0
   private initialized = false
   private initializePromise: Promise<void> | null = null
   private readBuffer = ''
   private nextId = 1
   private stopping = false
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>()
-  private readonly notificationListeners = new Set<(value: { method: string; params: unknown }) => void>()
+  private readonly notificationListeners = new Set<(value: AppServerNotification) => void>()
   private readonly pendingServerRequests = new Map<number, PendingServerRequest>()
   private readonly streamEventsByThreadId = new Map<string, StreamEventFrame[]>()
+  private readonly streamEventHistory: StreamEventFrame[] = []
+  private streamEpoch = randomUUID()
+  private nextStreamSeq = 0
   private readonly lastThreadReadSnapshotByThreadId = new Map<string, unknown>()
   private readonly threadTurnPageReadCacheByThreadId = new Map<string, { result: unknown; expiresAt: number }>()
   private readonly threadTurnPageReadPromiseByThreadId = new Map<string, Promise<unknown>>()
@@ -6437,6 +6502,13 @@ class AppServerProcess {
     if (this.process) return
 
     this.stopping = false
+    this.processGeneration += 1
+    // A restarted child process starts a new event timeline.  Consumers can
+    // use the epoch to discard stale cursors and request a fresh snapshot.
+    this.streamEpoch = randomUUID()
+    this.nextStreamSeq = 0
+    this.streamEventsByThreadId.clear()
+    this.streamEventHistory.length = 0
     const config = this.buildAppServerConfig()
     this.activeConfigSignature = this.getAppServerConfigSignature(config)
     const invocation = getSpawnInvocation(this.getCodexCommand(), config.args)
@@ -6481,6 +6553,9 @@ class AppServerProcess {
       this.pending.clear()
       this.pendingServerRequests.clear()
       this.process = null
+      // Invalidate broker writer ownership immediately when the child exits;
+      // the next mutation must perform a fresh thread/resume.
+      this.processGeneration += 1
       this.initialized = false
       this.initializePromise = null
       this.readBuffer = ''
@@ -6532,15 +6607,21 @@ class AppServerProcess {
   }
 
   private emitNotification(notification: { method: string; params: unknown }): void {
-    this.recordStreamEvent(notification)
+    const frame = this.recordStreamEvent(notification)
     this.captureItemFromNotification(notification)
-    const nThreadId = this.extractThreadIdFromParams(notification.params)
+    const nThreadId = frame.threadId
     if (nThreadId) {
       this.invalidateLiveStateCache(nThreadId)
       this.threadTurnPageReadCacheByThreadId.delete(nThreadId)
     }
     for (const listener of this.notificationListeners) {
-      listener(notification)
+      listener({
+        ...notification,
+        seq: frame.seq,
+        streamEpoch: frame.streamEpoch,
+        threadId: frame.threadId || undefined,
+        atIso: frame.atIso,
+      })
     }
   }
 
@@ -6565,14 +6646,21 @@ class AppServerProcess {
     return ''
   }
 
-  private recordStreamEvent(notification: { method: string; params: unknown }): void {
+  private recordStreamEvent(notification: { method: string; params: unknown }): StreamEventFrame {
     const threadId = this.extractThreadIdFromParams(notification.params)
-    if (!threadId) return
     const frame: StreamEventFrame = {
+      seq: ++this.nextStreamSeq,
+      streamEpoch: this.streamEpoch,
+      threadId,
       method: notification.method,
       params: notification.params,
       atIso: new Date().toISOString(),
     }
+    this.streamEventHistory.push(frame)
+    if (this.streamEventHistory.length > STREAM_EVENT_HISTORY_LIMIT) {
+      this.streamEventHistory.splice(0, this.streamEventHistory.length - STREAM_EVENT_HISTORY_LIMIT)
+    }
+    if (!threadId) return frame
     let buffer = this.streamEventsByThreadId.get(threadId)
     if (!buffer) {
       buffer = []
@@ -6582,12 +6670,31 @@ class AppServerProcess {
     if (buffer.length > STREAM_EVENT_BUFFER_LIMIT) {
       buffer.splice(0, buffer.length - STREAM_EVENT_BUFFER_LIMIT)
     }
+    return frame
   }
 
   getStreamEvents(threadId: string, limit: number): StreamEventFrame[] {
     const buffer = this.streamEventsByThreadId.get(threadId)
     if (!buffer || buffer.length === 0) return []
     return buffer.slice(-limit)
+  }
+
+  getStreamCursor(): { streamEpoch: string; latestSeq: number; oldestSeq: number | null } {
+    return {
+      streamEpoch: this.streamEpoch,
+      latestSeq: this.nextStreamSeq,
+      oldestSeq: this.streamEventHistory[0]?.seq ?? null,
+    }
+  }
+
+  getStreamEventsSince(afterSeq: number, threadId = ''): { events: StreamEventFrame[]; truncated: boolean } {
+    const normalizedAfterSeq = Number.isFinite(afterSeq) ? Math.max(0, Math.floor(afterSeq)) : 0
+    const oldestSeq = this.streamEventHistory[0]?.seq ?? this.nextStreamSeq + 1
+    const truncated = normalizedAfterSeq > 0 && normalizedAfterSeq < oldestSeq - 1
+    const events = this.streamEventHistory.filter((frame) => (
+      frame.seq > normalizedAfterSeq && (!threadId || frame.threadId === threadId)
+    ))
+    return { events, truncated }
   }
 
   storeThreadReadSnapshot(threadId: string, snapshot: unknown): void {
@@ -6869,11 +6976,15 @@ class AppServerProcess {
     return this.call(method, params)
   }
 
-  onNotification(listener: (value: { method: string; params: unknown }) => void): () => void {
+  onNotification(listener: (value: AppServerNotification) => void): () => void {
     this.notificationListeners.add(listener)
     return () => {
       this.notificationListeners.delete(listener)
     }
+  }
+
+  getProcessGeneration(): number {
+    return this.processGeneration
   }
 
   async respondToServerRequest(payload: unknown): Promise<void> {
@@ -6918,6 +7029,7 @@ class AppServerProcess {
     const proc = this.process
     this.stopping = true
     this.process = null
+    this.processGeneration += 1
     this.initialized = false
     this.initializePromise = null
     this.activeConfigSignature = ''
@@ -6960,8 +7072,13 @@ export class BackendQueueProcessor {
   private readonly queueDrainTimersByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly queueDrainDueAtByThreadId = new Map<string, number>()
   private readonly unsubscribe: () => void
+  private readonly threadBroker: ThreadSessionBroker
 
-  constructor(private readonly appServer: AppServerProcess) {
+  constructor(
+    private readonly appServer: AppServerProcess,
+    threadBroker?: ThreadSessionBroker,
+  ) {
+    this.threadBroker = threadBroker ?? new ThreadSessionBroker(() => appServer.getProcessGeneration())
     this.unsubscribe = appServer.onNotification((notification) => {
       if (!isTurnCompletedNotification(notification)) return
       const threadId = extractThreadIdFromNotificationParams(notification.params)
@@ -7018,24 +7135,29 @@ export class BackendQueueProcessor {
     if (this.processingThreadIds.has(threadId)) return
     this.processingThreadIds.add(threadId)
     try {
-      const canStart = await this.canStartQueuedTurn(threadId)
-      if (!canStart) {
-        if (await this.hasQueuedTurns(threadId)) {
+      await this.threadBroker.runExclusive(threadId, async () => {
+        const canStart = await this.canStartQueuedTurn(threadId)
+        if (!canStart) {
+          if (await this.hasQueuedTurns(threadId)) {
+            this.scheduleThreadQueueDrain(threadId)
+          }
+          return
+        }
+        const next = await this.popNextQueuedTurn(threadId)
+        if (!next) return
+        try {
+          await this.threadBroker.ensureWriterReady(threadId, async () => {
+            await this.appServer.rpc('thread/resume', { threadId })
+          })
+          await this.startQueuedTurn(next)
+          if (await this.hasQueuedTurns(threadId)) {
+            this.scheduleThreadQueueDrain(threadId)
+          }
+        } catch {
+          await this.restoreQueuedTurn(next)
           this.scheduleThreadQueueDrain(threadId)
         }
-        return
-      }
-      const next = await this.popNextQueuedTurn(threadId)
-      if (!next) return
-      try {
-        await this.startQueuedTurn(next)
-        if (await this.hasQueuedTurns(threadId)) {
-          this.scheduleThreadQueueDrain(threadId)
-        }
-      } catch {
-        await this.restoreQueuedTurn(next)
-        this.scheduleThreadQueueDrain(threadId)
-      }
+      })
     } catch {
       // Queue processing is best-effort. Keep the bridge alive if app-server is unavailable.
       this.scheduleThreadQueueDrain(threadId)
@@ -7193,7 +7315,6 @@ export class BackendQueueProcessor {
   }
 
   private async startQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
-    await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
     await this.appServer.rpc('turn/start', await this.buildQueuedTurnParams(turn))
   }
 }
@@ -7313,7 +7434,9 @@ class MethodCatalog {
 
 type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
   dispose: () => void
-  subscribeNotifications: (listener: (value: { method: string; params: unknown; atIso: string }) => void) => () => void
+  subscribeNotifications: (listener: (value: AppServerNotification & { atIso: string }) => void) => () => void
+  getStreamCursor: () => { streamEpoch: string; latestSeq: number; oldestSeq: number | null }
+  getStreamEventsSince: (afterSeq: number, threadId?: string) => { events: StreamEventFrame[]; truncated: boolean }
 }
 
 type SharedBridgeState = {
@@ -7323,10 +7446,11 @@ type SharedBridgeState = {
   methodCatalog: MethodCatalog
   telegramBridge: TelegramThreadBridge
   backendQueueProcessor: BackendQueueProcessor
+  threadBroker: ThreadSessionBroker
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'experimental-api-v2'
+const SHARED_BRIDGE_VERSION = 'experimental-api-v3'
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -7335,7 +7459,7 @@ function getSharedBridgeState(): SharedBridgeState {
 
   const existing = globalScope[SHARED_BRIDGE_KEY]
   if (existing) {
-    if (existing.version === SHARED_BRIDGE_VERSION && existing.terminalManager) {
+    if (existing.version === SHARED_BRIDGE_VERSION && existing.terminalManager && existing.threadBroker) {
       return existing
     }
     existing.appServer.dispose()
@@ -7345,14 +7469,17 @@ function getSharedBridgeState(): SharedBridgeState {
 
   const appServer = new AppServerProcess()
   const terminalManager = new ThreadTerminalManager()
-  const backendQueueProcessor = new BackendQueueProcessor(appServer)
+  const threadBroker = new ThreadSessionBroker(() => appServer.getProcessGeneration())
+  const backendQueueProcessor = new BackendQueueProcessor(appServer, threadBroker)
   const created: SharedBridgeState = {
     version: SHARED_BRIDGE_VERSION,
     appServer,
     terminalManager,
     methodCatalog: new MethodCatalog(),
     backendQueueProcessor,
+    threadBroker,
     telegramBridge: new TelegramThreadBridge(appServer, {
+      threadBroker,
       onChatSeen: (chatId) => {
         void rememberTelegramChatId(chatId).catch(() => {})
       },
@@ -7439,7 +7566,7 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
 }
 
 export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
-  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor } = getSharedBridgeState()
+  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor, threadBroker } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 
@@ -7937,14 +8064,45 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 	          return
 	        }
 
-	        if (body.method === 'account/rateLimits/read' && !(await hasUsableCodexAuth())) {
+        if (body.method === 'account/rateLimits/read' && !(await hasChatgptAccountAuth())) {
 	          setJson(res, 200, { result: null })
 	          return
 	        }
 
         let rpcResult: unknown
         try {
-          rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
+          const rpcParams = body.params ?? null
+          const rpcThreadId = readNonEmptyString(asRecord(rpcParams)?.threadId)
+          if (rpcThreadId && body.method === 'turn/start') {
+            rpcResult = await threadBroker.runTurn(
+              rpcThreadId,
+              async () => {
+                await appServer.rpc('thread/resume', { threadId: rpcThreadId })
+              },
+              async () => callRpcWithArchiveRecovery(appServer, body.method, rpcParams),
+            )
+          } else if (rpcThreadId && body.method === 'thread/resume' && threadBroker.isWriterReady(rpcThreadId)) {
+            // A second browser opening an already materialized thread should
+            // receive its read-only state instead of attempting to acquire a
+            // second Codex writer lock.
+            rpcResult = await appServer.rpc('thread/read', rpcParams)
+          } else if (rpcThreadId && body.method === 'thread/resume') {
+            rpcResult = await threadBroker.runExclusive(rpcThreadId, async () => {
+              if (threadBroker.isWriterReady(rpcThreadId)) {
+                return await appServer.rpc('thread/read', rpcParams)
+              }
+              const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+              threadBroker.markWriterReady(rpcThreadId)
+              return result
+            })
+          } else if (rpcThreadId && ['turn/steer', 'turn/interrupt', 'thread/rollback'].includes(body.method)) {
+            rpcResult = await threadBroker.runExclusive(
+              rpcThreadId,
+              async () => callRpcWithArchiveRecovery(appServer, body.method, rpcParams),
+            )
+          } else {
+            rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+          }
         } catch (error) {
 	          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
 	            setJson(res, 200, { result: null })
@@ -8096,12 +8254,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const threadId = url.searchParams.get('threadId')?.trim() ?? ''
         const limitRaw = url.searchParams.get('limit')?.trim() ?? '80'
         const limit = Math.max(1, Math.min(400, Number.parseInt(limitRaw, 10) || 80))
-        if (!threadId) {
-          setJson(res, 400, { error: 'Missing threadId' })
+        const afterSeqRaw = url.searchParams.get('afterSeq')?.trim() ?? ''
+        const afterSeq = afterSeqRaw ? Number.parseInt(afterSeqRaw, 10) : Number.NaN
+        if (Number.isFinite(afterSeq)) {
+          const replay = appServer.getStreamEventsSince(afterSeq, threadId)
+          setJson(res, 200, {
+            events: replay.events.slice(-limit),
+            truncated: replay.truncated,
+            cursor: appServer.getStreamCursor(),
+          })
           return
         }
         const events = appServer.getStreamEvents(threadId, limit)
-        setJson(res, 200, { events })
+        setJson(res, 200, { events, cursor: appServer.getStreamCursor(), truncated: false })
         return
       }
 
@@ -8155,12 +8320,17 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
           const responseData = {
             threadId,
+            thread: {
+              ...thread,
+              turns,
+            },
             conversationState: {
               turns,
             },
             ownerClientId: null,
             liveStateError: null,
             isInProgress,
+            streamCursor: appServer.getStreamCursor(),
           }
 
           if (!isInProgress) {
@@ -8176,6 +8346,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               ownerClientId: null,
               liveStateError: null,
               isInProgress: true,
+              streamCursor: appServer.getStreamCursor(),
             })
             return
           }
@@ -8195,6 +8366,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 message: getErrorMessage(error, 'thread/read failed'),
               },
               isInProgress: false,
+              streamCursor: appServer.getStreamCursor(),
             })
           } else {
             setJson(res, 200, {
@@ -8206,6 +8378,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 message: getErrorMessage(error, 'thread/read failed'),
               },
               isInProgress: false,
+              streamCursor: appServer.getStreamCursor(),
             })
           }
         }
@@ -8288,7 +8461,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
       if (req.method === 'POST' && url.pathname === '/codex-api/transcribe') {
         const auth = await readCodexAuth()
-        if (!auth) {
+        if (!auth || !auth.accountId) {
           setJson(res, 401, { error: 'No auth token available for transcription' })
           return
         }
@@ -8478,6 +8651,27 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-queue-state') {
         const state = await readThreadQueueState()
         setJson(res, 200, { data: state })
+        return
+      }
+
+      if (req.method === 'POST' && url.pathname === '/codex-api/thread-queue/enqueue') {
+        const payload = asRecord(await readJsonBody(req))
+        const threadId = readNonEmptyString(payload?.threadId)
+        const rawMessage = asRecord(payload?.message) ?? payload
+        const messageId = readNonEmptyString(rawMessage?.id)
+          || `web-${Date.now()}-${randomBytes(3).toString('hex')}`
+        const message = normalizeStoredQueuedMessage({ ...rawMessage, id: messageId })
+        if (!threadId || !message) {
+          setJson(res, 400, { error: 'Missing threadId or valid queued message' })
+          return
+        }
+        const result = await enqueueThreadQueuedMessage(threadId, message)
+        backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
+        setJson(res, 200, {
+          queued: true,
+          inserted: result.inserted,
+          data: result.state[threadId] ?? [],
+        })
         return
       }
 
@@ -9594,12 +9788,27 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         res.setHeader('Connection', 'keep-alive')
         res.setHeader('X-Accel-Buffering', 'no')
 
-        const unsubscribe = middleware.subscribeNotifications((notification: { method: string; params: unknown; atIso: string }) => {
+        const unsubscribe = middleware.subscribeNotifications((notification: { method: string; params: unknown; atIso: string; seq?: number }) => {
           if (res.writableEnded || res.destroyed) return
+          if (typeof notification.seq === 'number') {
+            res.write(`id: ${notification.seq}\n`)
+          }
           res.write(`data: ${JSON.stringify(notification)}\n\n`)
         })
 
-        res.write(`event: ready\ndata: ${JSON.stringify({ ok: true })}\n\n`)
+        const requestedAfterSeq = Number.parseInt(
+          url.searchParams.get('afterSeq')?.trim() || String(req.headers['last-event-id'] ?? ''),
+          10,
+        )
+        if (Number.isFinite(requestedAfterSeq)) {
+          const replay = middleware.getStreamEventsSince(requestedAfterSeq)
+          for (const event of replay.events) {
+            if (res.writableEnded || res.destroyed) break
+            res.write(`id: ${event.seq}\n`)
+            res.write(`data: ${JSON.stringify(event)}\n\n`)
+          }
+        }
+        res.write(`event: ready\ndata: ${JSON.stringify({ ok: true, ...appServer.getStreamCursor() })}\n\n`)
         const keepAlive = setInterval(() => {
           res.write(': ping\n\n')
         }, 15000)
@@ -9629,15 +9838,16 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
     telegramBridge.stop()
     terminalManager.dispose()
     backendQueueProcessor.dispose()
+    threadBroker.clearWriterState()
     appServer.dispose()
   }
   middleware.subscribeNotifications = (
-    listener: (value: { method: string; params: unknown; atIso: string }) => void,
+    listener: (value: AppServerNotification & { atIso: string }) => void,
   ) => {
-    const unsubscribeAppServer = appServer.onNotification((notification: { method: string; params: unknown }) => {
+    const unsubscribeAppServer = appServer.onNotification((notification: AppServerNotification) => {
       listener({
         ...notification,
-        atIso: new Date().toISOString(),
+        atIso: notification.atIso ?? new Date().toISOString(),
       })
     })
     const unsubscribeTerminal = terminalManager.subscribe((notification) => {
@@ -9651,6 +9861,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       unsubscribeTerminal()
     }
   }
+
+  middleware.getStreamCursor = () => appServer.getStreamCursor()
+  middleware.getStreamEventsSince = (afterSeq: number, threadId = '') => appServer.getStreamEventsSince(afterSeq, threadId)
 
   return middleware
 }

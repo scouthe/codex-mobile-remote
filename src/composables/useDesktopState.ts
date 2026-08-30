@@ -11,6 +11,7 @@ import {
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
+  getThreadLiveState,
   getOlderThreadMessages,
   getBackgroundThreadListLimit,
   interruptThreadTurn,
@@ -20,6 +21,7 @@ import {
   rollbackThread,
   getThreadGroupsPage,
   getThreadQueueState,
+  enqueueThreadMessage,
   getWorkspaceRootsState,
   setCodexSpeedMode,
   setThreadQueueState,
@@ -1510,6 +1512,8 @@ export function useDesktopState() {
     return ''
   }
   let stopNotificationStream: (() => void) | null = null
+  let lastStreamEpoch = ''
+  let lastStreamSeq = 0
   let eventSyncTimer: number | null = null
   let rateLimitRefreshTimer: number | null = null
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
@@ -4359,7 +4363,7 @@ export function useDesktopState() {
     await loadThreadsPromise
   }
 
-  async function loadMessages(threadId: string, options: { silent?: boolean } = {}) {
+  async function loadMessages(threadId: string, options: { silent?: boolean; force?: boolean } = {}) {
     if (!threadId) {
       return
     }
@@ -4388,7 +4392,7 @@ export function useDesktopState() {
       const loadedRecently =
         Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
       const canReuseLoadedMessages =
-        alreadyLoaded &&
+        options.force !== true && alreadyLoaded &&
         (
           loadedRecently ||
           (
@@ -4402,9 +4406,23 @@ export function useDesktopState() {
         return
       }
 
-      const needsResume = resumedThreadById.value[threadId] !== true
-      const resumedThread = needsResume ? await resumeThread(threadId) : null
-      const detail = resumedThread ?? await getThreadDetail(threadId)
+      // Loading an existing thread is a read-only operation.  Calling
+      // thread/resume here makes every browser tab a Codex writer and causes
+      // the app-server's active-writer lock when a second device opens the
+      // same in-progress thread.  Writes still resume explicitly in
+      // startTurnForThread below, behind the server-side writer path.
+      let detail = await getThreadDetail(threadId)
+      if (detail.inProgress) {
+        try {
+          // The live endpoint merges the app-server snapshot with items and
+          // command output observed since the last persisted read.  It is a
+          // read-only supplement and must never resume the thread.
+          detail = await getThreadLiveState(threadId)
+        } catch {
+          // Keep the ordinary thread/read result when the live cache is
+          // temporarily unavailable.
+        }
+      }
 
       if (detail.modelProvider) {
         setThreadModelProviderId(threadId, detail.modelProvider)
@@ -4412,13 +4430,6 @@ export function useDesktopState() {
       if (detail.model) {
         setThreadModelId(threadId, resolveThreadModelForProvider(threadId, detail.model, detail.modelProvider))
       }
-      if (resumedThread) {
-        resumedThreadById.value = {
-          ...resumedThreadById.value,
-          [threadId]: true,
-        }
-      }
-
       const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
@@ -4861,11 +4872,7 @@ export function useDesktopState() {
     if (isInProgress && mode === 'queue') {
       const queue = queuedMessagesByThreadId.value[threadId] ?? []
       const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      const nextQueue = [...queue]
-      const insertIndex = typeof queueInsertIndex === 'number'
-        ? Math.max(0, Math.min(queueInsertIndex, nextQueue.length))
-        : nextQueue.length
-      nextQueue.splice(insertIndex, 0, {
+      const queuedMessage = {
         id,
         text: nextText,
         imageUrls,
@@ -4876,7 +4883,30 @@ export function useDesktopState() {
           : collaborationModeOverride === 'default'
             ? 'default'
             : selectedCollaborationMode.value,
-      })
+      } satisfies QueuedMessage
+
+      // A plain append is sent through the server's atomic queue endpoint so
+      // that two browser clients cannot overwrite each other's queued work.
+      // Keep the existing whole-state path for explicit drag/drop insertion,
+      // and as a compatibility fallback for older bridge versions.
+      if (typeof queueInsertIndex !== 'number') {
+        try {
+          const result = await enqueueThreadMessage(threadId, queuedMessage)
+          queuedMessagesByThreadId.value = {
+            ...queuedMessagesByThreadId.value,
+            [threadId]: result.queue,
+          }
+          return
+        } catch {
+          // Fall through to the local update and best-effort persistence.
+        }
+      }
+
+      const nextQueue = [...queue]
+      const insertIndex = typeof queueInsertIndex === 'number'
+        ? Math.max(0, Math.min(queueInsertIndex, nextQueue.length))
+        : nextQueue.length
+      nextQueue.splice(insertIndex, 0, queuedMessage)
       queuedMessagesByThreadId.value = {
         ...queuedMessagesByThreadId.value,
         [threadId]: nextQueue,
@@ -5483,7 +5513,7 @@ export function useDesktopState() {
         (shouldRefreshThreads && loadedMessagesByThreadId.value[activeThreadId] !== true)
 
       if (shouldRefreshActiveThread) {
-        await loadMessages(activeThreadId, { silent: true })
+        await loadMessages(activeThreadId, { silent: true, force: true })
       }
     } catch {
       // Keep UI stable on transient event sync failures.
@@ -5506,10 +5536,9 @@ export function useDesktopState() {
   async function recoverBridgeState(): Promise<void> {
     await loadPendingServerRequestsFromBridge()
     pendingThreadsRefresh = !hasLoadedThreads.value
-    if (
-      selectedThreadId.value &&
-      loadedMessagesByThreadId.value[selectedThreadId.value] !== true
-    ) {
+    if (selectedThreadId.value) {
+      // A reconnect/gap means notifications may have been missed even when
+      // the thread was already loaded, so force a read-only snapshot refresh.
       pendingThreadMessageRefresh.add(selectedThreadId.value)
     }
     await syncFromNotifications()
@@ -5522,9 +5551,32 @@ export function useDesktopState() {
     void loadPendingServerRequestsFromBridge()
     stopNotificationStream = subscribeCodexNotifications((notification) => {
       if (notification.method === 'ready') {
+        const readyParams = asRecord(notification.params)
+        const readyEpoch = typeof readyParams?.streamEpoch === 'string' ? readyParams.streamEpoch : ''
+        const readySeq = typeof readyParams?.latestSeq === 'number' && Number.isFinite(readyParams.latestSeq)
+          ? Math.floor(readyParams.latestSeq)
+          : 0
+        if (readyEpoch) lastStreamEpoch = readyEpoch
+        if (readySeq > lastStreamSeq) lastStreamSeq = readySeq
         clearAllTransientTurnErrors()
         void recoverBridgeState()
         return
+      }
+
+      if (typeof notification.seq === 'number' && Number.isFinite(notification.seq)) {
+        const nextSeq = Math.floor(notification.seq)
+        const nextEpoch = notification.streamEpoch ?? ''
+        const epochChanged = Boolean(nextEpoch && lastStreamEpoch && nextEpoch !== lastStreamEpoch)
+        const sequenceGap = !epochChanged && lastStreamSeq > 0 && nextSeq > lastStreamSeq + 1
+        if (epochChanged || sequenceGap) {
+          lastStreamEpoch = nextEpoch || lastStreamEpoch
+          lastStreamSeq = nextSeq
+          void recoverBridgeState()
+          return
+        }
+        if (nextEpoch) lastStreamEpoch = nextEpoch
+        if (nextSeq <= lastStreamSeq) return
+        lastStreamSeq = nextSeq
       }
       applyRealtimeUpdates(notification)
       queueEventDrivenSync(notification)

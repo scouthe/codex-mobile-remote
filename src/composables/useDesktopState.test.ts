@@ -21,6 +21,8 @@ const gatewayMocks = vi.hoisted(() => ({
   getPendingServerRequests: vi.fn(),
   getSkillsList: vi.fn(),
   getThreadDetail: vi.fn(),
+  getThreadLiveState: vi.fn(),
+  enqueueThreadMessage: vi.fn(),
   getThreadGroupsPage: vi.fn(),
   getThreadQueueState: vi.fn(),
   getThreadTitleCache: vi.fn(),
@@ -81,6 +83,7 @@ function installTestWindow(initialStorage: Record<string, string> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  gatewayMocks.getThreadLiveState.mockRejectedValue(new Error('live state not configured in test'))
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
@@ -619,6 +622,46 @@ describe('startup request deduplication', () => {
 })
 
 describe('live error overlay', () => {
+  it('loads an existing thread through read-only detail without resuming it', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('observer-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getAvailableCollaborationModes.mockResolvedValue([{ value: 'default', label: 'Default' }])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.getAccountRateLimits.mockResolvedValue(null)
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({
+      model: 'gpt-5.5',
+      providerId: '',
+      reasoningEffort: 'medium',
+      speedMode: 'standard',
+    })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5'])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [{
+        id: 'assistant-1',
+        role: 'assistant',
+        text: 'already running',
+        messageType: 'agentMessage',
+      }],
+      inProgress: true,
+      activeTurnId: 'turn-1',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('observer-thread')
+    await state.refreshAll({ includeSelectedThreadMessages: true, awaitAncillaryRefreshes: true })
+
+    expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('observer-thread')
+    expect(state.messages.value.map((message) => message.text)).toContain('already running')
+  })
+
   it('shows the default thinking overlay while a selected thread is in progress without activity events', async () => {
     installTestWindow()
     gatewayMocks.getPendingServerRequests.mockResolvedValue([])
@@ -647,6 +690,48 @@ describe('live error overlay', () => {
       reasoningText: '',
       errorText: '',
     })
+  })
+
+  it('atomically appends queued messages through the bridge', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('queued-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getAvailableCollaborationModes.mockResolvedValue([{ value: 'default', label: 'Default' }])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.getAccountRateLimits.mockResolvedValue(null)
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({
+      model: 'gpt-5.5',
+      providerId: '',
+      reasoningEffort: 'medium',
+      speedMode: 'standard',
+    })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5'])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: true,
+      activeTurnId: 'turn-1',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.enqueueThreadMessage.mockImplementation(async (_threadId, message) => ({
+      inserted: true,
+      queue: [message],
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('queued-thread')
+    await state.refreshAll({ includeSelectedThreadMessages: true, awaitAncillaryRefreshes: true })
+    await state.sendMessageToSelectedThread('run after current task', [], [], 'queue')
+
+    expect(gatewayMocks.enqueueThreadMessage).toHaveBeenCalledWith(
+      'queued-thread',
+      expect.objectContaining({ text: 'run after current task' }),
+    )
+    expect(state.selectedThreadQueuedMessages.value).toHaveLength(1)
   })
 
   it('keeps a new live error visible when an older persisted turn error exists', async () => {
@@ -911,7 +996,7 @@ describe('provider model selection', () => {
       }
       return ['gpt-5.5', 'gpt-5.4-mini']
     })
-    gatewayMocks.resumeThread.mockResolvedValue({
+    gatewayMocks.getThreadDetail.mockResolvedValue({
       model: 'gpt-5.4-mini',
       modelProvider: 'opencode_zen',
       messages: [],
@@ -967,7 +1052,7 @@ describe('provider model selection', () => {
       }
       return ['gpt-5.5', 'gpt-5.4-mini']
     })
-    gatewayMocks.resumeThread.mockResolvedValue({
+    gatewayMocks.getThreadDetail.mockResolvedValue({
       model: 'gpt-5.4-mini',
       modelProvider: 'opencode_zen',
       messages: [],
@@ -1152,7 +1237,7 @@ describe('provider model selection', () => {
       speedMode: 'standard',
     })
     gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5', 'gpt-5.4-mini'])
-    gatewayMocks.resumeThread.mockRejectedValue(new Error('thread not found'))
+    gatewayMocks.getThreadDetail.mockRejectedValue(new Error('thread not found'))
 
     const state = useDesktopState()
     state.primeSelectedThread('missing-thread')
@@ -1167,7 +1252,7 @@ describe('provider model selection', () => {
 
     await state.ensureThreadMessagesLoaded('missing-thread', { silent: true })
     await state.loadMessages('missing-thread')
-    expect(gatewayMocks.resumeThread).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
   })
 })
 

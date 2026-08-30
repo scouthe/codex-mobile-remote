@@ -197,6 +197,7 @@
                     </div>
                     <div class="sidebar-settings-account-actions">
                       <button
+                        v-if="account.accountKind !== 'codex-provider'"
                         class="sidebar-settings-account-switch"
                         type="button"
                         :disabled="isAccountActionDisabled(account) || account.isActive || isAccountUnavailable(account)"
@@ -205,6 +206,7 @@
                         {{ getAccountSwitchLabel(account) }}
                       </button>
                       <button
+                        v-if="account.accountKind !== 'codex-provider'"
                         class="sidebar-settings-account-remove"
                         :class="{
                           'is-visible': isRemoveVisible(account),
@@ -2459,6 +2461,9 @@ function shortAccountId(accountId: string): string {
 }
 
 function formatAccountMeta(account: UiAccountEntry): string {
+  if (account.accountKind === 'codex-provider') {
+    return `Codex provider · ${account.providerId || account.planType || 'configured'}`
+  }
   const segments = [account.planType || t('unknown')]
   if (account.authMode) {
     segments.unshift(account.authMode)
@@ -2540,6 +2545,9 @@ function formatResetDateCompact(resetsAt: number | null): string {
 }
 
 function formatAccountQuota(account: UiAccountEntry): string {
+  if (account.accountKind === 'codex-provider') {
+    return 'Quota is managed by the configured Codex provider'
+  }
   if (isAccountUnavailable(account)) {
     return account.quotaError || t('402 Payment Required')
   }

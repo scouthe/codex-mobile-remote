@@ -10,6 +10,9 @@ export type RpcNotification = {
   method: string
   params: unknown
   atIso: string
+  seq?: number
+  streamEpoch?: string
+  threadId?: string
 }
 
 type ServerRequestReplyBody = {
@@ -142,6 +145,9 @@ function toNotification(value: unknown): RpcNotification | null {
     method: record.method,
     params: record.params ?? null,
     atIso,
+    seq: typeof record.seq === 'number' && Number.isFinite(record.seq) ? Math.floor(record.seq) : undefined,
+    streamEpoch: typeof record.streamEpoch === 'string' ? record.streamEpoch : undefined,
+    threadId: typeof record.threadId === 'string' ? record.threadId : undefined,
   }
 }
 
@@ -164,6 +170,7 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
   let cleanup: (() => void) | null = null
   let closed = false
   let reconnectTimer: number | null = null
+  let lastStreamSeq = 0
 
   const clearReconnectTimer = () => {
     if (reconnectTimer === null) return
@@ -182,6 +189,10 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
   }
 
   const handleNotificationPayload = (payload: unknown) => {
+    const record = asRecord(payload)
+    if (typeof record?.seq === 'number' && Number.isFinite(record.seq)) {
+      lastStreamSeq = Math.max(lastStreamSeq, Math.floor(record.seq))
+    }
     const notification = toNotification(payload)
     if (notification) {
       onNotification(notification)
@@ -191,7 +202,8 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
   const attachSse = (attempt = 0) => {
     if (typeof EventSource === 'undefined' || closed) return
     cleanup?.()
-    const source = new EventSource('/codex-api/events')
+    const query = lastStreamSeq > 0 ? `?afterSeq=${encodeURIComponent(String(lastStreamSeq))}` : ''
+    const source = new EventSource(`/codex-api/events${query}`)
     let isConnectionClosed = false
 
     source.onmessage = (event) => {
@@ -205,6 +217,10 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
     source.addEventListener('ready', (event: MessageEvent<string>) => {
       try {
         const parsed = event.data ? JSON.parse(event.data) as unknown : { ok: true }
+        const record = asRecord(parsed)
+        if (typeof record?.latestSeq === 'number' && Number.isFinite(record.latestSeq)) {
+          lastStreamSeq = Math.max(lastStreamSeq, Math.floor(record.latestSeq))
+        }
         emitReadyNotification(onNotification, parsed)
       } catch {
         emitReadyNotification(onNotification)
@@ -234,7 +250,8 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
 
     cleanup?.()
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const socket = new WebSocket(`${protocol}//${window.location.host}/codex-api/ws`)
+    const query = lastStreamSeq > 0 ? `?afterSeq=${encodeURIComponent(String(lastStreamSeq))}` : ''
+    const socket = new WebSocket(`${protocol}//${window.location.host}/codex-api/ws${query}`)
     let didOpen = false
     let intentionallyClosed = false
     let fallbackTimer: number | null = window.setTimeout(() => {
@@ -255,7 +272,17 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
 
     socket.onmessage = (event) => {
       try {
-        handleNotificationPayload(JSON.parse(String(event.data)) as unknown)
+        const payload = JSON.parse(String(event.data)) as unknown
+        const record = asRecord(payload)
+        if (typeof record?.seq === 'number' && Number.isFinite(record.seq)) {
+          lastStreamSeq = Math.max(lastStreamSeq, Math.floor(record.seq))
+        } else if (record?.method === 'ready') {
+          const params = asRecord(record.params)
+          if (typeof params?.latestSeq === 'number' && Number.isFinite(params.latestSeq)) {
+            lastStreamSeq = Math.max(lastStreamSeq, Math.floor(params.latestSeq))
+          }
+        }
+        handleNotificationPayload(payload)
       } catch {
         // Ignore malformed event payloads and keep stream alive.
       }
