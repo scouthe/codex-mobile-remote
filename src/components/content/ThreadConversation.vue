@@ -1314,6 +1314,8 @@ const props = defineProps<{
   activeThreadId: string
   cwd: string
   hasMorePersistedAbove?: boolean
+  /** Large observer sessions should load older pages only on explicit action. */
+  deferAutoLoadPersistedAbove?: boolean
   isLoadingPersistedAbove?: boolean
   loadEarlierMessages?: (threadId: string) => Promise<void>
 }>()
@@ -4426,7 +4428,12 @@ function onConversationScroll(): void {
   const container = conversationListRef.value
   if (!container || props.isLoading) return
   autoFollowOutput.value = isAtBottom(container)
-  if (hasMoreAbove.value && !isLoadingMore.value && container.scrollTop < LOAD_MORE_SCROLL_THRESHOLD_PX) {
+  if (
+    !props.deferAutoLoadPersistedAbove
+    && hasMoreAbove.value
+    && !isLoadingMore.value
+    && container.scrollTop < LOAD_MORE_SCROLL_THRESHOLD_PX
+  ) {
     void loadMoreAbove()
   }
 }

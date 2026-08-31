@@ -991,6 +991,7 @@
                     :live-overlay="liveOverlay"
                     :pending-requests="selectedThreadServerRequests"
                     :has-more-persisted-above="hasMoreOlderMessages"
+                    :defer-auto-load-persisted-above="deferAutoLoadPersistedAbove"
                     :is-loading-persisted-above="isLoadingOlderMessages"
                     :load-earlier-messages="loadOlderMessages"
                     @fork-thread="onForkThreadFromMessage"
@@ -1437,6 +1438,7 @@ const {
   accountRateLimitSnapshots,
   messages,
   hasMoreOlderMessages,
+  deferAutoLoadPersistedAbove,
   isLoadingThreads,
   isThreadListFullyLoaded,
   isLoadingMessages,

@@ -1671,6 +1671,7 @@ export function useDesktopState() {
     terminalState?: 'completed' | 'failed' | 'canceled' | ''
     terminalError?: string
     revision?: string
+    fullHydrationDeferred?: boolean
   }): void {
     const threadId = observation.threadId.trim()
     if (!threadId) return
@@ -1872,6 +1873,7 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     return threadId ? hasMoreOlderMessagesByThreadId.value[threadId] === true : false
   })
+  const deferAutoLoadPersistedAbove = computed(() => selectedTaskSnapshot.value?.fullHydrationDeferred === true)
   const isLoadingOlderMessages = computed(() => {
     const threadId = selectedThreadId.value
     return threadId ? loadingOlderMessagesByThreadId.value[threadId] === true : false
@@ -5176,6 +5178,7 @@ export function useDesktopState() {
         streamCursor: detailStreamCursor,
         error: 'error' in detail && (typeof detail.error === 'string' || detail.error === null) ? detail.error : undefined,
         revision: detailSessionRevision,
+        fullHydrationDeferred: detail.fullHydrationDeferred,
       })
       if ('taskState' in detail && detail.taskState) {
         const current = taskSnapshotsByThreadId.value[threadId]
@@ -5213,6 +5216,9 @@ export function useDesktopState() {
               writerClient: detail.writerClient === undefined ? current.writerClient : detail.writerClient,
               startedAt: detail.startedAt === undefined ? current.startedAt : detail.startedAt,
               finishedAt: detail.finishedAt === undefined ? current.finishedAt : detail.finishedAt,
+              fullHydrationDeferred: detail.fullHydrationDeferred === undefined
+                ? current.fullHydrationDeferred
+                : detail.fullHydrationDeferred,
               error: detail.error === undefined ? current.error : detail.error,
               timeline: detail.timeline ?? current.timeline,
             },
@@ -6872,6 +6878,7 @@ export function useDesktopState() {
     accountRateLimitSnapshots,
     messages,
     hasMoreOlderMessages,
+    deferAutoLoadPersistedAbove,
     isLoadingThreads,
     isThreadListFullyLoaded,
     isLoadingMessages,
