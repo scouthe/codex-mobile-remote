@@ -47,10 +47,9 @@ cd android
 ```
 
 The APK is written to
-`app/build/outputs/apk/debug/app-debug.apk`. This target does not need the
-Termux bootstrap or a bundled server asset, so `app/src/main/assets/` may stay
-empty. The old bootstrap helper files are retained in this branch only as
-historical references and are not called by the remote activity.
+`app/build/outputs/apk/debug/app-debug.apk`. This target does not include a
+Termux bootstrap, a bundled server asset, or any local Codex runtime helper.
+`app/src/main/assets/` is intentionally empty.
 
 ## First launch
 

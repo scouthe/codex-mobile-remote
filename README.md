@@ -153,9 +153,10 @@ on:
 - WebView navigation and file/share bridges;
 - notification updates and Android permissions.
 
-The old local-runtime helpers (`BootstrapInstaller`, `CodexServerManager`, and
-their assets) are retained in the source tree for migration/reference. They are
-not started by the remote activity or required by the remote CI workflow.
+The remote APK intentionally does not include the old local-runtime helpers or
+their Termux/bootstrap assets. A future local-runtime mode, if needed, should
+be added as a separate target so it cannot be started accidentally by the
+remote client.
 
 ## Troubleshooting
 
