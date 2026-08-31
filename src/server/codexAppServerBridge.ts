@@ -9154,6 +9154,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           const sessionActivity = await appServer.getSessionActivityReader().read(sessionPath)
           const sessionTail = await readSessionTailForFastThread(sessionPath)
           const turns = buildFastSessionTurns(sessionTail.raw)
+          const queueState = await readThreadQueueState()
           const currentStatus = asRecord(summaryThread.status)
           const inProgress = sessionActivity.known
             ? sessionActivity.inProgress
@@ -9173,7 +9174,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           const activitySnapshot = buildTaskSnapshotResponse(
             threadId,
             inProgress,
-            0,
+            queueState[threadId]?.length ?? 0,
             appServer.listPendingServerRequests(),
             appServer.getStreamEvents(threadId, 40),
             appServer.getStreamCursor(),
