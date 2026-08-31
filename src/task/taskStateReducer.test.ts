@@ -28,6 +28,51 @@ describe('task state reducer', () => {
     expect(completed.timeline.map((event) => event.type)).toEqual(['queued', 'task_started', 'activity', 'task_completed'])
   })
 
+  it('does not append duplicate timeline rows when the same queue depth is polled', () => {
+    const first = reduceTaskSnapshot(undefined, {
+      threadId: 'thread-1',
+      queue: { depth: 1, oldestQueuedAt: '2026-08-31T00:00:00.000Z', clientIds: ['phone'] },
+      atIso: '2026-08-31T00:00:01.000Z',
+    })
+    const second = reduceTaskSnapshot(first, {
+      threadId: 'thread-1',
+      queue: { depth: 1, oldestQueuedAt: '2026-08-31T00:00:00.000Z', clientIds: ['phone'] },
+      atIso: '2026-08-31T00:00:02.000Z',
+    })
+    const third = reduceTaskSnapshot(second, {
+      threadId: 'thread-1',
+      queue: { depth: 2, oldestQueuedAt: '2026-08-31T00:00:00.000Z', clientIds: ['phone'] },
+      atIso: '2026-08-31T00:00:03.000Z',
+    })
+
+    expect(second.timeline).toHaveLength(1)
+    expect(third.timeline).toHaveLength(2)
+    expect(third.timeline.map((event) => event.details[0])).toEqual(['1 message', '2 messages'])
+  })
+
+  it('deduplicates repeated queue notifications with the same depth', () => {
+    const first = reduceTaskSnapshot(undefined, {
+      threadId: 'thread-1',
+      notification: {
+        method: 'queue/updated',
+        params: { threadId: 'thread-1', queueDepth: 1, messageId: 'q-1' },
+        atIso: '2026-08-31T00:00:01.000Z',
+      },
+    })
+    const second = reduceTaskSnapshot(first, {
+      threadId: 'thread-1',
+      notification: {
+        method: 'queue/updated',
+        params: { threadId: 'thread-1', queueDepth: 1, messageId: 'q-1' },
+        atIso: '2026-08-31T00:00:02.000Z',
+      },
+    })
+
+    expect(first.timeline).toHaveLength(1)
+    expect(second.timeline).toHaveLength(1)
+    expect(second.queueDepth).toBe(1)
+  })
+
   it('represents approval and user-input requests, then resumes after resolution', () => {
     const base = createTaskSnapshot('thread-1', { state: 'running' })
     const approval = reduceTaskSnapshot(base, {

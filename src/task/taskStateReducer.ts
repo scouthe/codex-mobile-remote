@@ -79,11 +79,30 @@ function makeEvent(
   return { id, type, atIso, label, details, turnId: '', status, itemId }
 }
 
-function appendTimeline(snapshot: TaskSnapshot, event: TaskTimelineEvent): TaskTimelineEvent[] {
-  const existing = snapshot.timeline.findIndex((item) => item.id === event.id)
+function appendTimeline(snapshot: TaskSnapshot, event: TaskTimelineEvent, timeline = snapshot.timeline): TaskTimelineEvent[] {
+  const existing = timeline.findIndex((item) => item.id === event.id)
   if (existing >= 0) return snapshot.timeline
-  const next = [...snapshot.timeline, event]
+  const next = [...timeline, event]
   return next.length > MAX_TIMELINE_EVENTS ? next.slice(next.length - MAX_TIMELINE_EVENTS) : next
+}
+
+function appendQueueTimelineEvent(
+  snapshot: TaskSnapshot,
+  timeline: TaskTimelineEvent[],
+  depth: number,
+  atIso: string,
+): TaskTimelineEvent[] {
+  // Queue state is polled independently from notifications.  Re-reading an
+  // unchanged queue must update the current activity without adding another
+  // timeline row on every poll.
+  if (depth <= 0 || depth === snapshot.queueDepth) return timeline
+  const details = [`${depth} message${depth === 1 ? '' : 's'}`]
+  const timelineSnapshot = { ...snapshot, timeline }
+  return appendTimeline(
+    timelineSnapshot,
+    makeEvent(timelineSnapshot, 'queued', 'Queued', atIso, details, 'pending'),
+    timeline,
+  )
 }
 
 export function createTaskSnapshot(threadId: string, initial: Partial<TaskSnapshot> = {}): TaskSnapshot {
@@ -119,6 +138,7 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
   let error = observation.error === undefined ? snapshot.error : observation.error
   let timeline = snapshot.timeline
   let queueDepth = observation.queue?.depth ?? snapshot.queueDepth
+  let queueTimelineAppended = false
 
   // Pending requests are also hydrated on reconnect, without a notification.
   // Promote those snapshots to the same waiting states as live events.
@@ -137,7 +157,9 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
     if (observation.queue.depth > 0 && !observation.inProgress && !['running', 'starting', 'steering', 'waiting_approval', 'waiting_user_input'].includes(state)) {
       state = 'queued'
       currentActivity = { kind: 'queue', label: 'Queued', details: [`${observation.queue.depth} message${observation.queue.depth === 1 ? '' : 's'}`] }
-      timeline = appendTimeline(snapshot, makeEvent(snapshot, 'queued', 'Queued', atIso, currentActivity.details, 'pending'))
+      const nextTimeline = appendQueueTimelineEvent(snapshot, timeline, observation.queue.depth, atIso)
+      queueTimelineAppended = nextTimeline !== timeline
+      timeline = nextTimeline
     }
   }
 
@@ -150,7 +172,9 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
     if (parsedQueueDepth > 0 && !['starting', 'running', 'steering', 'waiting_approval', 'waiting_user_input'].includes(state)) {
       state = 'queued'
       currentActivity = { kind: 'queue', label: 'Queued', details: [`${parsedQueueDepth} message${parsedQueueDepth === 1 ? '' : 's'}`] }
-      timeline = appendTimeline(snapshot, makeEvent(snapshot, 'queued', 'Queued', atIso, currentActivity.details, 'pending'))
+      if (!queueTimelineAppended) {
+        timeline = appendQueueTimelineEvent(snapshot, timeline, parsedQueueDepth, atIso)
+      }
     }
   }
 
