@@ -957,7 +957,13 @@ describe('live error overlay', () => {
 
     expect(gatewayMocks.enqueueThreadMessage).toHaveBeenCalledWith(
       'queued-thread',
-      expect.objectContaining({ text: 'run after current task' }),
+      expect.objectContaining({
+        text: 'run after current task',
+        status: 'queued',
+        sourceClientId: expect.stringMatching(/^web-/),
+        createdAtIso: expect.any(String),
+        attempts: 0,
+      }),
     )
     expect(state.selectedThreadQueuedMessages.value).toHaveLength(1)
     expect(state.selectedTaskSnapshot.value?.state).toBe('running')
