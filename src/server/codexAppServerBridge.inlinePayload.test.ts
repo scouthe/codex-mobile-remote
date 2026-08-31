@@ -354,6 +354,39 @@ describe('thread session skill recovery', () => {
 })
 
 describe('backend queue scheduling', () => {
+  it('uses the authoritative idle session marker when thread/read is stale', async () => {
+    const sessionActivityReader = {
+      read: vi.fn().mockResolvedValue({
+        known: true,
+        inProgress: false,
+        turnId: '',
+        terminalTurnId: 'turn-1',
+        lastEventAt: Date.now(),
+        revision: 'session-idle',
+      }),
+    }
+    const appServer = {
+      onNotification: () => () => undefined,
+      rpc: vi.fn().mockResolvedValue({
+        thread: {
+          path: '/tmp/stale-thread.jsonl',
+          status: { type: 'inProgress' },
+          turns: [{ status: 'inProgress' }],
+        },
+      }),
+      getSessionActivityReader: () => sessionActivityReader,
+    } as never
+    const processor = new BackendQueueProcessor(appServer)
+
+    const canStartQueuedTurn = await (processor as unknown as {
+      canStartQueuedTurn: (threadId: string) => Promise<boolean>
+    }).canStartQueuedTurn('thread-1')
+
+    expect(canStartQueuedTurn).toBe(true)
+    expect(sessionActivityReader.read).toHaveBeenCalledWith('/tmp/stale-thread.jsonl')
+    processor.dispose()
+  })
+
   it('reschedules a pending drain when a run-now request needs an earlier drain', async () => {
     vi.useFakeTimers()
     const processor = new BackendQueueProcessor({
