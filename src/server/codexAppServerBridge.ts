@@ -8026,6 +8026,21 @@ export class BackendQueueProcessor {
     const thread = asRecord(response?.thread)
     if (!thread) return false
 
+    // A desktop Codex process can append the terminal marker to the shared
+    // session file before this app-server's thread projection catches up.
+    // Prefer that marker when it is available; otherwise a stale
+    // `thread.status=inProgress` would keep the queue in a retry loop forever.
+    const sessionPath = readNonEmptyString(thread.path)
+    if (sessionPath && isAbsolute(sessionPath)) {
+      try {
+        const sessionActivity = await this.appServer.getSessionActivityReader().read(sessionPath)
+        if (sessionActivity.known) return !sessionActivity.inProgress
+      } catch {
+        // Fall back to the app-server projection when the session marker is
+        // temporarily unreadable.
+      }
+    }
+
     const status = asRecord(thread.status)
     const statusType = readNonEmptyString(status?.type)
     if (statusType === 'inProgress' || statusType === 'running' || statusType === 'active') return false
