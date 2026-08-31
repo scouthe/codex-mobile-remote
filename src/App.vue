@@ -2583,6 +2583,13 @@ watch(
   },
 )
 
+watch(
+  [homeThreadComposerRef, threadComposerRef],
+  () => {
+    void flushAndroidShare()
+  },
+)
+
 function updateVisualViewportState(): void {
   if (typeof window === 'undefined') return
   layoutViewportHeight.value = Math.max(layoutViewportHeight.value, window.innerHeight)
