@@ -183,7 +183,7 @@ describe('shared thread observer HTTP path', () => {
         taskState: 'running',
         queueDepth: 0,
         activeRequest: null,
-        writerClient: null,
+        writerClient: expect.objectContaining({ clientType: 'desktop', label: 'Desktop' }),
       })
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
