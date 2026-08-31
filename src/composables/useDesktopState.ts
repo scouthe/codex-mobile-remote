@@ -37,6 +37,7 @@ import {
   type RpcNotification,
   type SkillInfo,
   type ThreadQueueState,
+  type ThreadLiveState,
   type WorkspaceRootsState,
 } from '../api/codexGateway'
 import { CodexApiError } from '../api/codexErrors'
@@ -1639,8 +1640,14 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     if (!threadId) return null
 
-    const isInProgress = inProgressById.value[threadId] === true
-    const activity = isInProgress ? turnActivityByThreadId.value[threadId] : undefined
+    const taskSnapshot = taskSnapshotsByThreadId.value[threadId]
+    const taskIsActive = taskSnapshot
+      ? ['starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'].includes(taskSnapshot.state)
+      : false
+    const isInProgress = taskSnapshot ? taskIsActive : inProgressById.value[threadId] === true
+    const activity = taskSnapshot?.currentActivity && taskSnapshot.currentActivity.kind !== 'idle'
+      ? { label: taskSnapshot.currentActivity.label, details: taskSnapshot.currentActivity.details }
+      : isInProgress ? turnActivityByThreadId.value[threadId] : undefined
     const reasoningText = isInProgress
       ? (liveReasoningTextByThreadId.value[threadId] ?? '').trim()
       : ''
@@ -1659,6 +1666,15 @@ export function useDesktopState() {
       !isInProgress && liveErrorText && latestPersistedTurnErrorText === liveErrorText
         ? ''
         : liveErrorText
+
+    if (taskSnapshot && taskIsActive && !activity && !reasoningText && !errorText) {
+      return {
+        activityLabel: taskSnapshot.currentActivity.label || 'Thinking',
+        activityDetails: taskSnapshot.currentActivity.details,
+        reasoningText: '',
+        errorText: '',
+      }
+    }
 
     if (!isInProgress && !activity && !reasoningText && !errorText) return null
     return {
@@ -4654,7 +4670,7 @@ export function useDesktopState() {
       // the app-server's active-writer lock when a second device opens the
       // same in-progress thread.  Writes still resume explicitly in
       // startTurnForThread below, behind the server-side writer path.
-      let detail: Awaited<ReturnType<typeof getThreadDetail>>
+      let detail: Awaited<ReturnType<typeof getThreadDetail>> & Partial<ThreadLiveState>
       let liveStateErrorObserved = false
       if (shouldPreferLiveState) {
         try {
@@ -4718,6 +4734,25 @@ export function useDesktopState() {
         streamCursor: detailStreamCursor,
         revision: detailSessionRevision,
       })
+      if ('taskState' in detail && detail.taskState) {
+        const current = taskSnapshotsByThreadId.value[threadId]
+        if (current) {
+          taskSnapshotsByThreadId.value = {
+            ...taskSnapshotsByThreadId.value,
+            [threadId]: {
+              ...current,
+              state: detail.taskState,
+              currentActivity: detail.currentActivity ?? current.currentActivity,
+              queueDepth: detail.queueDepth ?? current.queueDepth,
+              activeRequest: detail.activeRequest === undefined ? current.activeRequest : detail.activeRequest,
+              writerClient: detail.writerClient === undefined ? current.writerClient : detail.writerClient,
+              startedAt: detail.startedAt === undefined ? current.startedAt : detail.startedAt,
+              finishedAt: detail.finishedAt === undefined ? current.finishedAt : detail.finishedAt,
+              timeline: detail.timeline ?? current.timeline,
+            },
+          }
+        }
+      }
       const observedSessionRevision = detailSessionRevision?.trim() || sessionRevision
       if (sessionActivityKnown === true || observedSessionRevision) {
         reconcileThreadSessionActivity(threadId, {

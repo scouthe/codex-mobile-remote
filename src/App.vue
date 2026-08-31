@@ -1420,6 +1420,7 @@ const {
   selectedThreadTokenUsage,
   selectedThreadTerminalOpen,
   selectedThreadServerRequests,
+  selectedTaskSnapshot,
   selectedLiveOverlay,
   codexQuota,
   selectedThreadId,
@@ -1807,7 +1808,14 @@ const isTerminalKeyboardLayoutActive = computed(() => (
   (isComposerTerminalOpen.value && isTerminalKeyboardFocusFallbackActive.value)
 ))
 const directoryCwd = computed(() => selectedThread.value?.cwd?.trim() ?? newThreadCwd.value.trim())
-const isSelectedThreadInProgress = computed(() => !isHomeRoute.value && selectedThread.value?.inProgress === true)
+const isSelectedThreadInProgress = computed(() => {
+  if (isHomeRoute.value) return false
+  const taskState = selectedTaskSnapshot.value?.state
+  if (taskState) {
+    return ['starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'].includes(taskState)
+  }
+  return selectedThread.value?.inProgress === true
+})
 const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>
   isSendingMessage.value ||
