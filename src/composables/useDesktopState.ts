@@ -688,7 +688,7 @@ function areMessageArraysEqual(first: UiMessage[], second: UiMessage[]): boolean
 function mergeMessages(
   previous: UiMessage[],
   incoming: UiMessage[],
-  options: { preserveMissing?: boolean } = {},
+  options: { preserveMissing?: boolean; preserveOnlyOlder?: boolean } = {},
 ): UiMessage[] {
   const previousById = new Map(previous.map((message) => [message.id, message]))
   const incomingById = new Map(incoming.map((message) => [message.id, message]))
@@ -705,17 +705,31 @@ function mergeMessages(
     return areMessageArraysEqual(previous, mergedIncoming) ? previous : mergedIncoming
   }
 
+  const incomingTurnIndexes = incoming
+    .map((message) => message.turnIndex)
+    .filter((turnIndex): turnIndex is number => typeof turnIndex === 'number' && Number.isFinite(turnIndex))
+  const earliestIncomingTurnIndex = incomingTurnIndexes.length > 0 ? Math.min(...incomingTurnIndexes) : null
+  const shouldPreserveMissingMessage = (message: UiMessage): boolean => {
+    if (options.preserveOnlyOlder !== true || earliestIncomingTurnIndex === null) return true
+    const turnIndex = message.turnIndex
+    // Messages without a turn index (optimistic/live rows from older bridge
+    // versions) are retained conservatively; indexed rows in the projected
+    // window are authoritative and may have been removed by rollback.
+    return typeof turnIndex !== 'number' || !Number.isFinite(turnIndex) || turnIndex < earliestIncomingTurnIndex
+  }
+
   const mergedFromPrevious = previous
     .map((previousMessage) => {
       const nextMessage = incomingById.get(previousMessage.id)
       if (!nextMessage) {
-        return previousMessage
+        return shouldPreserveMissingMessage(previousMessage) ? previousMessage : null
       }
       if (areMessageFieldsEqual(previousMessage, nextMessage)) {
         return previousMessage
       }
       return nextMessage
     })
+    .filter((message): message is UiMessage => Boolean(message))
     .filter((message) => !isOptimisticUserMessage(message) || !hasEquivalentUserMessage(message, incoming))
 
   const previousIdSet = new Set(previous.map((message) => message.id))
@@ -5270,6 +5284,7 @@ export function useDesktopState() {
           || (liveStateErrorObserved && nextMessages.length === 0)
           || (options.silent === true && options.force !== true)
           || hasOptimisticUserMessages(previousPersisted),
+        preserveOnlyOlder: incomingProjectionIsPartial,
       })
       setPersistedMessagesForThread(threadId, mergedMessages)
 
