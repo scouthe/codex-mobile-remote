@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { getAvailableModelIds, getThreadDetail, listDirectoryComposioConnectors, resumeThread, startThreadTurn } from './codexGateway'
+import {
+  getAvailableModelIds,
+  getThreadDetail,
+  getThreadLiveState,
+  listDirectoryComposioConnectors,
+  resumeThread,
+  startThreadTurn,
+} from './codexGateway'
 
 function mockRpcFetch(): { requests: Array<{ method: string, params: Record<string, unknown> }> } {
   const requests: Array<{ method: string, params: Record<string, unknown> }> = []
@@ -202,6 +209,45 @@ describe('getThreadDetail', () => {
 
     await expect(getThreadDetail('legacy-thread')).resolves.toMatchObject({
       modelProvider: 'opencode_zen',
+    })
+  })
+})
+
+describe('getThreadLiveState', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('preserves bounded projection metadata for the message reducer', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      thread: {
+        id: 'large-thread',
+        turns: [{
+          id: 'turn-tail',
+          status: 'completed',
+          items: [{ id: 'assistant-tail', type: 'agentMessage', text: 'tail answer' }],
+        }],
+      },
+      partial: true,
+      threadTurnStartIndex: 12,
+      hasMoreOlder: true,
+      fullHydrationDeferred: true,
+      sessionActivityKnown: true,
+      sessionRevision: 'r12',
+      isInProgress: false,
+      taskState: 'completed',
+      streamCursor: { streamEpoch: 'epoch-1', latestSeq: 12, oldestSeq: 1 },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(getThreadLiveState('large-thread')).resolves.toMatchObject({
+      partial: true,
+      fullHydrationDeferred: true,
+      hasMoreOlder: true,
+      sessionRevision: 'r12',
+      messages: [expect.objectContaining({ text: 'tail answer' })],
     })
   })
 })

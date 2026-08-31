@@ -766,6 +766,8 @@ export type ThreadLiveState = {
   finishedAt?: string | null
   error?: string | null
   timeline?: TaskTimelineEvent[]
+  /** The bridge returned a bounded projection rather than the full history. */
+  partial?: boolean
   /** Large session logs stay on the bounded observer projection. */
   fullHydrationDeferred?: boolean
 }
@@ -855,6 +857,7 @@ async function getThreadDetailV2(threadId: string): Promise<{
     activeTurnId: readActiveTurnIdFromResponse(payload),
     ...(terminalTurnId ? { terminalTurnId } : {}),
     hasMoreOlder: startTurnIndex > 0,
+    ...(startTurnIndex > 0 ? { partial: true } : {}),
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
     ...(sessionRevision ? { sessionRevision } : {}),
     ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
@@ -1293,6 +1296,7 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       activeTurnId: readString(record?.activeTurnId) || readActiveTurnIdFromResponse(threadPayload),
       ...(terminalTurnId ? { terminalTurnId } : {}),
       hasMoreOlder: readThreadTurnStartIndex(threadPayload) > 0,
+      ...(record?.partial === true || readThreadTurnStartIndex(threadPayload) > 0 ? { partial: true } : {}),
       turnIndexByTurnId: buildTurnIndexByTurnId(threadPayload, readThreadTurnStartIndex(threadPayload)),
       ...(sessionRevision ? { sessionRevision } : {}),
       ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
@@ -1307,6 +1311,7 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       ...(typeof record?.finishedAt === 'string' ? { finishedAt: record.finishedAt } : {}),
       ...(typeof record?.error === 'string' ? { error: record.error } : record?.error === null ? { error: null } : {}),
       ...(timeline ? { timeline } : {}),
+      ...(record?.fullHydrationDeferred === true ? { fullHydrationDeferred: true } : {}),
     }
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load live thread state ${normalizedThreadId}`, 'thread-live-state')
