@@ -355,6 +355,109 @@ describe('shared thread observer HTTP path', () => {
     }
   })
 
+  it('serves a fast recent-message snapshot without requesting full thread turns', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-bridge-'))
+    const sessionPath = join(directory, 'rollout-fast-thread.jsonl')
+    const rows = [
+      {
+        timestamp: new Date().toISOString(),
+        type: 'session_meta',
+        payload: {
+          id: 'fast-thread',
+          cwd: '/tmp/project',
+          model_provider: 'openai',
+        },
+      },
+      {
+        timestamp: new Date().toISOString(),
+        type: 'turn_context',
+        payload: { turn_id: 'turn-fast-1' },
+      },
+      {
+        timestamp: new Date().toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          id: 'user-fast-1',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'hello fast path' }],
+        },
+      },
+      {
+        timestamp: new Date().toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          id: 'assistant-fast-1',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'fast answer' }],
+        },
+      },
+      {
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn-fast-1' },
+      },
+    ]
+    await writeFile(sessionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8')
+
+    const fake = installFakeSharedBridge({
+      threadReadResults: [{
+        thread: {
+          id: 'fast-thread',
+          path: sessionPath,
+          cwd: '/tmp/project',
+          modelProvider: 'openai',
+          turns: [],
+        },
+      }],
+    })
+    const originalRpc = fake.calls
+    const globalScope = globalThis as typeof globalThis & { __codexRemoteSharedBridge__?: { appServer?: { rpc: (...args: unknown[]) => Promise<unknown> } } }
+    const shared = globalScope.__codexRemoteSharedBridge__
+    const appServer = shared?.appServer
+    if (!appServer) throw new Error('Shared bridge app-server was not installed')
+    const originalAppServerRpc = appServer.rpc
+    appServer.rpc = async (method: unknown, params: unknown) => {
+      if (method === 'thread/read' && (params as { includeTurns?: boolean })?.includeTurns === true) {
+        throw new Error('full thread/read should not be used by fast snapshot')
+      }
+      return originalAppServerRpc(method, params)
+    }
+
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/thread-fast-state?threadId=fast-thread`)
+      expect(response.status).toBe(200)
+      const payload = await response.json() as {
+        partial?: boolean
+        thread?: { turns?: Array<{ id?: string; items?: Array<{ type?: string; text?: string }> }> }
+      }
+      expect(payload.partial).toBe(true)
+      expect(payload.thread?.turns).toContainEqual(expect.objectContaining({
+        id: 'turn-fast-1',
+        items: expect.arrayContaining([
+          expect.objectContaining({ type: 'userMessage' }),
+          expect.objectContaining({ type: 'agentMessage', text: 'fast answer' }),
+        ]),
+      }))
+      expect(originalRpc.some((call) => call.method === 'thread/read')).toBe(true)
+      expect(originalRpc.some((call) => call.method === 'thread/read' && (call.params as { includeTurns?: boolean })?.includeTurns === true)).toBe(false)
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('does not resume the same thread twice when two clients open it concurrently', async () => {
     const fake = installFakeSharedBridge()
     const instance = createServer()

@@ -808,6 +808,7 @@ async function getThreadDetailV2(threadId: string): Promise<{
   turnIndexByTurnId: ThreadTurnIndexById
   sessionRevision?: string
   sessionActivityKnown?: boolean
+  partial?: boolean
 }> {
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
@@ -833,6 +834,67 @@ async function getThreadDetailV2(threadId: string): Promise<{
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
     ...(sessionRevision ? { sessionRevision } : {}),
     ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
+  }
+}
+
+async function getThreadFastDetailV2(threadId: string): Promise<{
+  model: string
+  modelProvider: string
+  messages: UiMessage[]
+  inProgress: boolean
+  activeTurnId: string
+  hasMoreOlder: boolean
+  turnIndexByTurnId: ThreadTurnIndexById
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
+  partial: boolean
+}> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) throw new Error('Missing thread id')
+  const response = await fetch(`/codex-api/thread-fast-state?threadId=${encodeURIComponent(normalizedThreadId)}`, {
+    headers: getTaskClientHeaders(),
+  })
+  const payload = await response.json() as ThreadReadResponse & {
+    partial?: unknown
+    hasMoreOlder?: unknown
+    inProgress?: unknown
+    activeTurnId?: unknown
+    sessionRevision?: unknown
+    sessionActivityKnown?: unknown
+  }
+  if (!response.ok) {
+    throw new Error(`Fast thread state request failed with ${response.status}`)
+  }
+  if (!payload.thread || payload.partial !== true) {
+    throw new Error('Fast thread state response was incomplete')
+  }
+  const startTurnIndex = readThreadTurnStartIndex(payload)
+  const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
+  const rawThread = asRecord(payload.thread)
+  const rawRevision = payload.sessionRevision ?? rawThread?.sessionRevision ?? rawThread?.revision
+  const sessionRevision = typeof rawRevision === 'string'
+    ? rawRevision.trim()
+    : typeof rawRevision === 'number' && Number.isFinite(rawRevision)
+      ? String(rawRevision)
+      : ''
+  const sessionActivityKnown = payload.sessionActivityKnown === true || rawThread?.sessionActivityKnown === true
+  const inProgress = typeof payload.inProgress === 'boolean'
+    ? payload.inProgress
+    : readThreadInProgressFromResponse(payload)
+  const activeTurnId = typeof payload.activeTurnId === 'string'
+    ? payload.activeTurnId.trim()
+    : readActiveTurnIdFromResponse(payload)
+  return {
+    model: normalizeThreadModelFromPayload(payload),
+    modelProvider: normalizeThreadModelProviderFromPayload(payload),
+    messages: normalized,
+    inProgress,
+    activeTurnId,
+    hasMoreOlder: payload.hasMoreOlder === true || startTurnIndex > 0,
+    turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+    ...(sessionRevision ? { sessionRevision } : {}),
+    ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
+    partial: true,
   }
 }
 
@@ -915,11 +977,36 @@ export async function getThreadDetail(threadId: string): Promise<{
   turnIndexByTurnId: ThreadTurnIndexById
   sessionRevision?: string
   sessionActivityKnown?: boolean
+  partial?: boolean
 }> {
   try {
     return await getThreadDetailV2(threadId)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load thread ${threadId}`, 'thread/read')
+  }
+}
+
+/**
+ * Return a bounded, read-only session tail for fast task switching.  The
+ * caller should schedule a normal getThreadDetail refresh afterwards to fill
+ * command output and older turns.
+ */
+export async function getThreadFastDetail(threadId: string): Promise<{
+  model: string
+  modelProvider: string
+  messages: UiMessage[]
+  inProgress: boolean
+  activeTurnId: string
+  hasMoreOlder: boolean
+  turnIndexByTurnId: ThreadTurnIndexById
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
+  partial: boolean
+}> {
+  try {
+    return await getThreadFastDetailV2(threadId)
+  } catch (error) {
+    throw normalizeCodexApiError(error, `Failed to load fast thread ${threadId}`, 'thread/read')
   }
 }
 
