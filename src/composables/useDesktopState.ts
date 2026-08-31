@@ -107,6 +107,14 @@ const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
 const OPENCODE_ZEN_DEFAULT_MODEL = 'big-pickle'
 const CODEX_CLI_MISSING_MESSAGE = 'Codex CLI not found. Install @openai/codex or set CODEXUI_CODEX_COMMAND.'
+const ACTIVE_TASK_STATES = new Set<TaskSnapshot['state']>([
+  'queued',
+  'starting',
+  'running',
+  'waiting_approval',
+  'waiting_user_input',
+  'steering',
+])
 type SelectThreadResult = 'ok' | 'not-found' | 'error'
 
 function isCodexCliMissingError(error: unknown): boolean {
@@ -2260,7 +2268,14 @@ export function useDesktopState() {
     const flaggedGroups: UiProjectGroup[] = withTitles.map((group) => ({
       projectName: group.projectName,
       threads: group.threads.map((thread) => {
-        const inProgress = inProgressById.value[thread.id] === true
+        // Prefer the reducer-backed task state when available.  The legacy
+        // inProgress map is still used as a compatibility fallback, but it
+        // can otherwise retain an optimistic active bit after an external
+        // desktop writer has already completed the session.
+        const taskSnapshot = taskSnapshotsByThreadId.value[thread.id]
+        const inProgress = taskSnapshot
+          ? ACTIVE_TASK_STATES.has(taskSnapshot.state)
+          : inProgressById.value[thread.id] === true
         const pendingRequestState = readPendingRequestState(getThreadPendingRequests(thread.id))
         const isSelected = selectedThreadId.value === thread.id
         const unreadByEvent = eventUnreadByThreadId.value[thread.id] === true
@@ -4371,6 +4386,7 @@ export function useDesktopState() {
   function reconcileIncomingSessionActivity(threads: UiThread[]): void {
     let nextInProgress = inProgressById.value
     let changed = false
+    const idleThreadIdsToClear = new Set<string>()
 
     for (const thread of threads) {
       const threadId = thread.id.trim()
@@ -4393,8 +4409,18 @@ export function useDesktopState() {
         inProgress: thread.inProgress === true,
         revision,
       }
-      const previous = sessionActivityByThreadId.get(threadId)
       sessionActivityByThreadId.set(threadId, incoming)
+
+      // The session activity marker is authoritative for the task lifecycle,
+      // including threads that are not currently selected.  Updating the
+      // snapshot here lets the sidebar converge without opening every thread
+      // and without waiting for a selected-thread message hydration.
+      updateTaskSnapshot({
+        threadId,
+        inProgress: incoming.inProgress,
+        activeRequest: incoming.inProgress ? undefined : null,
+        revision,
+      })
 
       if (incoming.inProgress) {
         if (nextInProgress[threadId] === true) continue
@@ -4403,14 +4429,25 @@ export function useDesktopState() {
         continue
       }
 
-      // Keep a local active bit until `loadMessages` has consumed the idle
-      // snapshot.  `setThreadInProgress(false)` performs the associated live
-      // overlay/interrupt cleanup; clearing the map here would bypass that
-      // transition because the setter would observe an already-idle value.
+      // The selected thread still gets an authoritative message hydration in
+      // syncThreadStatus, which also reconciles its live overlay.  For every
+      // other thread there is no hydration pass, so clear the legacy active
+      // bit now or its sidebar spinner would remain stuck forever.
+      if (threadId !== selectedThreadId.value && nextInProgress[threadId] === true) {
+        idleThreadIdsToClear.add(threadId)
+      }
+    }
+
+    for (const threadId of idleThreadIdsToClear) {
+      nextInProgress = omitKey(nextInProgress, threadId)
+      clearCompletedTurnLiveState(threadId)
+      clearInterruptPersistenceGate(threadId)
+      changed = true
     }
 
     if (changed) {
       inProgressById.value = nextInProgress
+      applyThreadFlags()
     }
   }
 
@@ -5032,7 +5069,11 @@ export function useDesktopState() {
 
     try {
       await loadMessages(threadId)
-      await refreshModelPreferences({ includeProviderModels: true })
+      // Message hydration is the critical path when switching tasks.  Model,
+      // provider and skills metadata are ancillary and can refresh in the
+      // background; waiting for them made a healthy thread look stuck on
+      // "Loading messages..." whenever a provider endpoint was slow.
+      void refreshModelPreferences({ includeProviderModels: true })
       void refreshSkills()
       return 'ok'
     } catch (unknownError) {
