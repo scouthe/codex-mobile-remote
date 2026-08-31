@@ -235,6 +235,12 @@ const THREAD_RESPONSE_TURN_LIMIT = 10
 // prompts/tool output, so the task switch path uses a bounded tail projection
 // first and hydrates the full turn history in the background.
 const FAST_THREAD_SESSION_TAIL_BYTES = 4 * 1024 * 1024
+// Observer requests must not ask app-server to materialize a very large
+// rollout just to discover the latest task state.  The session JSONL is the
+// shared source of truth for this path; large files are projected from their
+// bounded tail instead.  Small sessions retain the existing full projection
+// so command/file details and exact turn pagination remain unchanged.
+const OBSERVER_FULL_READ_MAX_BYTES = 8 * 1024 * 1024
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
 // A desktop app-server can append the terminal session marker before its
 // thread/read projection is flushed.  Give that projection a short,
@@ -1058,6 +1064,53 @@ async function readThreadSnapshotForObserver(
   appServer: AppServerProcess,
   threadId: string,
 ): Promise<unknown> {
+  // `thread/read(includeTurns:false)` is a cheap metadata lookup and does not
+  // force app-server to deserialize the complete rollout.  Prefer the bridge
+  // summary when available, then use the metadata response to obtain the
+  // canonical session path for a thread opened outside this process.
+  let metadataResult = appServer.getThreadSummarySnapshot(threadId)
+  let metadataRecord = asRecord(metadataResult)
+  let metadataThread = asRecord(metadataRecord?.thread)
+  let sessionPath = readNonEmptyString(metadataThread?.path)
+
+  if (!sessionPath || !isAbsolute(sessionPath)) {
+    metadataResult = await appServer.rpc('thread/read', {
+      threadId,
+      includeTurns: false,
+    })
+    metadataRecord = asRecord(metadataResult)
+    metadataThread = asRecord(metadataRecord?.thread)
+    sessionPath = readNonEmptyString(metadataThread?.path)
+  }
+
+  if (sessionPath && isAbsolute(sessionPath)) {
+    try {
+      const sessionStat = await stat(sessionPath)
+      if (sessionStat.isFile() && sessionStat.size > OBSERVER_FULL_READ_MAX_BYTES) {
+        const sessionTail = await readSessionTailForFastThread(sessionPath)
+        const turns = buildFastSessionTurns(sessionTail.raw)
+        const result = metadataRecord && metadataThread
+          ? {
+            ...metadataRecord,
+            thread: {
+              ...metadataThread,
+              turns,
+            },
+            // The fast projection is intentionally bounded.  Consumers use
+            // this marker to keep older-turn pagination available without
+            // asking app-server for the full rollout on the hot path.
+            threadTurnStartIndex: turns.length > 0 ? 1 : 0,
+            partial: true,
+          }
+          : metadataResult
+        return mergeStreamTurnErrorsIntoThreadResult(appServer, result)
+      }
+    } catch {
+      // Fall through to the authoritative app-server projection when the
+      // session cannot be stat'ed/read.
+    }
+  }
+
   const rawResult = await appServer.rpc('thread/read', {
     threadId,
     includeTurns: true,
@@ -7536,7 +7589,15 @@ const MERGEABLE_ITEM_TYPES = new Set([
   'fileChange',
 ])
 
-class AppServerProcess {
+// Codex app-server keeps a thread-writer lock for the lifetime of the
+// resumed app-server session, even after the turn itself has completed.  A
+// second Codex Desktop window then sees "already opened in another app" until
+// the web bridge process exits.  Keep a short grace period for follow-up
+// requests, then recycle an idle child so its locks are released without
+// interrupting an active turn.
+const IDLE_WRITER_RELEASE_DELAY_MS = 1200
+
+export class AppServerProcess {
   private process: ChildProcessWithoutNullStreams | null = null
   private processGeneration = 0
   private initialized = false
@@ -7565,6 +7626,8 @@ class AppServerProcess {
   private readonly sessionActivityReader = new ThreadSessionActivityReader()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
   private activeConfigSignature = ''
+  private readonly activeTurnThreadIds = new Set<string>()
+  private idleWriterReleaseTimer: ReturnType<typeof setTimeout> | null = null
 
 
   private getCodexCommand(): string {
@@ -7732,6 +7795,17 @@ class AppServerProcess {
     const frame = this.recordStreamEvent(notification)
     this.captureItemFromNotification(notification)
     const nThreadId = frame.threadId
+    if (nThreadId && notification.method === 'turn/started') {
+      this.activeTurnThreadIds.add(nThreadId)
+      this.cancelIdleWriterRelease()
+    } else if (nThreadId && (
+      notification.method === 'turn/completed'
+      || notification.method === 'turn/interrupt'
+      || (notification.method === 'error' && asRecord(notification.params)?.willRetry !== true)
+    )) {
+      this.activeTurnThreadIds.delete(nThreadId)
+      this.scheduleIdleWriterRelease()
+    }
     if (nThreadId) {
       this.invalidateLiveStateCache(nThreadId)
       this.threadTurnPageReadCacheByThreadId.delete(nThreadId)
@@ -8124,11 +8198,30 @@ class AppServerProcess {
   }
 
   async rpc(method: string, params: unknown): Promise<unknown> {
+    // Read-only observer polling must not keep a bridge-owned child alive
+    // forever.  In particular, the web UI refreshes thread/list frequently;
+    // canceling the release timer for every poll would leave an idle child
+    // (and its historical writer locks) around for the lifetime of the page.
+    // A mutating request, on the other hand, cancels release so it can share
+    // the current initialized writer session.
+    const isReadOnlyRpc = method === 'thread/list'
+      || method === 'thread/read'
+      || method.endsWith('/read')
+      || method === 'config/read'
+    if (!isReadOnlyRpc) this.cancelIdleWriterRelease()
     this.disposeIfConfigChanged()
     await this.ensureInitialized()
     const result = await this.call(method, params)
     if (method === 'thread/list' || (method === 'thread/read' && asRecord(params)?.includeTurns !== true)) {
       this.rememberThreadSummaries(result)
+    }
+    if (method === 'thread/resume') {
+      // A legacy client may still resume while opening a thread.  If no turn
+      // follows shortly afterwards, recycle the child so a previous resume
+      // does not leave an idle writer lock that blocks Codex Desktop.  The
+      // timer is intentionally left intact while read-only observers poll;
+      // they cannot acquire the writer and must not prolong its lifetime.
+      this.scheduleIdleWriterRelease()
     }
     return result
   }
@@ -8208,6 +8301,8 @@ class AppServerProcess {
   }
 
   dispose(): void {
+    this.cancelIdleWriterRelease()
+    this.activeTurnThreadIds.clear()
     if (!this.process) return
 
     const proc = this.process
@@ -8248,6 +8343,27 @@ class AppServerProcess {
       }
     }, 1500)
     forceKillTimer.unref()
+  }
+
+  private cancelIdleWriterRelease(): void {
+    if (this.idleWriterReleaseTimer === null) return
+    clearTimeout(this.idleWriterReleaseTimer)
+    this.idleWriterReleaseTimer = null
+  }
+
+  private scheduleIdleWriterRelease(): void {
+    if (this.idleWriterReleaseTimer !== null) return
+    if (this.activeTurnThreadIds.size > 0 || this.pending.size > 0 || this.pendingServerRequests.size > 0) return
+
+    this.idleWriterReleaseTimer = setTimeout(() => {
+      this.idleWriterReleaseTimer = null
+      if (this.activeTurnThreadIds.size > 0 || this.pending.size > 0 || this.pendingServerRequests.size > 0) return
+      // dispose() closes stdin and terminates only this bridge-owned child;
+      // the native Codex Desktop app-server is a separate process and keeps
+      // its own active task and event stream untouched.
+      this.dispose()
+    }, IDLE_WRITER_RELEASE_DELAY_MS)
+    this.idleWriterReleaseTimer.unref?.()
   }
 }
 
@@ -9330,12 +9446,12 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             // A second browser opening an already materialized thread should
             // receive its read-only state instead of attempting to acquire a
             // second Codex writer lock.
-            rpcResult = await appServer.rpc('thread/read', rpcParams)
+            rpcResult = await readThreadSnapshotForObserver(appServer, rpcThreadId)
           } else if (rpcThreadId && body.method === 'thread/resume') {
             try {
               rpcResult = await threadBroker.runExclusive(rpcThreadId, async () => {
                 if (threadBroker.isWriterReady(rpcThreadId)) {
-                  return await appServer.rpc('thread/read', rpcParams)
+                  return await readThreadSnapshotForObserver(appServer, rpcThreadId)
                 }
                 const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
                 threadBroker.markWriterReady(rpcThreadId)
@@ -9346,7 +9462,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               if (!isActiveThreadWriterError(error)) throw error
               // A different app-server process owns this thread.  Preserve the
               // observer contract by returning the current read-only snapshot.
-              rpcResult = await appServer.rpc('thread/read', rpcParams)
+              rpcResult = await readThreadSnapshotForObserver(appServer, rpcThreadId)
             }
           } else if (rpcThreadId && ['turn/steer', 'turn/interrupt', 'thread/rollback'].includes(body.method)) {
             rpcResult = await threadBroker.runExclusive(
@@ -9549,6 +9665,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             ...summaryRecord,
             thread: mergedThread,
             partial: true,
+            // A full app-server hydration of a large rollout is deliberately
+            // deferred.  The client should keep the bounded projection as
+            // the live view instead of immediately issuing a multi-megabyte
+            // thread/read in the background.
+            fullHydrationDeferred: sessionTail.size > OBSERVER_FULL_READ_MAX_BYTES,
             hasMoreOlder: sessionTail.size > FAST_THREAD_SESSION_TAIL_BYTES || turns.length >= THREAD_RESPONSE_TURN_LIMIT,
             inProgress,
             sessionActivityKnown: sessionActivity.known,
@@ -9687,7 +9808,14 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
           if (sessionPath && isAbsolute(sessionPath) && sessionSize > 0) {
             try {
-              const sessionLogRaw = await readFile(sessionPath, 'utf8')
+              // Large session logs are common for long-running Codex tasks.
+              // Reading the whole JSONL here defeats the observer fast path
+              // and can block both clients while app-server materializes the
+              // same rollout.  The bounded tail still contains the recent
+              // turn/command ordering needed for the live view.
+              const sessionLogRaw = sessionSize > OBSERVER_FULL_READ_MAX_BYTES
+                ? (await readSessionTailForFastThread(sessionPath)).raw
+                : await readFile(sessionPath, 'utf8')
               turns = mergeSessionCommandsIntoTurns(turns, sessionLogRaw)
 
               // If the projection remained stale after the retry window,

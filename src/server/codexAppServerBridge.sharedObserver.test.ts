@@ -541,6 +541,64 @@ describe('shared thread observer HTTP path', () => {
     }
   })
 
+  it('keeps live-state reads bounded for a large session without materializing full turns', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-bridge-'))
+    const sessionPath = join(directory, 'rollout-large-thread.jsonl')
+    const timestamp = new Date().toISOString()
+    const filler = JSON.stringify({
+      timestamp,
+      type: 'session_meta',
+      payload: { id: 'shared-thread', padding: 'x'.repeat(9 * 1024 * 1024) },
+    })
+    const tailRows = [
+      { timestamp, type: 'turn_context', payload: { turn_id: 'turn-large' } },
+      { timestamp, type: 'response_item', payload: {
+        type: 'message', role: 'user', id: 'user-large', content: [{ type: 'input_text', text: 'large session' }],
+      } },
+      { timestamp, type: 'response_item', payload: {
+        type: 'message', role: 'assistant', id: 'assistant-large', content: [{ type: 'output_text', text: 'large answer' }],
+      } },
+      { timestamp, type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-large' } },
+    ]
+    await writeFile(sessionPath, `${filler}\n${tailRows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8')
+
+    const fake = installFakeSharedBridge({
+      threadReadResults: [{
+        thread: {
+          id: 'shared-thread',
+          path: sessionPath,
+          status: { type: 'inProgress' },
+          turns: [],
+        },
+      }],
+    })
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/thread-live-state?threadId=shared-thread`)
+      expect(response.status).toBe(200)
+      const payload = await response.json() as {
+        isInProgress?: boolean
+        thread?: { turns?: Array<{ id?: string }> }
+      }
+      expect(payload.isInProgress).toBe(true)
+      expect(payload.thread?.turns).toContainEqual(expect.objectContaining({ id: 'turn-large' }))
+      expect(fake.calls.some((call) => call.method === 'thread/read' && (call.params as { includeTurns?: boolean })?.includeTurns === true)).toBe(false)
+      expect(fake.calls.some((call) => call.method === 'thread/read' && (call.params as { includeTurns?: boolean })?.includeTurns === false)).toBe(true)
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('does not resume the same thread twice when two clients open it concurrently', async () => {
     const fake = installFakeSharedBridge()
     const instance = createServer()
@@ -659,7 +717,9 @@ describe('shared thread observer HTTP path', () => {
       })
 
       expect(response.status).toBe(200)
-      expect(fake.calls.map((call) => call.method)).toEqual(['thread/resume', 'thread/read'])
+      expect(fake.calls.map((call) => call.method)).toEqual(['thread/resume', 'thread/read', 'thread/read'])
+      expect((fake.calls[1]?.params as { includeTurns?: boolean })?.includeTurns).toBe(false)
+      expect((fake.calls[2]?.params as { includeTurns?: boolean })?.includeTurns).toBe(true)
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
       instance.dispose()
