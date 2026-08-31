@@ -24,6 +24,22 @@ type ServerRequestReplyBody = {
   }
 }
 
+const TASK_CLIENT_ID_KEY = 'codex-web-local.task-client-id.v1'
+
+/** Identity headers let the bridge distinguish a browser observer from the writer. */
+export function getTaskClientHeaders(): Record<string, string> {
+  if (typeof window === 'undefined') return { 'x-codex-client-id': 'server', 'x-codex-client-type': 'unknown' }
+  let clientId = window.localStorage.getItem(TASK_CLIENT_ID_KEY)?.trim() ?? ''
+  if (!clientId) {
+    clientId = `web-${Math.random().toString(36).slice(2, 10)}`
+    window.localStorage.setItem(TASK_CLIENT_ID_KEY, clientId)
+  }
+  return {
+    'x-codex-client-id': clientId,
+    'x-codex-client-type': /android|mobile/i.test(navigator.userAgent) ? 'android' : 'desktop',
+  }
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -39,6 +55,7 @@ export async function rpcCall<T>(method: string, params?: unknown): Promise<T> {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        ...getTaskClientHeaders(),
       },
       body: JSON.stringify(body),
     })
