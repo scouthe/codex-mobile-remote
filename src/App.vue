@@ -2379,7 +2379,14 @@ function syncAndroidTaskNotification(
     return
   }
 
-  if (previousThreadId && previousThreadId === next.threadId && previousState && ANDROID_TASK_ACTIVE_STATES.has(previousState)) {
+  // Queue state can briefly become empty while the server promotes its next
+  // message into a running turn. Do not report that intermediate gap as a
+  // completed task; only an already-started turn may transition to terminal.
+  const previousTurnWasStarted = previousState === 'running'
+    || previousState === 'waiting_approval'
+    || previousState === 'waiting_user_input'
+    || previousState === 'steering'
+  if (previousThreadId && previousThreadId === next.threadId && previousState && previousTurnWasStarted) {
     const terminalState = androidInterruptRequestedThreads.has(previousThreadId) ? 'canceled' : 'completed'
     androidInterruptRequestedThreads.delete(previousThreadId)
     clearAndroidSteeringMarker()
