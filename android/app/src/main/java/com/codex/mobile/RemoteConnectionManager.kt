@@ -20,23 +20,24 @@ class RemoteConnectionManager(
     private val connectivityManager =
         context.applicationContext.getSystemService(ConnectivityManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile
     private var registered = false
     private var retryAttempt = 0
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
-            mainHandler.post(onNetworkAvailable)
+            if (registered) mainHandler.post(onNetworkAvailable)
         }
 
         override fun onLost(network: Network) {
-            if (!isOnline()) mainHandler.post(onNetworkLost)
+            if (registered && !isOnline()) mainHandler.post(onNetworkLost)
         }
 
         override fun onCapabilitiesChanged(
             network: Network,
             networkCapabilities: NetworkCapabilities,
         ) {
-            if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+            if (registered && networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
                 mainHandler.post(onNetworkAvailable)
             }
         }

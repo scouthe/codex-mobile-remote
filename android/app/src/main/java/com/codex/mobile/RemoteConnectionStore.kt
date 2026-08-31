@@ -38,6 +38,7 @@ class RemoteConnectionStore(context: Context) {
         fun normalizeUrl(raw: String): String? {
             val value = raw.trim()
             if (value.isEmpty() || value.length > 2048) return null
+            if (value.any { it.isISOControl() || it.isWhitespace() }) return null
             val uri = try {
                 Uri.parse(value)
             } catch (_: Exception) {
@@ -109,6 +110,14 @@ class RemoteConnectionStore(context: Context) {
         } catch (_: Exception) {
             // A key can be invalidated after a device restore or lock-screen
             // change. Forget the unreadable value instead of blocking startup.
+            try {
+                KeyStore.getInstance("AndroidKeyStore").apply {
+                    load(null)
+                    deleteEntry(KEY_ALIAS)
+                }
+            } catch (_: Exception) {
+                // Best effort; the next save will surface a useful error.
+            }
             preferences.edit().remove(PASSWORD_KEY).apply()
             null
         }

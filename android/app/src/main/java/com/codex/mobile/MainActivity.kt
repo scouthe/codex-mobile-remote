@@ -39,6 +39,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -85,6 +86,7 @@ class MainActivity : AppCompatActivity() {
     private var pageReady = false
     private var passwordAttempted = false
     private var pendingNotification: TaskNotification? = null
+    private var shareDispatched = false
 
     private val shareLock = Any()
     private var pendingShareText: String? = null
@@ -183,6 +185,7 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         dispatchWindowEvent("codex-native-resume")
+        requestPendingNotificationPermission()
         if (mainFrameFailed && connectionManager.isOnline()) scheduleReconnect()
     }
 
@@ -318,7 +321,11 @@ class MainActivity : AppCompatActivity() {
             ) {
                 // Never provide a certificate bypass for a remote command UI.
                 handler.cancel()
-                onMainFrameFailure(getString(R.string.error_tls_certificate), retry = false)
+                if (isAllowedInWebView(Uri.parse(error.url))) {
+                    onMainFrameFailure(getString(R.string.error_tls_certificate), retry = false)
+                } else {
+                    Log.w(TAG, "Rejected certificate for subresource: ${error.url}")
+                }
             }
         }
 
@@ -623,6 +630,7 @@ class MainActivity : AppCompatActivity() {
         synchronized(shareLock) {
             pendingShareText = text
             pendingShareUris.clear()
+            shareDispatched = false
             uris.distinct().forEach { uri ->
                 val key = uri.toString()
                 pendingShareUris[key] = SharedContent(
@@ -669,10 +677,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun dispatchPendingShare() {
+        synchronized(shareLock) {
+            if (shareDispatched) return
+        }
         val payload = pendingShareJson()
-        val hasText = payload.optString("text").isNotEmpty()
+        val hasText = synchronized(shareLock) { !pendingShareText.isNullOrBlank() }
         val hasFiles = payload.optJSONArray("files")?.length()?.let { it > 0 } == true
         if (!hasText && !hasFiles) return
+        synchronized(shareLock) { shareDispatched = true }
         dispatchWindowEvent("codex-native-share", payload)
     }
 
@@ -713,7 +725,7 @@ class MainActivity : AppCompatActivity() {
             PackageManager.PERMISSION_GRANTED
         ) {
             pendingNotification = notification
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            requestPendingNotificationPermission()
             return
         }
         CodexForegroundService.showTask(
@@ -723,6 +735,30 @@ class MainActivity : AppCompatActivity() {
             detail,
             currentProfile?.baseUrl.orEmpty(),
         )
+    }
+
+    private fun requestPendingNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val pending = pendingNotification ?: return
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingNotification = null
+            CodexForegroundService.showTask(
+                this,
+                pending.state,
+                pending.title,
+                pending.detail,
+                currentProfile?.baseUrl.orEmpty(),
+            )
+            return
+        }
+        try {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } catch (error: IllegalStateException) {
+            Log.w(TAG, "Notification permission request deferred", error)
+        }
     }
 
     inner class AndroidBridge {

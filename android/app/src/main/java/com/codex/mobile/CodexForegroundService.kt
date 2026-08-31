@@ -45,7 +45,13 @@ class CodexForegroundService : Service() {
                 putExtra(EXTRA_DETAIL, detail)
                 putExtra(EXTRA_SERVER_URL, serverUrl)
             }
-            ContextCompat.startForegroundService(context, intent)
+            try {
+                ContextCompat.startForegroundService(context, intent)
+            } catch (_: RuntimeException) {
+                // Android 12+ can reject a foreground-service start while the
+                // app is backgrounded. The WebView will still show the state
+                // when it resumes; never crash the remote client for a badge.
+            }
         }
 
         fun clearTask(context: Context) {
