@@ -74,6 +74,10 @@ export type TaskActiveRequest = {
 export type TaskSnapshot = {
   threadId: string
   state: TaskState
+  /** The turn currently owning the task, when the session exposes one. */
+  activeTurnId: string
+  /** The most recently terminal turn, retained to reject delayed old events. */
+  terminalTurnId: string
   currentActivity: TaskActivity
   queueDepth: number
   activeRequest: TaskActiveRequest | null
@@ -92,11 +96,15 @@ export type TaskObservation = {
   notification?: Pick<RpcNotification, 'method' | 'params' | 'atIso' | 'seq' | 'streamEpoch'>
   inProgress?: boolean
   activeTurnId?: string
+  terminalTurnId?: string
   queue?: TaskQueueSummary
   activeRequest?: TaskActiveRequest | null
   writerClient?: TaskWriterIdentity | null
   streamCursor?: TaskStreamCursor | null
   error?: string | null
+  /** Terminal state observed from the shared session marker. */
+  terminalState?: 'completed' | 'failed' | 'canceled' | ''
+  terminalError?: string
   revision?: string
 }
 
@@ -108,6 +116,7 @@ export type TaskStateTransition = {
 
 export const TASK_STATE_TRANSITIONS: readonly TaskStateTransition[] = [
   { from: '*', event: 'queue/enqueued', to: 'queued' },
+  { from: 'queued', event: 'queue/updated:processing', to: 'starting' },
   { from: 'queued', event: 'turn/started', to: 'starting' },
   { from: 'starting', event: 'item/started', to: 'running' },
   { from: 'starting', event: 'activity', to: 'running' },

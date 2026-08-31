@@ -79,6 +79,12 @@ export type UiThread = {
   sessionRevision?: string
   /** True when `inProgress` came from a session activity marker. */
   sessionActivityKnown?: boolean
+  /** Unified task-center state when the bridge can project it for a list row. */
+  taskState?: 'queued' | 'starting' | 'running' | 'waiting_approval' | 'waiting_user_input' | 'steering' | 'completed' | 'failed' | 'canceled'
+  /** Most recently terminal turn, used to reject delayed stream events. */
+  terminalTurnId?: string
+  /** Terminal task error projected from the shared session marker. */
+  taskError?: string
   pendingRequestState?: UiPendingRequestState | null
 }
 

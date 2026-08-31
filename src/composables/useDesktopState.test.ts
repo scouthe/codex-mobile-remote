@@ -25,6 +25,8 @@ const gatewayMocks = vi.hoisted(() => ({
   getThreadFastDetail: vi.fn(),
   getThreadLiveState: vi.fn(),
   enqueueThreadMessage: vi.fn(),
+  removeQueuedThreadMessage: vi.fn(),
+  reorderQueuedThreadMessage: vi.fn(),
   getThreadGroupsPage: vi.fn(),
   getThreadQueueState: vi.fn(),
   getThreadTitleCache: vi.fn(),
@@ -897,7 +899,10 @@ describe('shared session activity polling', () => {
       clearInterval: clearIntervalMock,
     })
     gatewayMocks.subscribeCodexNotifications.mockReturnValue(unsubscribe)
-    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('retry-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
     gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
 
     const state = useDesktopState()
@@ -968,6 +973,84 @@ describe('thread selection latency', () => {
     await new Promise((resolve) => setTimeout(resolve, 350))
     expect(gatewayMocks.getThreadFastDetail).toHaveBeenCalledWith('fast-thread')
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('fast-thread')
+  })
+
+  it('does not let a stale plain thread read clear a newer active task snapshot', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        messages: [{ id: 'active', role: 'assistant', text: 'working', messageType: 'agentMessage' }],
+        inProgress: true,
+        activeTurnId: 'turn-new',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+      })
+      .mockResolvedValueOnce({
+        messages: [{ id: 'stale', role: 'assistant', text: 'old projection', messageType: 'agentMessage' }],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        taskState: 'completed',
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('stale-read-thread')
+    await state.loadMessages('stale-read-thread', { force: true })
+    await state.loadMessages('stale-read-thread', { force: true })
+
+    expect(state.selectedTaskSnapshot.value).toMatchObject({
+      state: 'running',
+      activeTurnId: 'turn-new',
+    })
+  })
+
+  it('ignores late item and completion events from an older turn', async () => {
+    installTestWindow()
+    let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('out-of-order-thread')
+    await state.loadMessages('out-of-order-thread')
+    gatewayMocks.getThreadDetail.mockImplementation(() => new Promise(() => {}))
+    gatewayMocks.getThreadGroupsPage.mockImplementation(() => new Promise(() => {}))
+    state.startPolling()
+
+    notificationHandler({
+      method: 'turn/started',
+      params: { threadId: 'out-of-order-thread', turn: { id: 'turn-new' } },
+    })
+    notificationHandler({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'out-of-order-thread', turnId: 'turn-old', itemId: 'old-item', delta: 'stale' },
+    })
+    notificationHandler({
+      method: 'turn/completed',
+      params: {
+        threadId: 'out-of-order-thread',
+        turnId: 'turn-old',
+        turn: { id: 'turn-old', status: 'completed' },
+      },
+    })
+
+    expect(state.selectedTaskSnapshot.value).toMatchObject({
+      state: 'starting',
+      activeTurnId: 'turn-new',
+    })
+    expect(state.selectedLiveOverlay.value?.errorText).toBe('')
   })
 })
 
@@ -1144,6 +1227,66 @@ describe('live error overlay', () => {
     )
   })
 
+  it('appends behind an existing queue even when the session itself is idle', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('queued-idle-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.getThreadQueueState.mockResolvedValue({
+      'queued-idle-thread': [{
+        id: 'q-existing',
+        text: 'existing queued work',
+        imageUrls: [],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        createdAtIso: '2026-08-31T00:00:00.000Z',
+        sourceClientId: 'desktop',
+        status: 'queued',
+        attempts: 0,
+        lastError: '',
+      }],
+    })
+    gatewayMocks.enqueueThreadMessage.mockImplementation(async (_threadId, message) => ({
+      inserted: true,
+      queue: [{
+        id: 'q-existing',
+        text: 'existing queued work',
+        imageUrls: [],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        createdAtIso: '2026-08-31T00:00:00.000Z',
+        sourceClientId: 'desktop',
+        status: 'queued',
+        attempts: 0,
+        lastError: '',
+      }, message],
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('queued-idle-thread')
+    await state.refreshAll({ includeSelectedThreadMessages: true })
+    await state.sendMessageToSelectedThread('run after existing queue')
+
+    expect(gatewayMocks.enqueueThreadMessage).toHaveBeenCalledWith(
+      'queued-idle-thread',
+      expect.objectContaining({ text: 'run after existing queue', status: 'queued' }),
+    )
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.selectedThreadQueuedMessages.value).toHaveLength(2)
+  })
+
   it('keeps normal send and explicit steer as separate task operations', async () => {
     installTestWindow()
     gatewayMocks.getPendingServerRequests.mockResolvedValue([])
@@ -1207,6 +1350,74 @@ describe('live error overlay', () => {
     expect(state.selectedTaskSnapshot.value?.error).toBeNull()
   })
 
+  it('clears the reducer active state when a direct start fails before turn/started', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5', modelProvider: 'openai', messages: [], inProgress: false,
+      activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+    gatewayMocks.resumeThread.mockResolvedValue({ model: 'gpt-5.5', modelProvider: 'openai' })
+    gatewayMocks.startThreadTurn.mockRejectedValue(new Error('provider unavailable'))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('start-failure-thread')
+    await state.loadMessages('start-failure-thread')
+
+    await expect(state.sendTaskMessage('should fail')).rejects.toThrow('provider unavailable')
+
+    expect(state.selectedTaskSnapshot.value?.state).toBe('completed')
+    expect(state.selectedTaskSnapshot.value?.activeTurnId).toBe('')
+  })
+
+  it('uses the shared live turn id when stopping an externally-owned task', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [],
+      inProgress: true,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.getThreadLiveState.mockResolvedValueOnce({
+      messages: [],
+      inProgress: true,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+      sessionActivityKnown: true,
+      sessionRevision: 'active-revision',
+      streamCursor: null,
+      liveStateError: null,
+    }).mockResolvedValueOnce({
+      messages: [],
+      inProgress: true,
+      activeTurnId: 'desktop-turn-1',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+      sessionActivityKnown: true,
+      sessionRevision: 'active-revision',
+      streamCursor: null,
+      liveStateError: null,
+      taskState: 'running',
+      currentActivity: { kind: 'thinking', label: 'Thinking', details: [] },
+      queueDepth: 0,
+      activeRequest: null,
+      writerClient: null,
+      startedAt: null,
+      finishedAt: null,
+      timeline: [],
+    })
+    gatewayMocks.interruptThreadTurn.mockResolvedValue(undefined)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('external-task')
+    await state.loadMessages('external-task')
+    await state.interruptTask()
+
+    expect(gatewayMocks.interruptThreadTurn).toHaveBeenCalledWith('external-task', 'desktop-turn-1')
+  })
+
   it('keeps a new live error visible when an older persisted turn error exists', async () => {
     installTestWindow()
     let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}
@@ -1250,6 +1461,10 @@ describe('live error overlay', () => {
     })
 
     expect(state.selectedLiveOverlay.value?.errorText).toBe('new live failure')
+    expect(state.selectedTaskSnapshot.value).toMatchObject({
+      state: 'failed',
+      error: 'new live failure',
+    })
   })
 
   it('suppresses a live error only after that same error has persisted', async () => {
@@ -1295,6 +1510,239 @@ describe('live error overlay', () => {
     })
 
     expect(state.selectedLiveOverlay.value).toBe(null)
+  })
+})
+
+describe.sequential('pending request state hydration', () => {
+  it('applies sidebar request flags after reconnect hydration', async () => {
+    installTestWindow()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | null = null
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('pending-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([{
+      id: 42,
+      method: 'item/commandExecution/requestApproval',
+      params: { threadId: 'pending-thread' },
+      receivedAtIso: '2026-08-31T00:00:00.000Z',
+    }])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [],
+      inProgress: true,
+      activeTurnId: 'turn-1',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('pending-thread')
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    // Keep the periodic status refresh in flight so this assertion exercises
+    // the pending-request replacement path itself rather than a later thread
+    // list refresh that happens to re-derive the same flag.
+    gatewayMocks.getThreadGroupsPage.mockImplementation(() => new Promise(() => {}))
+    state.startPolling()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(state.projectGroups.value[0]?.threads[0]?.pendingRequestState).toBe('approval')
+    notificationHandler = null
+  })
+
+  it('clears bridge-local pending request flags from an authoritative idle snapshot', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('stale-request-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([{
+      id: 43,
+      method: 'item/commandExecution/requestApproval',
+      params: { threadId: 'stale-request-thread' },
+      receivedAtIso: '2026-08-31T00:00:00.000Z',
+    }])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+      taskState: 'completed',
+      activeRequest: null,
+      error: null,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('stale-request-thread')
+    await state.refreshAll({ includeSelectedThreadMessages: true })
+
+    expect(state.selectedThreadServerRequests.value).toEqual([])
+    expect(state.projectGroups.value[0]?.threads[0]?.pendingRequestState).toBeNull()
+    expect(state.selectedTaskSnapshot.value?.state).toBe('completed')
+    expect(state.selectedTaskSnapshot.value?.activeRequest).toBeNull()
+  })
+
+  it('does not resurrect a resolved request from a stale reconnect response', async () => {
+    installTestWindow()
+    let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}
+    let pendingRequestReadResolve: (value: unknown) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    gatewayMocks.getThreadGroupsPage.mockImplementation(() => new Promise(() => {}))
+    gatewayMocks.getPendingServerRequests.mockImplementation(() => new Promise((resolve) => {
+      pendingRequestReadResolve = resolve
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('pending-race-thread')
+    state.startPolling()
+
+    const request = {
+      id: 44,
+      method: 'item/commandExecution/requestApproval',
+      params: { threadId: 'pending-race-thread' },
+      receivedAtIso: '2026-08-31T00:00:00.000Z',
+    }
+    notificationHandler({ method: 'server/request', params: request })
+    notificationHandler({
+      method: 'server/request/resolved',
+      params: { id: request.id, threadId: 'pending-race-thread' },
+    })
+
+    pendingRequestReadResolve([request])
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(state.selectedThreadServerRequests.value).toEqual([])
+    expect(state.selectedTaskSnapshot.value?.activeRequest).toBeNull()
+  })
+
+  it('does not turn an emptied queue into a running task', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('queue-drained-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    const queued = {
+      id: 'q-drain',
+      text: 'queued work',
+      imageUrls: [],
+      skills: [],
+      fileAttachments: [],
+      collaborationMode: 'default' as const,
+      createdAtIso: '2026-08-31T00:00:00.000Z',
+      sourceClientId: 'web-test',
+      status: 'queued' as const,
+      attempts: 0,
+      lastError: '',
+    }
+    gatewayMocks.getThreadQueueState
+      .mockResolvedValueOnce({ 'queue-drained-thread': [queued] })
+      .mockResolvedValueOnce({})
+
+    const state = useDesktopState()
+    state.primeSelectedThread('queue-drained-thread')
+    await state.refreshAll({ includeSelectedThreadMessages: true })
+    expect(state.selectedTaskSnapshot.value?.state).toBe('queued')
+
+    gatewayMocks.removeQueuedThreadMessage.mockResolvedValue([])
+    await state.removeQueuedMessage('q-drain')
+
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+    expect(state.selectedTaskSnapshot.value?.state).toBe('completed')
+  })
+
+  it('does not replace an enqueue failure with a destructive whole-queue write', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: true,
+      activeTurnId: 'turn-1',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.enqueueThreadMessage.mockRejectedValue(new Error('queue endpoint unavailable'))
+    gatewayMocks.getThreadQueueState.mockResolvedValue({})
+
+    const state = useDesktopState()
+    state.primeSelectedThread('queue-write-failure')
+    await state.loadMessages('queue-write-failure')
+
+    await expect(state.sendTaskMessage('must not be lost')).rejects.toThrow('queue endpoint unavailable')
+
+    expect(gatewayMocks.setThreadQueueState).not.toHaveBeenCalled()
+    expect(state.selectedThreadQueuedMessages.value).toEqual([])
+  })
+
+  it('refreshes the queue list when another client emits a queue update', async () => {
+    installTestWindow()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | null = null
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [thread('remote-queue-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.getThreadQueueState.mockResolvedValue({})
+
+    const state = useDesktopState()
+    state.startPolling()
+    await Promise.resolve()
+    gatewayMocks.getThreadQueueState.mockClear()
+    gatewayMocks.getThreadQueueState.mockResolvedValue({
+      'remote-queue-thread': [{
+        id: 'q-remote',
+        text: 'from another client',
+        imageUrls: [],
+        skills: [],
+        fileAttachments: [],
+        collaborationMode: 'default',
+        createdAtIso: '2026-08-31T00:00:00.000Z',
+        sourceClientId: 'desktop',
+        status: 'queued',
+        attempts: 0,
+        lastError: '',
+      }],
+    })
+
+    const emitNotification = notificationHandler as ((notification: { method: string; params?: unknown }) => void) | null
+    if (emitNotification) {
+      emitNotification({
+        method: 'queue/updated',
+        params: { threadId: 'remote-queue-thread', queueDepth: 1, status: 'enqueued' },
+      })
+    }
+    await Promise.resolve()
+    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(gatewayMocks.getThreadQueueState).toHaveBeenCalled()
+    expect(state.taskSnapshotsByThreadId.value['remote-queue-thread']).toMatchObject({ state: 'queued', queueDepth: 1 })
   })
 })
 

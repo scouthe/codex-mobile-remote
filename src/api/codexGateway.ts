@@ -744,6 +744,7 @@ export type ThreadLiveState = {
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
+  terminalTurnId?: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
   /** Optional bridge-side marker for changes written by another client. */
@@ -763,6 +764,7 @@ export type ThreadLiveState = {
   writerClient?: TaskWriterIdentity | null
   startedAt?: string | null
   finishedAt?: string | null
+  error?: string | null
   timeline?: TaskTimelineEvent[]
 }
 
@@ -804,11 +806,14 @@ async function getThreadDetailV2(threadId: string): Promise<{
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
+  terminalTurnId?: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
   sessionRevision?: string
   sessionActivityKnown?: boolean
   partial?: boolean
+  taskState?: TaskState
+  error?: string | null
 }> {
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
@@ -824,16 +829,35 @@ async function getThreadDetailV2(threadId: string): Promise<{
       ? String(rawRevision)
       : ''
   const sessionActivityKnown = rawThread?.sessionActivityKnown === true
+  const terminalTurnId = readString(rawThread?.terminalTurnId)
+  const rawTurns = Array.isArray(rawThread?.turns) ? rawThread.turns : []
+  const lastTurn = asRecord(rawTurns.at(-1))
+  const rawTurnStatus = asRecord(lastTurn?.status)
+  const turnStatus = (readString(lastTurn?.status) || readString(rawTurnStatus?.type) || '').toLowerCase()
+  const turnErrorRecord = asRecord(lastTurn?.error)
+  const turnError = readString(turnErrorRecord?.message) || readString(lastTurn?.error)
+  const terminalState = (readString(rawThread?.terminalState) ?? '').toLowerCase()
+  const terminalError = readString(rawThread?.terminalError) || turnError
+  const taskState: TaskState = terminalState === 'failed' || turnStatus === 'failed'
+    ? 'failed'
+    : terminalState === 'canceled'
+      ? 'canceled'
+      : readThreadInProgressFromResponse(payload)
+        ? 'running'
+        : 'completed'
   return {
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
     inProgress: readThreadInProgressFromResponse(payload),
     activeTurnId: readActiveTurnIdFromResponse(payload),
+    ...(terminalTurnId ? { terminalTurnId } : {}),
     hasMoreOlder: startTurnIndex > 0,
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
     ...(sessionRevision ? { sessionRevision } : {}),
     ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
+    taskState,
+    error: taskState === 'failed' ? (terminalError || 'Task failed') : null,
   }
 }
 
@@ -843,11 +867,26 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
+  terminalTurnId?: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
   sessionRevision?: string
   sessionActivityKnown?: boolean
+  streamCursor?: {
+    streamEpoch: string
+    latestSeq: number
+    oldestSeq: number | null
+  } | null
   partial: boolean
+  taskState?: TaskState
+  currentActivity?: TaskActivity
+  queueDepth?: number
+  activeRequest?: TaskActiveRequest | null
+  writerClient?: TaskWriterIdentity | null
+  startedAt?: string | null
+  finishedAt?: string | null
+  error?: string | null
+  timeline?: TaskTimelineEvent[]
 }> {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) throw new Error('Missing thread id')
@@ -859,8 +898,19 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
     hasMoreOlder?: unknown
     inProgress?: unknown
     activeTurnId?: unknown
+    terminalTurnId?: unknown
     sessionRevision?: unknown
     sessionActivityKnown?: unknown
+    streamCursor?: unknown
+    taskState?: unknown
+    currentActivity?: unknown
+    queueDepth?: unknown
+    activeRequest?: unknown
+    writerClient?: unknown
+    startedAt?: unknown
+    finishedAt?: unknown
+    error?: unknown
+    timeline?: unknown
   }
   if (!response.ok) {
     throw new Error(`Fast thread state request failed with ${response.status}`)
@@ -884,6 +934,75 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
   const activeTurnId = typeof payload.activeTurnId === 'string'
     ? payload.activeTurnId.trim()
     : readActiveTurnIdFromResponse(payload)
+  const terminalTurnId = typeof payload.terminalTurnId === 'string'
+    ? payload.terminalTurnId.trim()
+    : ''
+  const taskStates: TaskState[] = [
+    'queued', 'starting', 'running', 'waiting_approval', 'waiting_user_input',
+    'steering', 'completed', 'failed', 'canceled',
+  ]
+  const taskState = typeof payload.taskState === 'string' && taskStates.includes(payload.taskState as TaskState)
+    ? payload.taskState as TaskState
+    : undefined
+  const streamCursorRecord = asRecord(payload.streamCursor)
+  const streamCursor = streamCursorRecord
+    && typeof streamCursorRecord.streamEpoch === 'string'
+    && typeof streamCursorRecord.latestSeq === 'number'
+    ? {
+      streamEpoch: streamCursorRecord.streamEpoch,
+      latestSeq: Math.max(0, Math.trunc(streamCursorRecord.latestSeq)),
+      oldestSeq: typeof streamCursorRecord.oldestSeq === 'number' ? Math.max(0, Math.trunc(streamCursorRecord.oldestSeq)) : null,
+    }
+    : payload.streamCursor === null ? null : undefined
+  const activityRecord = asRecord(payload.currentActivity)
+  const activityKinds: TaskActivity['kind'][] = [
+    'thinking', 'command', 'file_change', 'response', 'approval', 'user_input', 'queue', 'error', 'idle',
+  ]
+  const activityKind = typeof activityRecord?.kind === 'string' && activityKinds.includes(activityRecord.kind as TaskActivity['kind'])
+    ? activityRecord.kind as TaskActivity['kind']
+    : undefined
+  const currentActivity = activityKind
+    ? {
+      kind: activityKind,
+      label: readString(activityRecord?.label) || 'Idle',
+      details: Array.isArray(activityRecord?.details)
+        ? activityRecord.details.filter((item): item is string => typeof item === 'string')
+        : [],
+    }
+    : undefined
+  const activeRequestRecord = asRecord(payload.activeRequest)
+  const activeRequest = activeRequestRecord && typeof activeRequestRecord.id === 'number'
+    ? {
+      id: Math.trunc(activeRequestRecord.id),
+      kind: activeRequestRecord.kind === 'approval' || activeRequestRecord.kind === 'user_input' ? activeRequestRecord.kind : 'other',
+      method: readString(activeRequestRecord.method),
+      receivedAtIso: readString(activeRequestRecord.receivedAtIso),
+    } as TaskActiveRequest
+    : payload.activeRequest === null ? null : undefined
+  const writerClient = payload.writerClient && typeof payload.writerClient === 'object'
+    ? payload.writerClient as TaskWriterIdentity
+    : payload.writerClient === null ? null : undefined
+  const timeline = Array.isArray(payload.timeline)
+    ? payload.timeline.flatMap((item) => {
+      const row = asRecord(item)
+      if (!row) return []
+      const id = readString(row.id)
+      const type = readString(row.type)
+      const atIso = readString(row.atIso)
+      const label = readString(row.label)
+      if (!id || !type || !atIso || !label) return []
+      return [{
+        id,
+        type: type as TaskTimelineEvent['type'],
+        atIso,
+        label,
+        details: Array.isArray(row.details) ? row.details.filter((value): value is string => typeof value === 'string') : [],
+        turnId: readString(row.turnId) ?? '',
+        ...(typeof row.itemId === 'string' ? { itemId: row.itemId } : {}),
+        ...(typeof row.status === 'string' ? { status: row.status as TaskTimelineEvent['status'] } : {}),
+      }]
+    })
+    : undefined
   return {
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
@@ -894,6 +1013,17 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
     ...(sessionRevision ? { sessionRevision } : {}),
     ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
+    ...(streamCursor !== undefined ? { streamCursor } : {}),
+    ...(terminalTurnId ? { terminalTurnId } : {}),
+    ...(taskState ? { taskState } : {}),
+    ...(currentActivity ? { currentActivity } : {}),
+    ...(typeof payload.queueDepth === 'number' ? { queueDepth: Math.max(0, Math.trunc(payload.queueDepth)) } : {}),
+    ...(activeRequest !== undefined ? { activeRequest } : {}),
+    ...(writerClient !== undefined ? { writerClient } : {}),
+    ...(typeof payload.startedAt === 'string' ? { startedAt: payload.startedAt } : payload.startedAt === null ? { startedAt: null } : {}),
+    ...(typeof payload.finishedAt === 'string' ? { finishedAt: payload.finishedAt } : payload.finishedAt === null ? { finishedAt: null } : {}),
+    ...(typeof payload.error === 'string' ? { error: payload.error } : payload.error === null ? { error: null } : {}),
+    ...(timeline ? { timeline } : {}),
     partial: true,
   }
 }
@@ -973,11 +1103,14 @@ export async function getThreadDetail(threadId: string): Promise<{
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
+  terminalTurnId?: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
   sessionRevision?: string
   sessionActivityKnown?: boolean
   partial?: boolean
+  taskState?: TaskState
+  error?: string | null
 }> {
   try {
     return await getThreadDetailV2(threadId)
@@ -997,11 +1130,26 @@ export async function getThreadFastDetail(threadId: string): Promise<{
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
+  terminalTurnId?: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
   sessionRevision?: string
   sessionActivityKnown?: boolean
+  streamCursor?: {
+    streamEpoch: string
+    latestSeq: number
+    oldestSeq: number | null
+  } | null
   partial: boolean
+  taskState?: TaskState
+  currentActivity?: TaskActivity
+  queueDepth?: number
+  activeRequest?: TaskActiveRequest | null
+  writerClient?: TaskWriterIdentity | null
+  startedAt?: string | null
+  finishedAt?: string | null
+  error?: string | null
+  timeline?: TaskTimelineEvent[]
 }> {
   try {
     return await getThreadFastDetailV2(threadId)
@@ -1114,6 +1262,7 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
     const writerClient = record?.writerClient && typeof record.writerClient === 'object'
       ? record.writerClient as TaskWriterIdentity
       : record?.writerClient === null ? null : undefined
+    const terminalTurnId = readString(record?.terminalTurnId) || readString(thread?.terminalTurnId)
     const liveStateErrorRecord = asRecord(record?.liveStateError)
     const explicitInProgress = sessionActivityKnown
       ? typeof record?.isInProgress === 'boolean'
@@ -1133,7 +1282,8 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       // an old projected in-progress turn resurrect the spinner after the
       // desktop task has completed.
       inProgress: explicitInProgress ?? readThreadInProgressFromResponse(threadPayload),
-      activeTurnId: readActiveTurnIdFromResponse(threadPayload),
+      activeTurnId: readString(record?.activeTurnId) || readActiveTurnIdFromResponse(threadPayload),
+      ...(terminalTurnId ? { terminalTurnId } : {}),
       hasMoreOlder: readThreadTurnStartIndex(threadPayload) > 0,
       turnIndexByTurnId: buildTurnIndexByTurnId(threadPayload, readThreadTurnStartIndex(threadPayload)),
       ...(sessionRevision ? { sessionRevision } : {}),
@@ -1147,6 +1297,7 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       ...(writerClient !== undefined ? { writerClient } : {}),
       ...(typeof record?.startedAt === 'string' ? { startedAt: record.startedAt } : {}),
       ...(typeof record?.finishedAt === 'string' ? { finishedAt: record.finishedAt } : {}),
+      ...(typeof record?.error === 'string' ? { error: record.error } : record?.error === null ? { error: null } : {}),
       ...(timeline ? { timeline } : {}),
     }
   } catch (error) {
@@ -2936,11 +3087,17 @@ export async function setThreadQueueState(nextState: ThreadQueueState): Promise<
 export async function enqueueThreadMessage(
   threadId: string,
   message: StoredQueuedMessage,
+  beforeMessageId?: string,
 ): Promise<{ inserted: boolean; queue: StoredQueuedMessage[] }> {
+  const normalizedBeforeMessageId = beforeMessageId?.trim() ?? ''
   const response = await fetch('/codex-api/thread-queue/enqueue', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ threadId, message: normalizeStoredQueuedMessage(message) }),
+    body: JSON.stringify({
+      threadId,
+      message: normalizeStoredQueuedMessage(message),
+      ...(normalizedBeforeMessageId ? { beforeMessageId: normalizedBeforeMessageId } : {}),
+    }),
   })
   const payload = await response.json() as unknown
   if (!response.ok) {
@@ -2957,6 +3114,40 @@ export async function enqueueThreadMessage(
     inserted: record?.inserted === true,
     queue,
   }
+}
+
+async function mutateThreadQueue(
+  path: '/remove' | '/reorder',
+  payload: Record<string, string>,
+): Promise<StoredQueuedMessage[]> {
+  const response = await fetch(`/codex-api/thread-queue${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const body = await response.json() as unknown
+  if (!response.ok) {
+    throw new Error(getErrorMessageFromPayload(body, `Failed to mutate thread queue (${path.slice(1)})`))
+  }
+  const record = asRecord(body)
+  return Array.isArray(record?.data)
+    ? record.data.flatMap((item) => {
+      const normalized = normalizeStoredQueuedMessage(item)
+      return normalized ? [normalized] : []
+    })
+    : []
+}
+
+export async function removeQueuedThreadMessage(threadId: string, messageId: string): Promise<StoredQueuedMessage[]> {
+  return await mutateThreadQueue('/remove', { threadId, messageId })
+}
+
+export async function reorderQueuedThreadMessage(
+  threadId: string,
+  messageId: string,
+  targetId: string,
+): Promise<StoredQueuedMessage[]> {
+  return await mutateThreadQueue('/reorder', { threadId, messageId, targetId })
 }
 
 export async function createWorktree(sourceCwd: string, baseBranch?: string): Promise<WorktreeCreateResult> {
