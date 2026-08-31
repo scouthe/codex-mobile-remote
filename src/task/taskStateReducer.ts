@@ -118,6 +118,7 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
   let finishedAt = snapshot.finishedAt
   let error = observation.error === undefined ? snapshot.error : observation.error
   let timeline = snapshot.timeline
+  let queueDepth = observation.queue?.depth ?? snapshot.queueDepth
 
   if (observation.queue) {
     if (observation.queue.depth > 0 && !observation.inProgress && !['running', 'starting', 'steering', 'waiting_approval', 'waiting_user_input'].includes(state)) {
@@ -127,7 +128,20 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
     }
   }
 
-  if (observation.inProgress === true && state === 'completed') {
+  if (method === 'queue/enqueued' || method === 'queue/updated') {
+    const params = asRecord(notification?.params)
+    const parsedQueueDepth = typeof params?.queueDepth === 'number' && Number.isFinite(params.queueDepth)
+      ? Math.max(0, Math.trunc(params.queueDepth))
+      : observation.queue?.depth ?? snapshot.queueDepth
+    queueDepth = parsedQueueDepth
+    if (parsedQueueDepth > 0 && !['starting', 'running', 'steering', 'waiting_approval', 'waiting_user_input'].includes(state)) {
+      state = 'queued'
+      currentActivity = { kind: 'queue', label: 'Queued', details: [`${parsedQueueDepth} message${parsedQueueDepth === 1 ? '' : 's'}`] }
+      timeline = appendTimeline(snapshot, makeEvent(snapshot, 'queued', 'Queued', atIso, currentActivity.details, 'pending'))
+    }
+  }
+
+  if (observation.inProgress === true && (state === 'completed' || state === 'queued')) {
     state = 'running'
     startedAt = startedAt ?? atIso
     if (currentActivity.kind === 'idle') {
@@ -135,6 +149,10 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
     }
   } else if (observation.inProgress === false && !method) {
     if (state === 'running' || state === 'starting' || state === 'steering' || state === 'waiting_approval' || state === 'waiting_user_input') {
+      state = 'completed'
+      finishedAt = atIso
+      currentActivity = { kind: 'idle', label: 'Completed', details: [] }
+    } else if (state === 'queued' && (observation.queue?.depth ?? 0) === 0) {
       state = 'completed'
       finishedAt = atIso
       currentActivity = { kind: 'idle', label: 'Completed', details: [] }
@@ -199,7 +217,7 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
     threadId,
     state,
     currentActivity,
-    queueDepth: observation.queue?.depth ?? snapshot.queueDepth,
+    queueDepth,
     activeRequest,
     writerClient: observation.writerClient === undefined ? snapshot.writerClient : observation.writerClient,
     startedAt,
