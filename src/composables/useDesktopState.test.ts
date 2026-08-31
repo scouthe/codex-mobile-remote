@@ -1092,6 +1092,58 @@ describe('live error overlay', () => {
     expect(state.selectedTaskSnapshot.value?.queueDepth).toBe(1)
   })
 
+  it('sends directly when the local active flag is stale but the live session is idle', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: true,
+      activeTurnId: 'turn-1',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.resumeThread.mockResolvedValue({ model: 'gpt-5.5', modelProvider: 'openai' })
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-2')
+    gatewayMocks.enqueueThreadMessage.mockResolvedValue({ inserted: true, queue: [] })
+    gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('stale-active-thread')
+    await state.loadMessages('stale-active-thread')
+
+    gatewayMocks.getThreadLiveState.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+      sessionActivityKnown: true,
+      sessionRevision: 'idle-revision',
+      streamCursor: null,
+      liveStateError: null,
+      taskState: 'completed',
+      currentActivity: { kind: 'idle', label: 'Completed', details: [] },
+      queueDepth: 0,
+      activeRequest: null,
+      writerClient: null,
+      startedAt: null,
+      finishedAt: '2026-08-31T00:01:00.000Z',
+      timeline: [],
+    })
+
+    await state.sendTaskMessage('run while session is idle')
+
+    expect(gatewayMocks.getThreadLiveState).toHaveBeenCalledWith('stale-active-thread')
+    expect(gatewayMocks.enqueueThreadMessage).not.toHaveBeenCalled()
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
+      'stale-active-thread', 'run while session is idle', [], 'gpt-5.5', 'medium', undefined, [], 'default',
+    )
+  })
+
   it('keeps normal send and explicit steer as separate task operations', async () => {
     installTestWindow()
     gatewayMocks.getPendingServerRequests.mockResolvedValue([])

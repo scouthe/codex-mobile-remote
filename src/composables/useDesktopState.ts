@@ -1661,6 +1661,78 @@ export function useDesktopState() {
       inProgress: inProgressById.value[threadId] === true,
     })
   }
+
+  /**
+   * Refresh the send decision when a browser still has an optimistic active
+   * bit.  A desktop writer can finish in another process without emitting a
+   * notification to this browser, so the legacy map may incorrectly route a
+   * normal message into the queue.  The bridge's live snapshot includes the
+   * authoritative session-file marker and queue depth.
+   */
+  async function refreshTaskStateBeforeSend(threadId: string): Promise<boolean | null> {
+    const snapshot = taskSnapshotsByThreadId.value[threadId]
+    const localStateLooksBusy = inProgressById.value[threadId] === true
+      || Boolean(snapshot && ACTIVE_TASK_STATES.has(snapshot.state))
+    if (!localStateLooksBusy) return null
+
+    let detail: ThreadLiveState
+    try {
+      detail = await getThreadLiveState(threadId)
+    } catch {
+      return null
+    }
+
+    // A diagnostic fallback can carry `inProgress: false` without a complete
+    // session read.  Do not let that transient envelope start a second turn.
+    if (detail.liveStateError || detail.sessionActivityKnown !== true) return null
+    if (selectedThreadId.value !== threadId) return null
+
+    const queueDepth = typeof detail.queueDepth === 'number'
+      ? Math.max(0, Math.trunc(detail.queueDepth))
+      : undefined
+    updateTaskSnapshot({
+      threadId,
+      inProgress: detail.inProgress,
+      activeTurnId: detail.activeTurnId,
+      activeRequest: detail.activeRequest,
+      writerClient: detail.writerClient,
+      streamCursor: detail.streamCursor ?? undefined,
+      revision: detail.sessionRevision,
+      ...(queueDepth === undefined
+        ? {}
+        : {
+          queue: {
+            depth: queueDepth,
+            oldestQueuedAt: null,
+            clientIds: [],
+          },
+        }),
+    })
+    if (detail.taskState) {
+      const current = taskSnapshotsByThreadId.value[threadId]
+      if (current) {
+        taskSnapshotsByThreadId.value = {
+          ...taskSnapshotsByThreadId.value,
+          [threadId]: {
+            ...current,
+            state: detail.taskState,
+            currentActivity: detail.currentActivity ?? current.currentActivity,
+            queueDepth: queueDepth ?? current.queueDepth,
+            activeRequest: detail.activeRequest === undefined ? current.activeRequest : detail.activeRequest,
+            writerClient: detail.writerClient === undefined ? current.writerClient : detail.writerClient,
+            startedAt: detail.startedAt === undefined ? current.startedAt : detail.startedAt,
+            finishedAt: detail.finishedAt === undefined ? current.finishedAt : detail.finishedAt,
+            timeline: detail.timeline ?? current.timeline,
+          },
+        }
+      }
+    }
+    setThreadInProgress(threadId, detail.inProgress)
+
+    const waitingForInput = detail.taskState === 'waiting_approval' || detail.taskState === 'waiting_user_input'
+    return detail.inProgress || waitingForInput || detail.taskState === 'queued' || (queueDepth ?? 0) > 0
+  }
+
   const selectedLiveOverlay = computed<UiLiveOverlay | null>(() => {
     const threadId = selectedThreadId.value
     if (!threadId) return null
@@ -5375,7 +5447,13 @@ export function useDesktopState() {
       return
     }
 
-    const isInProgress = inProgressById.value[threadId] === true
+    const taskSnapshot = taskSnapshotsByThreadId.value[threadId]
+    let isInProgress = inProgressById.value[threadId] === true
+      || Boolean(taskSnapshot && ACTIVE_TASK_STATES.has(taskSnapshot.state))
+    const refreshedBusyState = await refreshTaskStateBeforeSend(threadId)
+    if (refreshedBusyState !== null) {
+      isInProgress = refreshedBusyState
+    }
 
     if (isInProgress && mode === 'queue') {
       const queue = queuedMessagesByThreadId.value[threadId] ?? []
