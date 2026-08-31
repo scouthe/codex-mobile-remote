@@ -1425,6 +1425,11 @@ export function useDesktopState() {
     skills: Array<{ name: string; path: string }>
     fileAttachments: FileAttachment[]
     collaborationMode: CollaborationModeKind
+    createdAtIso?: string
+    sourceClientId?: string
+    status?: 'queued' | 'processing' | 'failed'
+    attempts?: number
+    lastError?: string
   }
   type PendingTurnRequest = {
     text: string
@@ -1438,6 +1443,15 @@ export function useDesktopState() {
   const queuedMessagesByThreadId = ref<Record<string, QueuedMessage[]>>({})
   const queueProcessingByThreadId = ref<Record<string, boolean>>({})
   let hasLoadedPersistedQueueState = false
+  const queueClientId = (() => {
+    if (typeof window === 'undefined') return 'server'
+    const key = 'codex-web-local.task-client-id.v1'
+    const existing = window.localStorage.getItem(key)?.trim()
+    if (existing) return existing
+    const generated = `web-${Math.random().toString(36).slice(2, 10)}`
+    window.localStorage.setItem(key, generated)
+    return generated
+  })()
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
   const availableModelIds = ref<string[]>([])
   const availableCollaborationModes = ref<CollaborationModeOption[]>([
@@ -4435,6 +4449,11 @@ export function useDesktopState() {
           fsPath: attachment.fsPath,
         })),
         collaborationMode: message.collaborationMode,
+        createdAtIso: message.createdAtIso,
+        sourceClientId: message.sourceClientId || queueClientId,
+        status: message.status || 'queued',
+        attempts: message.attempts ?? 0,
+        lastError: message.lastError || '',
       }))
     }
     return next
@@ -5233,6 +5252,11 @@ export function useDesktopState() {
           : collaborationModeOverride === 'default'
             ? 'default'
             : selectedCollaborationMode.value,
+        createdAtIso: new Date().toISOString(),
+        sourceClientId: queueClientId,
+        status: 'queued' as const,
+        attempts: 0,
+        lastError: '',
       } satisfies QueuedMessage
 
       // A plain append is sent through the server's atomic queue endpoint so

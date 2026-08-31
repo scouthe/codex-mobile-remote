@@ -291,6 +291,11 @@ export type StoredQueuedMessage = {
   skills: Array<{ name: string; path: string }>
   fileAttachments: Array<{ label: string; path: string; fsPath: string }>
   collaborationMode: CollaborationModeKind
+  createdAtIso?: string
+  sourceClientId?: string
+  status?: 'queued' | 'processing' | 'failed'
+  attempts?: number
+  lastError?: string
 }
 
 export type ThreadQueueState = Record<string, StoredQueuedMessage[]>
@@ -2745,6 +2750,11 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     skills,
     fileAttachments,
     collaborationMode: record.collaborationMode === 'plan' ? 'plan' : 'default',
+    ...(typeof record.createdAtIso === 'string' ? { createdAtIso: record.createdAtIso } : {}),
+    ...(typeof record.sourceClientId === 'string' ? { sourceClientId: record.sourceClientId } : {}),
+    ...(record.status === 'failed' || record.status === 'processing' || record.status === 'queued' ? { status: record.status } : {}),
+    ...(typeof record.attempts === 'number' && Number.isFinite(record.attempts) ? { attempts: Math.max(0, Math.trunc(record.attempts)) } : {}),
+    ...(typeof record.lastError === 'string' ? { lastError: record.lastError } : {}),
   }
 }
 
