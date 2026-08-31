@@ -7598,6 +7598,12 @@ class AppServerProcess {
     }
   }
 
+  /** Broadcast bridge-owned lifecycle events to every observer client. */
+  publishNotification(method: string, params: unknown): void {
+    if (!method.trim()) return
+    this.emitNotification({ method: method.trim(), params })
+  }
+
   getProcessGeneration(): number {
     return this.processGeneration
   }
@@ -7758,8 +7764,15 @@ export class BackendQueueProcessor {
           }
           return
         }
-        const next = await this.popNextQueuedTurn(threadId)
+      const next = await this.popNextQueuedTurn(threadId)
         if (!next) return
+        this.appServer.publishNotification('queue/updated', {
+          threadId,
+          messageId: next.message.id,
+          queueDepth: (await readThreadQueueState())[threadId]?.length ?? 0,
+          status: 'processing',
+          atIso: new Date().toISOString(),
+        })
         try {
           await this.threadBroker.ensureWriterReady(threadId, async () => {
             await this.appServer.rpc('thread/resume', { threadId })
@@ -7770,6 +7783,13 @@ export class BackendQueueProcessor {
           }
         } catch {
           await this.restoreQueuedTurn(next)
+          this.appServer.publishNotification('queue/updated', {
+            threadId,
+            messageId: next.message.id,
+            queueDepth: (await readThreadQueueState())[threadId]?.length ?? 0,
+            status: 'failed',
+            atIso: new Date().toISOString(),
+          })
           this.scheduleThreadQueueDrain(threadId)
         }
       })
@@ -9438,6 +9458,13 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           return
         }
         const result = await enqueueThreadQueuedMessage(threadId, message)
+        appServer.publishNotification('queue/updated', {
+          threadId,
+          messageId: message.id,
+          queueDepth: result.state[threadId]?.length ?? 0,
+          inserted: result.inserted,
+          atIso: new Date().toISOString(),
+        })
         backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
         setJson(res, 200, {
           queued: true,
