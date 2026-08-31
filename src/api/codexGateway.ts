@@ -1284,10 +1284,12 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
             ? thread.inProgress
             : undefined
       : undefined
+    const threadTurnStartIndex = readThreadTurnStartIndex(threadPayload)
+    const hasMoreOlder = threadTurnStartIndex > 0 || record?.hasMoreOlder === true
     return {
       model: normalizeThreadModelFromPayload(threadPayload),
       modelProvider: normalizeThreadModelProviderFromPayload(threadPayload),
-      messages: normalizeThreadMessagesV2(threadPayload, readThreadTurnStartIndex(threadPayload)),
+      messages: normalizeThreadMessagesV2(threadPayload, threadTurnStartIndex),
       // When the bridge has read the shared session log, its boolean marker
       // is authoritative even when false.  Falling back with `||` would let
       // an old projected in-progress turn resurrect the spinner after the
@@ -1295,9 +1297,9 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       inProgress: explicitInProgress ?? readThreadInProgressFromResponse(threadPayload),
       activeTurnId: readString(record?.activeTurnId) || readActiveTurnIdFromResponse(threadPayload),
       ...(terminalTurnId ? { terminalTurnId } : {}),
-      hasMoreOlder: readThreadTurnStartIndex(threadPayload) > 0,
-      ...(record?.partial === true || readThreadTurnStartIndex(threadPayload) > 0 ? { partial: true } : {}),
-      turnIndexByTurnId: buildTurnIndexByTurnId(threadPayload, readThreadTurnStartIndex(threadPayload)),
+      hasMoreOlder,
+      ...(record?.partial === true || hasMoreOlder ? { partial: true } : {}),
+      turnIndexByTurnId: buildTurnIndexByTurnId(threadPayload, threadTurnStartIndex),
       ...(sessionRevision ? { sessionRevision } : {}),
       ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
       streamCursor,
