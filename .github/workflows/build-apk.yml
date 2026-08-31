@@ -1,8 +1,8 @@
-name: Build APK
+name: Build Android remote client
 
 on:
   push:
-    branches: [android]
+    branches: [android-remote-client]
   workflow_dispatch:
 
 permissions:
@@ -18,26 +18,24 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The web/server sources are built as a CI check.  The remote APK only
+      # contains the Android shell and never bundles a local Codex runtime.
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "21"
-          cache: "npm"
 
-      - name: Install npm dependencies
-        run: npm ci --ignore-scripts || npm install
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@latest --activate
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
 
       - name: Build Vue frontend
-        run: npm run build:frontend
+        run: pnpm run build:frontend
 
       - name: Build CLI server
-        run: npm run build:cli
-
-      - name: Bundle server into APK assets
-        run: bash android/scripts/build-server-bundle.sh
-
-      - name: Download Termux bootstrap
-        run: bash android/scripts/download-bootstrap.sh
+        run: pnpm run build:cli
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -53,16 +51,16 @@ jobs:
         run: ./gradlew assembleDebug
 
       - name: Rename APK
-        run: cp android/app/build/outputs/apk/debug/app-debug.apk android/app/build/outputs/apk/debug/codexapp.apk
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk android/app/build/outputs/apk/debug/codexapp-remote.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: codexapp
-          path: android/app/build/outputs/apk/debug/codexapp.apk
+          name: codexapp-remote
+          path: android/app/build/outputs/apk/debug/codexapp-remote.apk
 
       - name: Generate changelog
-        if: github.ref == 'refs/heads/android'
+        if: github.ref == 'refs/heads/android-remote-client'
         id: changelog
         run: |
           PREV_TAG=$(git tag --sort=-v:refname | head -1)
@@ -78,21 +76,21 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create Release
-        if: github.ref == 'refs/heads/android'
+        if: github.ref == 'refs/heads/android-remote-client'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.run_number }}
-          name: "Codex App v${{ github.run_number }}"
+          tag_name: remote-v${{ github.run_number }}
+          name: "Codex App Remote v${{ github.run_number }}"
           body: |
-            🔥 **Codex App** — OpenAI Codex on Android
+            🔗 **Codex App Remote** — Android client for a remote codexapp server
 
-            📱 Install the APK on any ARM64 Android 7.0+ device. No root required.
+            📱 Connects to a Codex app-server running on your computer over HTTPS/Tailscale.
 
             ### Changes
             ${{ steps.changelog.outputs.notes }}
 
             ---
             Built from commit ${{ github.sha }}
-          files: android/app/build/outputs/apk/debug/codexapp.apk
+          files: android/app/build/outputs/apk/debug/codexapp-remote.apk
           draft: false
           prerelease: false

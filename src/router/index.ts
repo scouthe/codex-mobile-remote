@@ -1,11 +1,11 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHashHistory } from 'vue-router'
 
 const EmptyRouteView = {
   render: () => null,
 }
 
 const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHashHistory(),
   routes: [
     {
       path: '/',
@@ -15,6 +15,16 @@ const router = createRouter({
     {
       path: '/thread/:threadId',
       name: 'thread',
+      component: EmptyRouteView,
+    },
+    {
+      path: '/skills',
+      name: 'skills',
+      component: EmptyRouteView,
+    },
+    {
+      path: '/automations',
+      name: 'automations',
       component: EmptyRouteView,
     },
     {

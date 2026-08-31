@@ -1,7 +1,17 @@
 node_modules/
 dist/
 dist-cli/
+output/
+.playwright-cli/
+test-results/
 *.tsbuildinfo
 PROJECT_SPEC.md
 codex_tools_from_notices.txt
+
 package-lock.json
+pnpm-lock.yaml
+.codex/
+.env
+.env.local
+.cert/
+.omx/

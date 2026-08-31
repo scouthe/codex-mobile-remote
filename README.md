@@ -1,261 +1,183 @@
-<div align="center">
+# 📱 Codex App Remote
 
-# 🤖 Codex App Android
+Codex App Remote is a native Android client for a `codexapp` instance running
+on your computer. The computer remains the only Codex execution host; the
+phone is a lightweight observer/controller that connects over HTTPS (usually
+through Tailscale).
 
-### 📱 OpenAI Codex CLI — Running Natively on Your Android Phone 📱
+This project is based on the MIT-licensed `codex-mobile` application shell and
+the shared-observer work in this fork. It is intended for personal, self-hosted
+use. The Android app does **not** install Termux, Node.js, the Codex binary, or
+a second app-server.
 
-[![Android](https://img.shields.io/badge/Android-7.0+-3DDC84?logo=android&logoColor=white&style=for-the-badge)](https://developer.android.com)
-[![Kotlin](https://img.shields.io/badge/Kotlin-2.1-7F52FF?logo=kotlin&logoColor=white&style=for-the-badge)](https://kotlinlang.org)
-[![Node.js](https://img.shields.io/badge/Node.js-24-339933?logo=nodedotjs&logoColor=white&style=for-the-badge)](https://nodejs.org)
-[![Vue](https://img.shields.io/badge/Vue.js-3-4FC08D?logo=vuedotjs&logoColor=white&style=for-the-badge)](https://vuejs.org)
-[![Codex](https://img.shields.io/badge/Codex_CLI-0.104.0-412991?logo=openai&logoColor=white&style=for-the-badge)](https://github.com/openai/codex)
-[![Status](https://img.shields.io/badge/Status-🔥%20WORKS-brightgreen?style=for-the-badge)](https://github.com/friuns2/codex-app-android)
-[![Stars](https://img.shields.io/github/stars/friuns2/codex-app-android?style=for-the-badge&logo=github&color=gold)](https://github.com/friuns2/codex-app-android/stargazers)
+## What it does
 
-<br />
+- Saves a remote `http(s)` endpoint and reconnects on launch.
+- Opens the existing Codex UI in a hardened WebView.
+- Identifies itself as an Android observer so the desktop remains the writer.
+- Shows the desktop's existing threads and live task state.
+- Supports queued messages, steer, interrupt, approvals, and user-input
+  requests when the connected server exposes those shared-observer APIs.
+- Reconnects after a temporary Wi-Fi/Tailscale interruption without starting a
+  second `thread/resume`.
+- Provides Android-native notifications, clipboard integration, file chooser,
+  share-sheet intake, dark mode, and system back navigation.
 
-> **A self-contained Android APK that bundles an entire Linux environment,**
-> **installs the OpenAI Codex CLI, and gives you a full coding agent UI**
-> **right on your phone. No root. No Termux. One APK.**
+The UI, queue, and Codex protocol continue to live in the web/server project;
+the Kotlin layer supplies lifecycle, networking, credentials, and Android
+integration.
 
-<br />
+## Architecture
 
+```text
+┌──────────────────── Android APK ────────────────────┐
+│  Kotlin activity + WebView                          │
+│  • endpoint/password storage (Android Keystore)     │
+│  • lifecycle and network reconnect                  │
+│  • notifications, files, share sheet, clipboard     │
+└────────────────────────┬───────────────────────────┘
+                         │ HTTPS / Tailscale
+                         ▼
+┌────────────── computer ──────────────┐
+│ codexapp bridge (:5900 or configured) │
+│ shared observer + task queue          │
+│             │                         │
+│             ▼                         │
+│       Codex app-server                │
+│       (唯一执行端 / single writer)    │
+└───────────────────────────────────────┘
 ```
-╔═══════════════════════════════════════════════╗
-║   ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗   ║
-║  ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝   ║
-║  ██║     ██║   ██║██║  ██║█████╗   ╚███╔╝    ║
-║  ██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗    ║
-║  ╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗   ║
-║   ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝   ║
-║     A N D R O I D  ·  M O B I L E  ·  A P K   ║
-╚═══════════════════════════════════════════════╝
-```
 
-</div>
+The app sends `X-Codex-Client-Type: android` and
+`X-Codex-Client-Mode: observer` on the initial navigation. A saved client ID
+is exposed to the page for task/writer status and remains stable across app
+restarts.
 
----
+## Run the desktop server
 
-## 🤯 What Is This?
-
-OpenAI shipped Codex CLI — a **terminal-based AI coding agent** that reads your codebase, writes code, runs commands, and iterates. It's incredible. But it only runs on macOS and Linux.
-
-**We put it on Android.** Yes, the full native Rust binary. Yes, with a real web UI. Yes, on your phone.
-
-This project packages a **complete Linux userland** (borrowed from Termux's bootstrap), installs **Node.js 24**, the **Codex CLI v0.104.0** with its native `aarch64` binary, wires up a **Vue.js web frontend**, and serves it all through an **Android WebView** — in a single APK that installs like any other app.
-
-**One APK. Zero dependencies. Full AI coding agent in your pocket.** 🧠
-
----
-
-## 🌍 What Can You Do With This?
-
-| | Use Case | Description |
-|---|---|---|
-| 💬 | **Chat with Codex** | Full conversational coding agent with streaming responses |
-| 📝 | **Write code on the go** | Generate, refactor, and debug code from your phone |
-| 🔧 | **Execute commands** | Codex runs shell commands in the embedded Linux environment |
-| 🧠 | **Reasoning visibility** | Watch the model think in real-time with reasoning summaries |
-| 📂 | **Multi-thread sessions** | Multiple parallel conversations, each with its own context |
-| 🔓 | **Full auto-approval** | No permission popups — `danger-full-access` mode by default |
-| 🌙 | **Background execution** | Foreground service keeps Codex alive when you switch apps |
-| 🔑 | **OAuth login** | Authenticate with your OpenAI account via browser — no API key pasting |
-| 🌐 | **DNS proxy bridge** | Native musl binary routes through Node.js CONNECT proxy for DNS/TLS |
-| 📱 | **Offline-ready bootstrap** | Linux environment extracted from APK — works without internet after setup |
-
----
-
-## ⚡ Quick Start
+On the computer that owns the Codex installation:
 
 ```bash
-# 🔨 Clone the repo
-git clone https://github.com/friuns2/codex-app-android.git
-cd codex-app-android
+git clone https://github.com/scouthe/codex-mobile-remote.git
+cd codex-mobile-remote
+git switch android-remote-client
 
-# 📦 Install deps & build frontend
-npm install && npm run build
-
-# 🐧 Download Termux bootstrap (one-time, ~50MB)
-cd android && bash scripts/download-bootstrap.sh
-
-# 📱 Bundle, build APK, install, launch
-bash scripts/build-server-bundle.sh && ./gradlew assembleDebug \
-  && adb install -r app/build/outputs/apk/debug/app-debug.apk \
-  && adb shell am start -n com.codex.mobile/.MainActivity
-# 🚀 You're flying!
+pnpm install
+pnpm run build:frontend
+pnpm run build:cli
+node dist-cli/index.js --port 5900 --no-open --no-tunnel
 ```
 
----
+The server needs access to the computer's Codex CLI and its existing
+`CODEX_HOME` authentication. Keep the server bound behind Tailscale or another
+private network. If you use Tailscale Serve, expose the local port rather than
+opening port 5900 on the public Internet:
 
-## 🏗️ Architecture
-
-> **Four layers. One APK. Zero compromises.**
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                     📱 Android APK                       │
-│                                                          │
-│  ┌────────────┐  ┌─────────────────────────────────────┐ │
-│  │ 🖥️ WebView │  │  📦 APK Assets                     │ │
-│  │  (Vue.js)  │  │  bootstrap-aarch64.zip              │ │
-│  └─────┬──────┘  │  server-bundle/ (Vue + Express)     │ │
-│        │         │  proxy.js (CONNECT proxy)           │ │
-│        │         └─────────────────────────────────────┘ │
-│  ┌─────▼──────────────────────────────────────────────┐  │
-│  │              🔧 CodexServerManager                 │  │
-│  │  Bootstrap → Node.js → Codex CLI → Platform Binary │  │
-│  │  Config → Proxy → Auth → Health Check → Server     │  │
-│  └─────┬──────────────────────────────────────────────┘  │
-│        │                                                 │
-│  ┌─────▼──────────────────────────────────────────────┐  │
-│  │              🐧 Embedded Linux ($PREFIX)           │  │
-│  │                                                    │  │
-│  │  node (v24)  ─── Express server (:18923)           │  │
-│  │                      │                             │  │
-│  │                      ├── JSON-RPC over stdio       │  │
-│  │                      ▼                             │  │
-│  │  codex app-server (native Rust/musl aarch64)       │  │
-│  │       │                                            │  │
-│  │       ├── HTTPS_PROXY ──▶ proxy.js (:18924)        │  │
-│  │       │                      │                     │  │
-│  │       │                      ▼                     │  │
-│  │       │                 api.openai.com             │  │
-│  │       │                                            │  │
-│  │       └── SSE notifications ──▶ WebView            │  │
-│  └────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
+```bash
+tailscale serve --https=443 http://127.0.0.1:5900
 ```
 
-### 🔄 Request Lifecycle
+Use the resulting HTTPS hostname in the Android app. A local Wi-Fi URL such as
+`http://192.168.1.20:5900` is also accepted after explicitly enabling the
+“Allow HTTP” option, but HTTPS is recommended.
 
-```
-User taps Send
-  → 🖥️ Vue ThreadComposer → useDesktopState → codexGateway
-    → 📡 POST /codex-api/rpc { method: "turn/start" }
-      → 🔌 Express bridge → JSON-RPC stdin → codex app-server
-        → 🦀 Native Rust binary → HTTPS via proxy → OpenAI API
-        → 📤 stdout JSON-RPC notifications (streaming)
-      → 📺 SSE EventSource → live typing in WebView
-```
+## Build the Android app
 
----
+### Prerequisites
 
-## 📁 Project Structure
+- Android Studio or Android SDK command-line tools;
+- JDK 17;
+- Android SDK platform 35 and build tools installed;
+- Node.js 18+ and pnpm (needed only for the frontend/CLI verification build);
+- an Android 7.0 (API 24) or newer device/emulator.
 
-```
-🤖 codex-app-android/
-├── 📱 android/
-│   ├── 🔧 app/build.gradle.kts           # targetSdk=28 (W^X bypass)
-│   └── 📂 src/main/
-│       ├── 📋 AndroidManifest.xml         # Permissions & service declaration
-│       ├── 📦 assets/
-│       │   ├── 🌐 proxy.js               # Node.js CONNECT proxy
-│       │   └── 🎁 server-bundle/         # Pre-built Vue + Express + deps
-│       └── ☕ java/com/codex/mobile/
-│           ├── 🐧 BootstrapInstaller.kt   # Linux environment setup
-│           ├── 🔔 CodexForegroundService.kt # Background persistence
-│           ├── ⚙️ CodexServerManager.kt    # Install, auth, proxy, server
-│           └── 🖥️ MainActivity.kt         # WebView + setup orchestration
-├── 🌐 src/                                # codex-web-local (TypeScript + Vue)
-│   ├── 📡 api/                            # RPC client, gateway, SSE
-│   ├── 🧩 components/                     # Vue components (composer, threads)
-│   ├── 🔗 composables/                    # useDesktopState (reactive state)
-│   ├── 🔌 server/                         # Express + codex app-server bridge
-│   └── 🚀 cli/                            # CLI entry point
-├── 🔧 android/scripts/
-│   ├── 📥 download-bootstrap.sh           # Fetch Termux bootstrap
-│   └── 📦 build-server-bundle.sh          # Bundle frontend into APK
-└── 📖 PROJECT_SPEC.md                     # Full technical specification
+The remote client has no native Codex executable and does not require an ARM64
+device or a Termux bootstrap archive.
+
+```bash
+git clone https://github.com/scouthe/codex-mobile-remote.git
+cd codex-mobile-remote
+git switch android-remote-client
+
+pnpm install
+pnpm run build:frontend
+pnpm run build:cli
+
+cd android
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
----
+The debug APK is written to
+`android/app/build/outputs/apk/debug/app-debug.apk`. CI additionally publishes
+it as `codexapp-remote.apk` under the `codexapp-remote` artifact name.
 
-## 🧩 How It Works
+For a signed release build, configure your normal Android signing credentials
+and run `./gradlew assembleRelease`.
 
-> **They said you can't run a statically-linked Rust binary on Android without root. We did it anyway.**
+## First launch
 
-### 🐧 Embedded Linux Environment
+1. Enter the computer's Tailscale HTTPS URL (or a trusted LAN HTTP URL).
+2. Enter the codexapp password if the server requires one. Tailscale ACLs can
+   provide the network boundary, but they do not automatically disable the
+   app-server's own authentication.
+3. Tap **Connect**. The URL and password are retained for the next launch;
+   the password is encrypted with an Android Keystore AES-GCM key.
+4. The app opens the existing desktop threads. It does not create a second
+   local Codex session.
 
-The APK bundles Termux's `bootstrap-aarch64.zip` — a minimal Linux userland with `sh`, `apt-get`, `dpkg-deb`, SSL certificates, and core libraries. On first launch, it's extracted to the app's private storage. All hardcoded `/data/data/com.termux/` paths are rewritten to our package path.
+If the server is busy, the phone remains an observer. A normal message can be
+queued, **Steer** sends guidance to the current turn, and **Stop** requests an
+interrupt. The exact controls depend on the server-side shared-observer build.
 
-### 🦀 Native Codex Binary
+## Security notes
 
-The Codex CLI ships a **73MB native Rust binary** compiled for `aarch64-unknown-linux-musl`. npm refuses to install it on Android (`os: "linux"` vs `process.platform: "android"`), so we download the tarball directly from the npm registry using Node.js and extract it manually.
+- Prefer Tailscale HTTPS or another authenticated private network.
+- Do not expose `--no-password` over a public interface.
+- Use `--no-password` only on a network you fully trust and understand.
+- The Android WebView rejects navigation to a different host, port, or scheme
+  and cancels TLS certificate errors.
+- Clear saved credentials with the settings button's long-press action.
+- The server still has the permissions of the local Codex process. Review its
+  sandbox and approval policy before enabling unattended execution.
 
-### 🌐 DNS/TLS Proxy Bridge
+## Development notes
 
-The musl-linked binary reads `/etc/resolv.conf` for DNS — which doesn't exist on Android. Our Node.js **CONNECT proxy** on port `18924` solves this: Node.js uses Android's native Bionic DNS resolver, and the native binary routes all HTTPS through `HTTPS_PROXY`.
+The Android shell is intentionally small. Changes to conversation rendering,
+live events, task queues, writer coordination, and approvals belong in `src/`
+and are consumed by the remote WebView. Kotlin changes should remain focused
+on:
 
-### 🔌 JSON-RPC Stdio Bridge
+- lifecycle and network callbacks;
+- secure endpoint/password storage;
+- WebView navigation and file/share bridges;
+- notification updates and Android permissions.
 
-The Express server spawns `codex app-server` and communicates via **newline-delimited JSON-RPC 2.0 over stdin/stdout**. Notifications stream back via **Server-Sent Events** to the Vue frontend, enabling real-time typing, reasoning visibility, and turn progress.
+The old local-runtime helpers (`BootstrapInstaller`, `CodexServerManager`, and
+their assets) are retained in the source tree for migration/reference. They are
+not started by the remote activity or required by the remote CI workflow.
 
----
+## Troubleshooting
 
-## 🛡️ Security & Permissions
+### The app cannot connect
 
-| Permission | Why |
-|---|---|
-| 🌐 `INTERNET` | API calls to OpenAI |
-| 🔔 `FOREGROUND_SERVICE` | Keep server alive in background |
-| 🔋 `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` | Prevent Doze from killing processes |
-| 🔒 `WAKE_LOCK` | Maintain CPU during long tasks |
+- Verify the desktop process is listening on the configured port.
+- Test the exact HTTPS URL from another device on the same Tailscale network.
+- Check Tailscale ACLs and `tailscale serve status`.
+- For an HTTP LAN URL, enable **Allow HTTP** in the connection form.
 
-The app runs with `targetSdk = 28` to bypass Android 10+'s **W^X (Write XOR Execute)** SELinux policy — same approach used by Termux on F-Droid.
+### The app asks for a password
 
----
+This is the desktop server's authentication, not Android's Wi-Fi password. Set
+the codexapp password in the app, or configure authentication at the private
+network layer and use the server's documented trusted-network option.
 
-## 🎯 Requirements
+### Progress stops after the phone sleeps
 
-- 📱 **Android 7.0+** (API 24) — ARM64 device
-- 🌐 **Internet connection** — for first-run setup + API calls
-- 🔑 **OpenAI account** — authenticated via OAuth browser flow
-- 💾 **~500MB storage** — for Linux environment + Node.js + Codex binary
+Reopen the app. The WebView reconnects with the same observer client ID and the
+server replays the available live events. Long-running execution continues on
+the computer even while the phone is offline.
 
----
+## License
 
-## 🐛 Troubleshooting
-
-| Problem | Solution |
-|---|---|
-| 🚫 App crashes on launch | Check `adb logcat` for `CodexServerManager` errors |
-| 🔒 "Permission denied" executing binaries | Ensure `targetSdk = 28` in `build.gradle.kts` |
-| 🌐 "No address associated with hostname" | Check device has internet; proxy may not be running |
-| 🔑 Login page doesn't open | Ensure a default browser is set on the device |
-| 📦 Old UI after APK update | Server bundle re-extracts every launch — force-stop and reopen |
-| 🔋 App killed in background | Grant battery optimization exemption in Android settings |
-| 💥 `codex exec` fails with "not inside trusted directory" | Uses `--skip-git-repo-check` flag automatically |
-
----
-
-## 📊 Tech Stack
-
-| Layer | Technology | Version |
-|---|---|---|
-| 🤖 AI Engine | OpenAI Codex CLI (`@openai/codex`) | 0.104.0 |
-| 🦀 Native Binary | Rust (musl, aarch64) | - |
-| 🟢 Runtime | Node.js (via Termux) | 24.13.0 |
-| 🌐 Frontend | Vue.js 3 + Vite + TailwindCSS | 3.x |
-| 🔌 Backend | Express.js + JSON-RPC bridge | - |
-| 📱 Android | Kotlin + WebView | 2.1.0 |
-| 🐧 Linux | Termux bootstrap (aarch64) | - |
-
----
-
-## ⭐ Star This Repo
-
-If you believe **an AI coding agent should run in your pocket** — not just on a laptop with a terminal — **smash that star button.** ⭐
-
-This is what happens when you refuse to accept "it's desktop-only." 
-
-[![Star History](https://img.shields.io/github/stars/friuns2/codex-app-android?style=for-the-badge&logo=github&color=gold)](https://github.com/friuns2/codex-app-android/stargazers)
-
----
-
-<div align="center">
-
-**Built by shoving an entire Linux distro into an APK and refusing to give up** 🔬
-
-*They said "just use SSH to your server." We said "no."* 😏
-
-</div>
+MIT. See [LICENSE](./LICENSE).

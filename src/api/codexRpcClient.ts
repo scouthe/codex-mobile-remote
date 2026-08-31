@@ -10,6 +10,9 @@ export type RpcNotification = {
   method: string
   params: unknown
   atIso: string
+  seq?: number
+  streamEpoch?: string
+  threadId?: string
 }
 
 type ServerRequestReplyBody = {
@@ -47,15 +50,19 @@ export async function rpcCall<T>(method: string, params?: unknown): Promise<T> {
   }
 
   let payload: unknown = null
+  let rawText: string | null = null
   try {
-    payload = await response.json()
+    rawText = await response.text()
+    payload = JSON.parse(rawText)
   } catch {
     payload = null
   }
 
   if (!response.ok) {
+    const detail = extractErrorMessage(payload, '') || rawText?.slice(0, 500) || ''
+    const prefix = `RPC ${method} failed with HTTP ${response.status}`
     throw new CodexApiError(
-      extractErrorMessage(payload, `RPC ${method} failed with HTTP ${response.status}`),
+      detail ? `${prefix}: ${detail}` : prefix,
       {
         code: 'http_error',
         method,
@@ -138,30 +145,188 @@ function toNotification(value: unknown): RpcNotification | null {
     method: record.method,
     params: record.params ?? null,
     atIso,
+    seq: typeof record.seq === 'number' && Number.isFinite(record.seq) ? Math.floor(record.seq) : undefined,
+    streamEpoch: typeof record.streamEpoch === 'string' ? record.streamEpoch : undefined,
+    threadId: typeof record.threadId === 'string' ? record.threadId : undefined,
   }
 }
 
+function emitReadyNotification(
+  onNotification: (value: RpcNotification) => void,
+  params: unknown = { ok: true },
+): void {
+  onNotification({
+    method: 'ready',
+    params,
+    atIso: new Date().toISOString(),
+  })
+}
+
 export function subscribeRpcNotifications(onNotification: (value: RpcNotification) => void): () => void {
-  if (typeof window === 'undefined' || typeof EventSource === 'undefined') {
+  if (typeof window === 'undefined') {
     return () => {}
   }
 
-  const source = new EventSource('/codex-api/events')
+  let cleanup: (() => void) | null = null
+  let closed = false
+  let reconnectTimer: number | null = null
+  let lastStreamSeq = 0
 
-  source.onmessage = (event) => {
-    try {
-      const parsed = JSON.parse(event.data) as unknown
-      const notification = toNotification(parsed)
-      if (notification) {
-        onNotification(notification)
-      }
-    } catch {
-      // Ignore malformed event payloads and keep stream alive.
+  const clearReconnectTimer = () => {
+    if (reconnectTimer === null) return
+    window.clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+
+  const scheduleReconnect = (attach: () => void, attempt: number) => {
+    if (closed || reconnectTimer !== null) return
+    const delayMs = Math.min(1000 * (2 ** attempt), 10000)
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null
+      if (closed) return
+      attach()
+    }, delayMs)
+  }
+
+  const handleNotificationPayload = (payload: unknown) => {
+    const record = asRecord(payload)
+    if (typeof record?.seq === 'number' && Number.isFinite(record.seq)) {
+      lastStreamSeq = Math.max(lastStreamSeq, Math.floor(record.seq))
+    }
+    const notification = toNotification(payload)
+    if (notification) {
+      onNotification(notification)
     }
   }
 
+  const attachSse = (attempt = 0) => {
+    if (typeof EventSource === 'undefined' || closed) return
+    cleanup?.()
+    const query = lastStreamSeq > 0 ? `?afterSeq=${encodeURIComponent(String(lastStreamSeq))}` : ''
+    const source = new EventSource(`/codex-api/events${query}`)
+    let isConnectionClosed = false
+
+    source.onmessage = (event) => {
+      try {
+        handleNotificationPayload(JSON.parse(event.data) as unknown)
+      } catch {
+        // Ignore malformed event payloads and keep stream alive.
+      }
+    }
+
+    source.addEventListener('ready', (event: MessageEvent<string>) => {
+      try {
+        const parsed = event.data ? JSON.parse(event.data) as unknown : { ok: true }
+        const record = asRecord(parsed)
+        if (typeof record?.latestSeq === 'number' && Number.isFinite(record.latestSeq)) {
+          lastStreamSeq = Math.max(lastStreamSeq, Math.floor(record.latestSeq))
+        }
+        emitReadyNotification(onNotification, parsed)
+      } catch {
+        emitReadyNotification(onNotification)
+      }
+    })
+
+    source.onerror = () => {
+      if (closed || isConnectionClosed) return
+      if (source.readyState === EventSource.CLOSED) {
+        isConnectionClosed = true
+        source.close()
+        scheduleReconnect(() => attachSse(attempt + 1), attempt)
+      }
+    }
+
+    cleanup = () => {
+      isConnectionClosed = true
+      source.close()
+    }
+  }
+
+  const attachWebSocket = (attempt = 0) => {
+    if (typeof WebSocket === 'undefined' || closed) {
+      attachSse()
+      return
+    }
+
+    cleanup?.()
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const query = lastStreamSeq > 0 ? `?afterSeq=${encodeURIComponent(String(lastStreamSeq))}` : ''
+    const socket = new WebSocket(`${protocol}//${window.location.host}/codex-api/ws${query}`)
+    let didOpen = false
+    let intentionallyClosed = false
+    let fallbackTimer: number | null = window.setTimeout(() => {
+      if (didOpen || closed || intentionallyClosed) return
+      intentionallyClosed = true
+      socket.close()
+      attachSse()
+    }, 2500)
+
+    socket.onopen = () => {
+      didOpen = true
+      clearReconnectTimer()
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer)
+        fallbackTimer = null
+      }
+    }
+
+    socket.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(String(event.data)) as unknown
+        const record = asRecord(payload)
+        if (typeof record?.seq === 'number' && Number.isFinite(record.seq)) {
+          lastStreamSeq = Math.max(lastStreamSeq, Math.floor(record.seq))
+        } else if (record?.method === 'ready') {
+          const params = asRecord(record.params)
+          if (typeof params?.latestSeq === 'number' && Number.isFinite(params.latestSeq)) {
+            lastStreamSeq = Math.max(lastStreamSeq, Math.floor(params.latestSeq))
+          }
+        }
+        handleNotificationPayload(payload)
+      } catch {
+        // Ignore malformed event payloads and keep stream alive.
+      }
+    }
+
+    socket.onerror = () => {
+      // Wait for close so we do not race duplicate reconnect/fallback paths.
+    }
+
+    socket.onclose = () => {
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer)
+        fallbackTimer = null
+      }
+      if (closed || intentionallyClosed) {
+        return
+      }
+      if (!didOpen) {
+        attachSse()
+        return
+      }
+      scheduleReconnect(() => attachWebSocket(attempt + 1), attempt)
+    }
+
+    cleanup = () => {
+      intentionallyClosed = true
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer)
+        fallbackTimer = null
+      }
+      socket.close()
+    }
+  }
+
+  if (typeof WebSocket !== 'undefined') {
+    attachWebSocket()
+  } else {
+    attachSse()
+  }
+
   return () => {
-    source.close()
+    closed = true
+    clearReconnectTimer()
+    cleanup?.()
   }
 }
 
