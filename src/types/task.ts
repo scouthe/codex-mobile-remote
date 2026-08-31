@@ -121,4 +121,3 @@ export const TASK_STATE_TRANSITIONS: readonly TaskStateTransition[] = [
   { from: '*', event: 'turn/interrupt', to: 'canceled' },
   { from: '*', event: 'error', to: 'failed' },
 ]
-
