@@ -15,6 +15,7 @@ Return to the [manual test index](../../tests.md).
 | [Feature: Revert Renat scrolling/input-layout behavior (without Fast mode changes)](revert-renat-scrolling-input-layout-behavior-without-fast-mode-changes.md) |
 | [Feature: Dark theme command rows in chat remain readable](dark-theme-command-rows-in-chat-remain-readable.md) |
 | [Feature: Home composer vertical alignment matches reference layout](home-composer-vertical-alignment-matches-reference-layout.md) |
+| [Composer no longer covers the latest conversation message](composer-does-not-cover-latest-message.md) |
 | [Fix: Delete/rename thread dialog height cap](delete-rename-thread-dialog-height-cap.md) |
 | [Integrated terminal mobile keyboard avoidance](integrated-terminal-mobile-keyboard-avoidance.md) |
 | [Codex.app-style integrated terminal](codex-app-style-integrated-terminal.md) |

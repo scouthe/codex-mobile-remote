@@ -5168,7 +5168,7 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 }
 
 .content-thread {
-  @apply flex-1 min-h-0;
+  @apply flex flex-1 min-h-0 flex-col overflow-hidden;
 }
 
 .composer-with-queue {
