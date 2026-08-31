@@ -6137,6 +6137,28 @@ export function buildTaskSnapshotResponse(
   }
 }
 
+function resolveTaskWriterClient(
+  threadId: string,
+  sessionActivity: { known: boolean; inProgress: boolean } | null,
+  appServer: AppServerProcess,
+  threadBroker: ThreadSessionBroker,
+): { clientId: string; clientType: 'desktop' | 'android' | 'web' | 'unknown'; generation: number; claimedAt: string } | null {
+  const knownWriter = threadBroker.getWriter(threadId)
+  if (knownWriter) return knownWriter
+  // A Codex desktop process can own the JSONL session without going through
+  // this bridge.  The shared session activity marker is the authoritative
+  // signal in that case, so expose a stable desktop observer label.
+  if (sessionActivity?.known && sessionActivity.inProgress) {
+    return {
+      clientId: 'desktop-session',
+      clientType: 'desktop',
+      generation: appServer.getProcessGeneration(),
+      claimedAt: new Date().toISOString(),
+    }
+  }
+  return null
+}
+
 type BackendQueuedTurn = {
   threadId: string
   message: StoredQueuedMessage
@@ -9026,7 +9048,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               appServer.getStreamEvents(threadId, 40),
               appServer.getStreamCursor(),
               sessionActivity,
-              threadBroker.getWriter(threadId),
+              resolveTaskWriterClient(threadId, sessionActivity, appServer, threadBroker),
             )
             setJson(res, 200, { ...cachedRecord, ...taskSnapshot })
             return
@@ -9076,7 +9098,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             appServer.getStreamEvents(threadId, 40),
             appServer.getStreamCursor(),
             sessionActivity,
-            threadBroker.getWriter(threadId),
+            resolveTaskWriterClient(threadId, sessionActivity, appServer, threadBroker),
           )
 
           const responseData = {
