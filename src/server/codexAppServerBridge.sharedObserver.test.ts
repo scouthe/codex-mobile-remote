@@ -585,9 +585,15 @@ describe('shared thread observer HTTP path', () => {
       expect(response.status).toBe(200)
       const payload = await response.json() as {
         isInProgress?: boolean
+        partial?: boolean
+        fullHydrationDeferred?: boolean
+        hasMoreOlder?: boolean
         thread?: { turns?: Array<{ id?: string }> }
       }
       expect(payload.isInProgress).toBe(true)
+      expect(payload.partial).toBe(true)
+      expect(payload.fullHydrationDeferred).toBe(true)
+      expect(payload.hasMoreOlder).toBe(true)
       expect(payload.thread?.turns).toContainEqual(expect.objectContaining({ id: 'turn-large' }))
       expect(fake.calls.some((call) => call.method === 'thread/read' && (call.params as { includeTurns?: boolean })?.includeTurns === true)).toBe(false)
       expect(fake.calls.some((call) => call.method === 'thread/read' && (call.params as { includeTurns?: boolean })?.includeTurns === false)).toBe(true)

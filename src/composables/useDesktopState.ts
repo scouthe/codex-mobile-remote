@@ -5257,14 +5257,17 @@ export function useDesktopState() {
       replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
       rebindLiveFileChangeTurnIndices(threadId)
       const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+      const incomingProjectionIsPartial = detail.hasMoreOlder === true
+        || detail.partial === true
+        || detail.fullHydrationDeferred === true
       const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
-        // A forced poll is an authoritative snapshot (typically the first
-        // read after an external active→idle transition).  Do not retain
-        // stale live/partial assistant rows that are absent from that final
-        // snapshot; still preserve an optimistic user message while its turn
-        // is being materialized.
+        // Full snapshots can remove stale live rows after a task settles, but
+        // bounded/partial projections must never delete history already
+        // painted from a fuller read.  They are only an additive update until
+        // the user explicitly paginates or a complete snapshot arrives.
         preserveMissing:
-          (liveStateErrorObserved && nextMessages.length === 0)
+          incomingProjectionIsPartial
+          || (liveStateErrorObserved && nextMessages.length === 0)
           || (options.silent === true && options.force !== true)
           || hasOptimisticUserMessages(previousPersisted),
       })
@@ -6521,10 +6524,15 @@ export function useDesktopState() {
 
       // While a thread is active, websocket events (when available) provide
       // incremental content.  Polling only hydrates an unloaded thread; it
-      // performs a forced live read when the status settles or its session
-      // revision changes.  This avoids rereading full turns every interval.
+      // performs a forced live read when a status/list version settles or its
+      // session revision changes.  This avoids rereading full turns every
+      // interval while keeping cross-process projections authoritative.
       const shouldForceRefresh = becameIdle || hasVersionChange || hasSessionRevisionChange || shouldRetryLiveState
-      const shouldPreferLiveState = becameIdle || hasSessionRevisionChange || shouldRetryLiveState
+      // A thread-list version change can be caused by a writer in another
+      // Codex process.  Its ordinary app-server projection may still be
+      // behind the session file, so all forced refreshes use the read-only
+      // live path.
+      const shouldPreferLiveState = becameIdle || hasVersionChange || hasSessionRevisionChange || shouldRetryLiveState
       const shouldLoadMessages =
         shouldForceRefresh || (isInProgress && loadedMessagesByThreadId.value[threadId] !== true)
 
@@ -6587,7 +6595,16 @@ export function useDesktopState() {
         (shouldRefreshThreads && loadedMessagesByThreadId.value[activeThreadId] !== true)
 
       if (shouldRefreshActiveThread) {
-        await loadMessages(activeThreadId, { silent: true, force: true })
+        // Event-driven refreshes commonly arrive before app-server's
+        // materialized `thread/read` projection catches up (especially after
+        // a desktop-owned turn completes).  Use the bridge's read-only live
+        // projection so a stale RPC snapshot cannot roll the conversation
+        // back to an older set of turns.
+        await loadMessages(activeThreadId, {
+          silent: true,
+          force: true,
+          preferLiveState: true,
+        })
       }
     } catch {
       // Keep UI stable on transient event sync failures.

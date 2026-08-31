@@ -800,6 +800,44 @@ describe('shared session activity polling', () => {
     expect(state.messages.value.map((message) => message.text)).toEqual(['second'])
   })
 
+  it('uses the live projection when only the thread-list version changes', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [activityThread('version-thread', false, 'r1', '2026-04-28T00:00:00.000Z')] }],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [activityThread('version-thread', false, 'r1', '2026-04-28T00:01:00.000Z')] }],
+        nextCursor: null,
+      })
+    gatewayMocks.getThreadLiveState.mockResolvedValue({
+      messages: [{ id: 'latest', role: 'assistant', text: 'latest projection', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+      sessionActivityKnown: true,
+      sessionRevision: 'r1',
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [{ id: 'stale', role: 'assistant', text: 'stale projection', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('version-thread')
+    await state.syncThreadStatus()
+    await state.syncThreadStatus()
+
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadLiveState).toHaveBeenCalledTimes(2)
+    expect(state.messages.value.map((message) => message.text)).toEqual(['latest projection'])
+  })
+
   it('detects an idle row even when an older bridge omits activity metadata', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage
@@ -1003,6 +1041,153 @@ describe('thread selection latency', () => {
       state: 'running',
       activeTurnId: 'turn-new',
     })
+  })
+
+  it('does not let an event-driven stale thread read replace a newer fast snapshot', async () => {
+    installTestWindow()
+    const callbacks: Array<() => void> = []
+    vi.mocked(window.setTimeout).mockImplementation(((callback: TimerHandler) => {
+      if (typeof callback === 'function') {
+        callbacks.push(callback as () => void)
+        queueMicrotask(callback as () => void)
+      }
+      return callbacks.length
+    }) as typeof window.setTimeout)
+    Object.assign(window, {
+      setInterval: vi.fn(() => 1),
+      clearInterval: vi.fn(),
+    })
+
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{
+        projectName: 'Project',
+        threads: [{
+          ...thread('event-refresh-thread', '/tmp/project'),
+          sessionActivityKnown: true,
+          sessionRevision: 'r2',
+          inProgress: false,
+        }],
+      }],
+      nextCursor: null,
+    })
+    gatewayMocks.getThreadFastDetail.mockResolvedValue({
+      messages: [{ id: 'latest', role: 'assistant', text: 'latest conversation', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: true,
+      turnIndexByTurnId: {},
+      partial: true,
+      fullHydrationDeferred: true,
+      sessionActivityKnown: true,
+      sessionRevision: 'r2',
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [{ id: 'stale', role: 'assistant', text: 'stale projection', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.getThreadLiveState.mockResolvedValue({
+      messages: [{ id: 'latest', role: 'assistant', text: 'latest conversation', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: true,
+      turnIndexByTurnId: {},
+      sessionActivityKnown: true,
+      sessionRevision: 'r2',
+    })
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    state.primeSelectedThread('event-refresh-thread')
+    await state.selectThread('event-refresh-thread')
+    expect(state.messages.value.map((message) => message.text)).toEqual(['latest conversation'])
+    gatewayMocks.getThreadDetail.mockClear()
+    gatewayMocks.getThreadLiveState.mockClear()
+
+    state.startPolling()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(notificationHandler).toBeDefined()
+    notificationHandler!({
+      method: 'turn/completed',
+      params: {
+        threadId: 'event-refresh-thread',
+        turn: { id: 'turn-1', status: 'completed' },
+      },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+
+    expect(state.messages.value.map((message) => message.text)).toContain('latest conversation')
+    expect(state.messages.value.map((message) => message.text)).not.toContain('stale projection')
+  })
+
+  it('preserves already loaded history when a later projection is partial', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        messages: [
+          { id: 'older', role: 'assistant', text: 'older history', messageType: 'agentMessage' },
+          { id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage' },
+        ],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+      })
+      .mockResolvedValueOnce({
+        messages: [{ id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage' }],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: true,
+        turnIndexByTurnId: {},
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('partial-refresh-thread')
+    await state.loadMessages('partial-refresh-thread', { force: true, fast: false })
+    await state.loadMessages('partial-refresh-thread', { force: true, fast: false })
+
+    expect(state.messages.value.map((message) => message.text)).toEqual(['older history', 'newer history'])
+  })
+
+  it('keeps full history when an event refresh uses a bounded live tail', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [
+        { id: 'older', role: 'assistant', text: 'older history', messageType: 'agentMessage' },
+        { id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage' },
+      ],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.getThreadLiveState.mockResolvedValue({
+      messages: [{ id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: true,
+      partial: true,
+      fullHydrationDeferred: true,
+      turnIndexByTurnId: {},
+      sessionActivityKnown: true,
+      sessionRevision: 'r2',
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('live-tail-thread')
+    await state.loadMessages('live-tail-thread', { force: true, fast: false })
+    await state.loadMessages('live-tail-thread', { force: true, preferLiveState: true })
+
+    expect(state.messages.value.map((message) => message.text)).toEqual(['older history', 'newer history'])
   })
 
   it('ignores late item and completion events from an older turn', async () => {

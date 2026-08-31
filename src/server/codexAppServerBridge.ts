@@ -9867,6 +9867,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             conversationState: {
               turns,
             },
+            // Preserve projection metadata from the read-only observer read.
+            // Without these markers a bounded tail was indistinguishable from
+            // a complete conversation, so a later live refresh could replace
+            // loaded history with only the recent turns.
+            partial: rawThreadRecord?.partial === true || typeof rawThreadRecord?.threadTurnStartIndex === 'number',
+            threadTurnStartIndex: typeof rawThreadRecord?.threadTurnStartIndex === 'number'
+              ? Math.max(0, Math.trunc(rawThreadRecord.threadTurnStartIndex))
+              : 0,
+            hasMoreOlder: (typeof rawThreadRecord?.threadTurnStartIndex === 'number'
+              && Math.trunc(rawThreadRecord.threadTurnStartIndex) > 0)
+              || sessionSize > FAST_THREAD_SESSION_TAIL_BYTES
+              || turns.length >= THREAD_RESPONSE_TURN_LIMIT,
+            fullHydrationDeferred: sessionSize > OBSERVER_FULL_READ_MAX_BYTES,
             ownerClientId: null,
             liveStateError: null,
             isInProgress,
