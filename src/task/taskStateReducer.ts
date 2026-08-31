@@ -120,6 +120,19 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
   let timeline = snapshot.timeline
   let queueDepth = observation.queue?.depth ?? snapshot.queueDepth
 
+  // Pending requests are also hydrated on reconnect, without a notification.
+  // Promote those snapshots to the same waiting states as live events.
+  if (observation.activeRequest?.kind === 'approval') {
+    state = 'waiting_approval'
+    currentActivity = { kind: 'approval', label: 'Approval required', details: [] }
+  } else if (observation.activeRequest?.kind === 'user_input') {
+    state = 'waiting_user_input'
+    currentActivity = { kind: 'user_input', label: 'Input required', details: [] }
+  } else if (observation.activeRequest === null && (state === 'waiting_approval' || state === 'waiting_user_input')) {
+    state = 'running'
+    currentActivity = { kind: 'thinking', label: 'Thinking', details: [] }
+  }
+
   if (observation.queue) {
     if (observation.queue.depth > 0 && !observation.inProgress && !['running', 'starting', 'steering', 'waiting_approval', 'waiting_user_input'].includes(state)) {
       state = 'queued'
