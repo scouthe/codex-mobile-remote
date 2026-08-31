@@ -1456,6 +1456,8 @@ const {
   renameThreadById,
   forkThreadFromTurn,
   sendMessageToSelectedThread,
+  sendTaskMessage,
+  steerTaskMessage,
   sendMessageToNewThread,
   interruptSelectedThreadTurn,
   selectedThreadQueuedMessages,
@@ -3448,7 +3450,11 @@ function onSubmitThreadMessage(payload: { text: string; imageUrls: string[]; fil
     void submitFirstMessageForNewThread(text, payload.imageUrls, payload.skills, payload.fileAttachments)
     return
   }
-  void sendMessageToSelectedThread(text, payload.imageUrls, payload.skills, payload.mode, payload.fileAttachments, queueInsertIndex)
+  if (payload.mode === 'steer') {
+    void steerTaskMessage(text, payload.imageUrls, payload.skills, payload.fileAttachments)
+  } else {
+    void sendTaskMessage(text, payload.imageUrls, payload.skills, payload.fileAttachments, queueInsertIndex)
+  }
 }
 
 function onEditQueuedMessage(messageId: string): void {

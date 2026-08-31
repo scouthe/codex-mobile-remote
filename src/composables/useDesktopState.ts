@@ -5202,7 +5202,7 @@ export function useDesktopState() {
     text: string,
     imageUrls: string[] = [],
     skills: Array<{ name: string; path: string }> = [],
-    mode: 'steer' | 'queue' = 'steer',
+    mode: 'steer' | 'queue' = 'queue',
     fileAttachments: FileAttachment[] = [],
     queueInsertIndex?: number,
     collaborationModeOverride?: CollaborationModeKind,
@@ -5268,19 +5268,32 @@ export function useDesktopState() {
     }
 
     if (isInProgress) {
+      if (mode === 'steer') {
+        updateTaskSnapshot({
+          threadId,
+          notification: {
+            method: 'turn/steer',
+            params: { threadId },
+            atIso: new Date().toISOString(),
+          },
+        })
+      }
       shouldAutoScrollOnNextAgentEvent = true
-      void startTurnForThread(
-        threadId,
-        nextText,
-        imageUrls,
-        skills,
-        fileAttachments,
-        collaborationModeOverride,
-      ).catch((unknownError) => {
+      try {
+        await startTurnForThread(
+          threadId,
+          nextText,
+          imageUrls,
+          skills,
+          fileAttachments,
+          collaborationModeOverride,
+        )
+      } catch (unknownError) {
         const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         setTurnErrorForThread(threadId, errorMessage)
         error.value = errorMessage
-      })
+        throw unknownError
+      }
       return
     }
 
@@ -5304,6 +5317,11 @@ export function useDesktopState() {
     )
     setTurnErrorForThread(threadId, null)
     setThreadInProgress(threadId, true)
+    updateTaskSnapshot({
+      threadId,
+      inProgress: true,
+      atIso: new Date().toISOString(),
+    })
 
     try {
       await startTurnForThread(
@@ -5323,6 +5341,45 @@ export function useDesktopState() {
       error.value = errorMessage
       throw unknownError
     }
+  }
+
+  /** Public task-center send operation. Normal messages never steer an active turn. */
+  async function sendTaskMessage(
+    text: string,
+    imageUrls: string[] = [],
+    skills: Array<{ name: string; path: string }> = [],
+    fileAttachments: FileAttachment[] = [],
+    queueInsertIndex?: number,
+    collaborationModeOverride?: CollaborationModeKind,
+  ): Promise<void> {
+    await sendMessageToSelectedThread(
+      text,
+      imageUrls,
+      skills,
+      'queue',
+      fileAttachments,
+      queueInsertIndex,
+      collaborationModeOverride,
+    )
+  }
+
+  /** Explicit guide operation; maps to turn/steer while a turn is active. */
+  async function steerTaskMessage(
+    text: string,
+    imageUrls: string[] = [],
+    skills: Array<{ name: string; path: string }> = [],
+    fileAttachments: FileAttachment[] = [],
+    collaborationModeOverride?: CollaborationModeKind,
+  ): Promise<void> {
+    await sendMessageToSelectedThread(
+      text,
+      imageUrls,
+      skills,
+      'steer',
+      fileAttachments,
+      undefined,
+      collaborationModeOverride,
+    )
   }
 
   async function sendMessageToNewThread(
@@ -5576,6 +5633,14 @@ export function useDesktopState() {
     error.value = ''
     try {
       await interruptThreadTurn(threadId, turnId)
+      updateTaskSnapshot({
+        threadId,
+        notification: {
+          method: 'turn/interrupt',
+          params: { threadId, turnId },
+          atIso: new Date().toISOString(),
+        },
+      })
       setThreadInProgress(threadId, false)
       setTurnActivityForThread(threadId, null)
       setTurnErrorForThread(threadId, null)
@@ -5592,6 +5657,11 @@ export function useDesktopState() {
     } finally {
       isInterruptingTurn.value = false
     }
+  }
+
+  /** Public task-center stop operation; always maps to turn/interrupt. */
+  async function interruptTask(): Promise<void> {
+    await interruptSelectedThreadTurn()
   }
 
   async function rollbackSelectedThread(turnId: string): Promise<void> {
@@ -6210,8 +6280,11 @@ export function useDesktopState() {
     rollbackSelectedThread,
 
     sendMessageToSelectedThread,
+    sendTaskMessage,
+    steerTaskMessage,
     sendMessageToNewThread,
     interruptSelectedThreadTurn,
+    interruptTask,
     selectedThreadQueuedMessages,
     removeQueuedMessage,
     reorderQueuedMessage,

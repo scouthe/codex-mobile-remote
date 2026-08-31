@@ -960,6 +960,32 @@ describe('live error overlay', () => {
       expect.objectContaining({ text: 'run after current task' }),
     )
     expect(state.selectedThreadQueuedMessages.value).toHaveLength(1)
+    expect(state.selectedTaskSnapshot.value?.state).toBe('running')
+    expect(state.selectedTaskSnapshot.value?.queueDepth).toBe(1)
+  })
+
+  it('keeps normal send and explicit steer as separate task operations', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5', modelProvider: 'openai', messages: [], inProgress: true,
+      activeTurnId: 'turn-1', hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+    gatewayMocks.enqueueThreadMessage.mockResolvedValue({ inserted: true, queue: [{
+      id: 'q-1', text: 'normal', imageUrls: [], skills: [], fileAttachments: [], collaborationMode: 'default',
+    }] })
+    gatewayMocks.startThreadTurn.mockResolvedValue('turn-2')
+    gatewayMocks.resumeThread.mockResolvedValue({ model: 'gpt-5.5', modelProvider: 'openai' })
+    const state = useDesktopState()
+    state.primeSelectedThread('operation-thread')
+    await state.loadMessages('operation-thread')
+    await state.sendTaskMessage('normal')
+    expect(gatewayMocks.enqueueThreadMessage).toHaveBeenCalled()
+    await state.steerTaskMessage('guide')
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
+      'operation-thread', 'guide', [], 'gpt-5.5', 'medium', undefined, [], 'default',
+    )
+    expect(state.selectedTaskSnapshot.value?.state).toBe('steering')
   })
 
   it('keeps a new live error visible when an older persisted turn error exists', async () => {
