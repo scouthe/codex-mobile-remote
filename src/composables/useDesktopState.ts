@@ -5314,7 +5314,10 @@ export function useDesktopState() {
         clearCompletedTurnLiveState(threadId)
       }
       markThreadAsRead(threadId)
-      if (loadedFastSnapshot) {
+      // Large rollouts opt out of background full hydration.  Their bounded
+      // observer projection remains the live conversation view and older
+      // turns are fetched only when the user explicitly asks for them.
+      if (loadedFastSnapshot && detail.fullHydrationDeferred !== true) {
         // Do not make the user wait for a complete app-server materialization.
         // Schedule after this load promise settles; scheduling inline would
         // observe the in-flight promise and await itself forever.

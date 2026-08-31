@@ -766,6 +766,8 @@ export type ThreadLiveState = {
   finishedAt?: string | null
   error?: string | null
   timeline?: TaskTimelineEvent[]
+  /** Large session logs stay on the bounded observer projection. */
+  fullHydrationDeferred?: boolean
 }
 
 async function getThreadGroupsPageV2(cursor: string | null, limit: number): Promise<ThreadGroupsPage> {
@@ -887,6 +889,8 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
   finishedAt?: string | null
   error?: string | null
   timeline?: TaskTimelineEvent[]
+  /** Large session logs stay on the bounded observer projection. */
+  fullHydrationDeferred?: boolean
 }> {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) throw new Error('Missing thread id')
@@ -911,6 +915,7 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
     finishedAt?: unknown
     error?: unknown
     timeline?: unknown
+    fullHydrationDeferred?: unknown
   }
   if (!response.ok) {
     throw new Error(`Fast thread state request failed with ${response.status}`)
@@ -1024,6 +1029,7 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
     ...(typeof payload.finishedAt === 'string' ? { finishedAt: payload.finishedAt } : payload.finishedAt === null ? { finishedAt: null } : {}),
     ...(typeof payload.error === 'string' ? { error: payload.error } : payload.error === null ? { error: null } : {}),
     ...(timeline ? { timeline } : {}),
+    ...(typeof payload.fullHydrationDeferred === 'boolean' ? { fullHydrationDeferred: payload.fullHydrationDeferred } : {}),
     partial: true,
   }
 }
@@ -1150,6 +1156,8 @@ export async function getThreadFastDetail(threadId: string): Promise<{
   finishedAt?: string | null
   error?: string | null
   timeline?: TaskTimelineEvent[]
+  /** Large session logs stay on the bounded observer projection. */
+  fullHydrationDeferred?: boolean
 }> {
   try {
     return await getThreadFastDetailV2(threadId)
