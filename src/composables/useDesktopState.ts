@@ -11,6 +11,7 @@ import {
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
+  getThreadFastDetail,
   getThreadLiveState,
   getOlderThreadMessages,
   getBackgroundThreadListLimit,
@@ -4673,7 +4674,7 @@ export function useDesktopState() {
 
   async function loadMessages(
     threadId: string,
-    options: { silent?: boolean; force?: boolean; preferLiveState?: boolean } = {},
+    options: { silent?: boolean; force?: boolean; preferLiveState?: boolean; fast?: boolean } = {},
   ) {
     if (!threadId) {
       return
@@ -4734,6 +4735,7 @@ export function useDesktopState() {
       // startTurnForThread below, behind the server-side writer path.
       let detail: Awaited<ReturnType<typeof getThreadDetail>> & Partial<ThreadLiveState>
       let liveStateErrorObserved = false
+      let loadedFastSnapshot = false
       if (shouldPreferLiveState) {
         try {
           // A status transition or session revision change can be produced by
@@ -4755,8 +4757,22 @@ export function useDesktopState() {
           detail = await getThreadDetail(threadId)
         }
       } else {
-        detail = await getThreadDetail(threadId)
-        if (detail.inProgress) {
+        // A full thread/read has to materialize the entire session JSONL in
+        // app-server.  Use the bounded session-tail projection for the first
+        // paint, then hydrate commands and older turns asynchronously.  A
+        // forced refresh always bypasses this path so it remains authoritative
+        // after a task completes or a stream gap is detected.
+        if (options.fast !== false && options.force !== true) {
+          try {
+            detail = await getThreadFastDetail(threadId)
+            loadedFastSnapshot = detail.partial === true
+          } catch {
+            detail = await getThreadDetail(threadId)
+          }
+        } else {
+          detail = await getThreadDetail(threadId)
+        }
+        if (detail.inProgress && !loadedFastSnapshot) {
           try {
             // The live endpoint merges the app-server snapshot with items and
             // command output observed since the last persisted read.  It is a
@@ -4893,6 +4909,22 @@ export function useDesktopState() {
         clearCompletedTurnLiveState(threadId)
       }
       markThreadAsRead(threadId)
+      if (loadedFastSnapshot) {
+        // Do not make the user wait for a complete app-server materialization.
+        // Schedule after this load promise settles; scheduling inline would
+        // observe the in-flight promise and await itself forever.
+        setTimeout(() => {
+          void loadMessages(threadId, {
+            silent: true,
+            force: true,
+            fast: false,
+            preferLiveState: inProgress,
+          }).catch(() => {
+            // The fast snapshot is still useful when the background hydration
+            // races a desktop writer or a transient app-server restart.
+          })
+        }, 0)
+      }
       } catch (unknownError) {
         const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         if (selectedThreadId.value === threadId) {

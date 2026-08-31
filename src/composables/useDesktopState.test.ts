@@ -21,6 +21,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getPendingServerRequests: vi.fn(),
   getSkillsList: vi.fn(),
   getThreadDetail: vi.fn(),
+  getThreadFastDetail: vi.fn(),
   getThreadLiveState: vi.fn(),
   enqueueThreadMessage: vi.fn(),
   getThreadGroupsPage: vi.fn(),
@@ -83,6 +84,7 @@ function installTestWindow(initialStorage: Record<string, string> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  gatewayMocks.getThreadFastDetail.mockRejectedValue(new Error('fast snapshot not configured in test'))
   gatewayMocks.getThreadLiveState.mockRejectedValue(new Error('live state not configured in test'))
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
@@ -938,6 +940,33 @@ describe('thread selection latency', () => {
 
     expect(result).toBe('selected')
     expect(state.messages.value.map((message) => message.text)).toEqual(['ready'])
+  })
+
+  it('paints a bounded fast snapshot before full thread hydration completes', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadFastDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [{ id: 'message-fast', role: 'assistant', text: 'fast answer', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: true,
+      turnIndexByTurnId: {},
+      partial: true,
+    })
+    gatewayMocks.getThreadDetail.mockImplementation(() => new Promise(() => {}))
+
+    const state = useDesktopState()
+    const result = await Promise.race([
+      state.selectThread('fast-thread').then(() => 'selected'),
+      new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 50)),
+    ])
+
+    expect(result).toBe('selected')
+    expect(state.messages.value.map((message) => message.text)).toEqual(['fast answer'])
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(gatewayMocks.getThreadFastDetail).toHaveBeenCalledWith('fast-thread')
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('fast-thread')
   })
 })
 

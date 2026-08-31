@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes, open } from 'node:fs/promises'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
@@ -230,6 +230,11 @@ const COMPOSIO_CONNECTORS_PAGE_LIMIT_MAX = 1000
 const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 
 const THREAD_RESPONSE_TURN_LIMIT = 10
+// The app-server's thread/read materializes the complete rollout before the
+// bridge can trim it.  A session file can contain tens or hundreds of MB of
+// prompts/tool output, so the task switch path uses a bounded tail projection
+// first and hydrates the full turn history in the background.
+const FAST_THREAD_SESSION_TAIL_BYTES = 4 * 1024 * 1024
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
 // A desktop app-server can append the terminal session marker before its
 // thread/read projection is flushed.  Give that projection a short,
@@ -2160,6 +2165,142 @@ function buildSessionProjectionFallback(
   const items = itemsByTurnId.get(targetTurnId)
   if (!items || items.length === 0) return null
   return { turnId: targetTurnId, items }
+}
+
+type FastSessionTurn = {
+  id: string
+  status: 'inProgress' | 'completed'
+  items: Record<string, unknown>[]
+}
+
+/**
+ * Read only the tail of a session JSONL and project the recent conversational
+ * messages.  This deliberately omits command/tool payloads; the normal
+ * thread/read hydration that follows fills those in without blocking the
+ * first paint after a task switch.
+ */
+async function readSessionTailForFastThread(path: string): Promise<{ raw: string; size: number }> {
+  const metadata = await stat(path)
+  if (!metadata.isFile() || metadata.size <= 0) return { raw: '', size: 0 }
+  const start = Math.max(0, metadata.size - FAST_THREAD_SESSION_TAIL_BYTES)
+  const file = await open(path, 'r')
+  try {
+    const length = metadata.size - start
+    const buffer = Buffer.allocUnsafe(length)
+    const { bytesRead } = await file.read(buffer, 0, length, start)
+    return { raw: buffer.subarray(0, bytesRead).toString('utf8'), size: metadata.size }
+  } finally {
+    await file.close()
+  }
+}
+
+function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TURN_LIMIT): FastSessionTurn[] {
+  const turnsById = new Map<string, FastSessionTurn>()
+  const turnOrder: string[] = []
+  let currentTurnId = ''
+
+  const ensureTurn = (turnId: string, status: FastSessionTurn['status'] = 'inProgress'): FastSessionTurn | null => {
+    const normalizedId = turnId.trim()
+    if (!normalizedId) return null
+    const existing = turnsById.get(normalizedId)
+    if (existing) {
+      if (status === 'completed') existing.status = status
+      return existing
+    }
+    const turn: FastSessionTurn = { id: normalizedId, status, items: [] }
+    turnsById.set(normalizedId, turn)
+    turnOrder.push(normalizedId)
+    return turn
+  }
+
+  const addItem = (turn: FastSessionTurn, item: Record<string, unknown>): void => {
+    const itemId = readNonEmptyString(item.id)
+    if (itemId && turn.items.some((candidate) => readNonEmptyString(candidate.id) === itemId)) return
+    const assistantText = item.type === 'agentMessage' ? readNonEmptyString(item.text) : ''
+    if (assistantText && turn.items.some((candidate) => candidate.type === 'agentMessage' && readNonEmptyString(candidate.text) === assistantText)) return
+    turn.items.push(item)
+  }
+
+  for (const line of sessionLogRaw.split(/\r?\n/u)) {
+    if (!line.trim()) continue
+    let row: Record<string, unknown>
+    try {
+      const parsed = JSON.parse(line) as unknown
+      const record = asRecord(parsed)
+      if (!record) continue
+      row = record
+    } catch {
+      // The first line can be a partial JSONL record when the tail starts in
+      // the middle of a large item.  Later complete records are sufficient.
+      continue
+    }
+
+    const payload = asRecord(row.payload)
+    if (!payload) continue
+
+    if (row.type === 'turn_context') {
+      currentTurnId = readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId) || currentTurnId
+      ensureTurn(currentTurnId)
+      continue
+    }
+
+    if (row.type === 'event_msg') {
+      const eventType = readNonEmptyString(payload.type)
+      const eventTurnId = readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId)
+      if (eventType === 'task_started' || eventType === 'turn_started') {
+        currentTurnId = eventTurnId || currentTurnId
+        ensureTurn(currentTurnId, 'inProgress')
+      } else if (eventType === 'task_complete' || eventType === 'task_completed' || eventType === 'turn_complete' || eventType === 'turn_completed' || eventType === 'turn_aborted' || eventType === 'task_failed') {
+        const completedTurnId = eventTurnId || currentTurnId
+        const turn = ensureTurn(completedTurnId, 'completed')
+        if (turn) turn.status = 'completed'
+        if (completedTurnId === currentTurnId) currentTurnId = ''
+      } else if (eventType === 'agent_message') {
+        const text = readNonEmptyString(payload.message)
+        const turn = ensureTurn(eventTurnId || currentTurnId)
+        if (turn && text) {
+          addItem(turn, {
+            id: readNonEmptyString(payload.id) || `${turn.id}-session-agent-${turn.items.length}`,
+            type: 'agentMessage',
+            text,
+          })
+        }
+      }
+      continue
+    }
+
+    if (row.type !== 'response_item') continue
+    const rowTurnId = readNonEmptyString(row.turn_id) || readNonEmptyString(row.turnId) || readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId)
+    if (rowTurnId) currentTurnId = rowTurnId
+    const turn = ensureTurn(currentTurnId)
+    if (!turn || readNonEmptyString(payload.type) !== 'message') continue
+    const role = readNonEmptyString(payload.role)
+    const payloadId = readNonEmptyString(payload.id)
+    if (role === 'assistant') {
+      const text = extractSessionMessageText(payload.content, readNonEmptyString(payload.text))
+      if (text) {
+        addItem(turn, {
+          id: payloadId || `${turn.id}-session-agent-${turn.items.length}`,
+          type: 'agentMessage',
+          text,
+        })
+      }
+    } else if (role === 'user') {
+      const content = normalizeSessionUserContent(payload.content)
+      if (content.length > 0) {
+        addItem(turn, {
+          id: payloadId || `${turn.id}-session-user-${turn.items.length}`,
+          type: 'userMessage',
+          content,
+        })
+      }
+    }
+  }
+
+  return turnOrder
+    .slice(-Math.max(1, limit))
+    .map((turnId) => turnsById.get(turnId))
+    .filter((turn): turn is FastSessionTurn => Boolean(turn))
 }
 
 function mergeSessionProjectionFallbackIntoTurns(
@@ -8929,6 +9070,77 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           })
         } catch (error) {
           setJson(res, 500, { error: getErrorMessage(error, 'Failed to load earlier thread messages') })
+        }
+        return
+      }
+
+      if (req.method === 'GET' && url.pathname === '/codex-api/thread-fast-state') {
+        const threadId = url.searchParams.get('threadId')?.trim() ?? ''
+        if (!threadId) {
+          setJson(res, 400, { error: 'Missing threadId' })
+          return
+        }
+
+        try {
+          // includeTurns:false still gives us the stable session path and
+          // thread metadata, without asking app-server to materialize the
+          // complete rollout.  The path is obtained from Codex itself rather
+          // than accepted from the browser, so this endpoint cannot be used
+          // as an arbitrary local-file reader.
+          const summaryResult = await appServer.rpc('thread/read', {
+            threadId,
+            includeTurns: false,
+          })
+          const summaryRecord = asRecord(summaryResult)
+          const summaryThread = asRecord(summaryRecord?.thread)
+          const sessionPath = readNonEmptyString(summaryThread?.path)
+          if (!summaryRecord || !summaryThread || !sessionPath || !isAbsolute(sessionPath)) {
+            setJson(res, 404, { error: 'Thread session path is unavailable' })
+            return
+          }
+
+          const sessionActivity = await appServer.getSessionActivityReader().read(sessionPath)
+          const sessionTail = await readSessionTailForFastThread(sessionPath)
+          const turns = buildFastSessionTurns(sessionTail.raw)
+          const currentStatus = asRecord(summaryThread.status)
+          const inProgress = sessionActivity.known
+            ? sessionActivity.inProgress
+            : readNonEmptyString(currentStatus?.type) === 'inProgress'
+          const mergedThread = {
+            ...summaryThread,
+            turns,
+            ...(sessionActivity.known
+              ? {
+                inProgress,
+                status: { ...currentStatus, type: inProgress ? 'inProgress' : 'idle' },
+                sessionActivityKnown: true,
+                sessionRevision: sessionActivity.revision,
+              }
+              : {}),
+          }
+          const activitySnapshot = buildTaskSnapshotResponse(
+            threadId,
+            inProgress,
+            0,
+            appServer.listPendingServerRequests(),
+            appServer.getStreamEvents(threadId, 40),
+            appServer.getStreamCursor(),
+            sessionActivity,
+            resolveTaskWriterClient(threadId, sessionActivity, appServer, threadBroker),
+          )
+          setJson(res, 200, {
+            ...summaryRecord,
+            thread: mergedThread,
+            partial: true,
+            hasMoreOlder: sessionTail.size > FAST_THREAD_SESSION_TAIL_BYTES || turns.length >= THREAD_RESPONSE_TURN_LIMIT,
+            inProgress,
+            activeTurnId: sessionActivity.inProgress ? sessionActivity.turnId : '',
+            sessionActivityKnown: sessionActivity.known,
+            sessionRevision: sessionActivity.revision,
+            ...activitySnapshot,
+          })
+        } catch (error) {
+          setJson(res, 502, { error: getErrorMessage(error, 'Failed to load fast thread state') })
         }
         return
       }
