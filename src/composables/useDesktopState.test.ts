@@ -964,7 +964,7 @@ describe('thread selection latency', () => {
 
     expect(result).toBe('selected')
     expect(state.messages.value.map((message) => message.text)).toEqual(['fast answer'])
-    await new Promise((resolve) => setTimeout(resolve, 10))
+    await new Promise((resolve) => setTimeout(resolve, 350))
     expect(gatewayMocks.getThreadFastDetail).toHaveBeenCalledWith('fast-thread')
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('fast-thread')
   })

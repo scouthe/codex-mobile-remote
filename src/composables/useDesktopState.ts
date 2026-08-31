@@ -102,6 +102,7 @@ const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
 const THREAD_STATUS_POLL_INTERVAL_MS = 1500
+const FAST_THREAD_BACKGROUND_HYDRATION_DELAY_MS = 300
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
@@ -4914,6 +4915,11 @@ export function useDesktopState() {
         // Schedule after this load promise settles; scheduling inline would
         // observe the in-flight promise and await itself forever.
         setTimeout(() => {
+          // A user can tap through several tasks before a full app-server
+          // read completes.  Only hydrate a fast snapshot in the background
+          // if it is still the visible task; a later selection can request
+          // the same full snapshot when needed.
+          if (selectedThreadId.value !== threadId) return
           void loadMessages(threadId, {
             silent: true,
             force: true,
@@ -4923,7 +4929,7 @@ export function useDesktopState() {
             // The fast snapshot is still useful when the background hydration
             // races a desktop writer or a transient app-server restart.
           })
-        }, 0)
+        }, FAST_THREAD_BACKGROUND_HYDRATION_DELAY_MS)
       }
       } catch (unknownError) {
         const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
