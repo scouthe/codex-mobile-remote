@@ -1443,6 +1443,7 @@ export function useDesktopState() {
   const queuedMessagesByThreadId = ref<Record<string, QueuedMessage[]>>({})
   const queueProcessingByThreadId = ref<Record<string, boolean>>({})
   let hasLoadedPersistedQueueState = false
+  let lastQueueStateRefreshAt = 0
   const queueClientId = (() => {
     if (typeof window === 'undefined') return 'server'
     const key = 'codex-web-local.task-client-id.v1'
@@ -5926,6 +5927,15 @@ export function useDesktopState() {
       if (!selectedThreadId.value) return
 
       const threadId = selectedThreadId.value
+      if (Date.now() - lastQueueStateRefreshAt >= THREAD_STATUS_POLL_INTERVAL_MS) {
+        try {
+          const queueState = await getThreadQueueState()
+          lastQueueStateRefreshAt = Date.now()
+          updateTaskQueueSnapshot(threadId, queueState[threadId] ?? [])
+        } catch {
+          // Queue state is optional; preserve the last known snapshot.
+        }
+      }
       // Selection can change while the forced list request is in flight.  Do
       // not apply the prior thread's transition to the newly selected one.
       const sameSelectedThread = threadId === threadIdBeforeRefresh
@@ -6194,6 +6204,7 @@ export function useDesktopState() {
     persistedUserMessageByThreadId.value = {}
     queuedMessagesByThreadId.value = {}
     queueProcessingByThreadId.value = {}
+    lastQueueStateRefreshAt = 0
     persistQueueState()
     codexRateLimit.value = null
     threadTokenUsageByThreadId.value = {}
