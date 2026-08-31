@@ -7,15 +7,19 @@ android {
     namespace = "com.codex.mobile"
     compileSdk = 35
 
+    buildFeatures {
+        // Used for the native WebView user-agent and debug bridge diagnostics.
+        buildConfig = true
+    }
+
     defaultConfig {
         applicationId = "com.codex.mobile"
         minSdk = 24
-        // targetSdk 28 allows executing binaries from app data directory.
-        // Android 10+ (targetSdk 29+) enforces W^X which blocks this via SELinux.
-        // Termux (F-Droid) uses the same approach.
-        targetSdk = 28
-        versionCode = 2
-        versionName = "0.1.1"
+        // Remote mode does not execute downloaded binaries, so it can target
+        // the current Android security model instead of relying on W^X bypasses.
+        targetSdk = 35
+        versionCode = 3
+        versionName = "0.2.0"
     }
 
     buildTypes {
@@ -43,16 +47,11 @@ android {
         }
     }
 
-    // Don't compress bootstrap zip or server bundle in assets
-    androidResources {
-        noCompress += listOf("zip", "tar.gz")
-    }
 }
 
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.webkit:webkit:1.12.1")
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("com.google.android.material:material:1.12.0")
 }

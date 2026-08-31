@@ -1,92 +1,107 @@
-# Codex Mobile (Android)
+# Codex Remote (Android)
 
-Android APK that embeds a Termux-style Linux bootstrap environment, installs Codex on first run, and presents the codex-web-local UI inside a WebView.
+This Android target is a small native shell around a `codexapp` instance that
+runs on your computer. It does **not** install Termux, Node.js, Codex CLI, or a
+second app-server on the phone. The computer remains the only Codex writer;
+the phone is a remote observer/controller and uses the same task queue,
+approval cards, and live-state stream as the web client.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────┐
-│              Android APK                │
-│                                         │
-│  ┌──────────────┐  ┌────────────────┐   │
-│  │   WebView    │  │  Bootstrap     │   │
-│  │              │  │  Installer     │   │
-│  │ localhost:   │  │                │   │
-│  │   18923      │  │  Extracts      │   │
-│  │              │  │  Termux env    │   │
-│  └──────┬───────┘  └───────┬────────┘   │
-│         │                  │            │
-│         ▼                  ▼            │
-│  ┌──────────────────────────────────┐   │
-│  │    /data/data/com.codex.mobile/  │   │
-│  │    files/usr/  (Termux prefix)   │   │
-│  │                                  │   │
-│  │    ├── bin/node                   │   │
-│  │    ├── bin/codex                  │   │
-│  │    └── lib/node_modules/         │   │
-│  │        └── codex-web-local/      │   │
-│  │            ├── dist/      (Vue)  │   │
-│  │            └── dist-cli/  (srv)  │   │
-│  └──────────────────────────────────┘   │
-└─────────────────────────────────────────┘
+```text
+┌──────────────────────────┐       Tailscale Serve (HTTPS)
+│ Codex Remote Android     │ ─────────────────────────────────┐
+│ Kotlin shell + WebView  │                                  │
+│ URL/credential vault    │                                  ▼
+└──────────────────────────┘                       ┌────────────────────┐
+                                                   │ Computer            │
+                                                   │ codexapp bridge     │
+                                                   │ ThreadSessionBroker │
+                                                   │ Codex app-server    │
+                                                   └────────────────────┘
 ```
 
-## Prerequisites
+The WebView keeps the existing Vue UI and WebSocket/SSE protocol. Native code
+adds the pieces that are awkward or unreliable in a browser:
 
-- Android Studio (or just the Android SDK command-line tools)
-- Java 17+
-- curl (for downloading bootstrap)
+- remembers the server address;
+- stores an optional codexapp password in the Android Keystore;
+- restores WebView cookies for a long-lived login session;
+- retries after Tailscale/Wi-Fi transitions with bounded backoff;
+- opens the Android document picker for file attachments;
+- accepts Android share intents and exposes their content to the web UI;
+- exposes a small `window.CodexAndroid` bridge for client identity and task
+  notifications.
 
-## Build Instructions
+## Build
 
-### 1. Download the Termux bootstrap
+Requirements:
+
+- Android SDK with API 35 platform/build tools;
+- JDK 17 or newer;
+- Gradle wrapper (run from this directory).
 
 ```bash
 cd android
-./scripts/download-bootstrap.sh
-```
-
-This downloads `bootstrap-aarch64.zip` (~30 MB) from Termux releases into `app/src/main/assets/`.
-
-### 2. (Optional) Bundle the server
-
-If you want to pre-bundle the codex-web-local server in the APK so users don't need to `npm install` it on first run:
-
-```bash
-./scripts/build-server-bundle.sh
-```
-
-This builds the Vue frontend + Express CLI from the parent project and copies them into `app/src/main/assets/server-bundle/`.
-
-### 3. Build the APK
-
-```bash
 ./gradlew assembleDebug
 ```
 
-The APK will be at `app/build/outputs/apk/debug/app-debug.apk`.
+The APK is written to
+`app/build/outputs/apk/debug/app-debug.apk`. This target does not need the
+Termux bootstrap or a bundled server asset, so `app/src/main/assets/` may stay
+empty. The old bootstrap helper files are retained in this branch only as
+historical references and are not called by the remote activity.
 
-For a release build:
+## First launch
 
-```bash
-./gradlew assembleRelease
+1. Start `codexapp` on the computer and expose it through Tailscale Serve, for
+   example `https://my-computer.my-tailnet.ts.net`.
+2. Open **Codex Remote** and enter that complete URL. A host without a scheme
+   is treated as HTTPS.
+3. Optionally enter the codexapp password. It is encrypted with an AES/GCM key
+   held by Android Keystore; it is never put into the URL. Leave it blank when
+   the server trusts the Tailscale identity or when you prefer the in-page
+   login form.
+4. Tap **Connect**. The saved profile is loaded automatically next time.
+
+HTTPS is strongly recommended. An explicit **Allow unencrypted HTTP** checkbox
+is available for a private test network only; never use it for a forwarded or
+public address. The app rejects invalid schemes, URL credentials, query strings,
+fragments, and untrusted TLS certificates.
+
+Long-press the connection settings button to forget the URL, encrypted
+password, and WebView login cookies.
+
+## Native bridge contract
+
+The current web UI can opt into these methods without requiring a native UI
+rewrite:
+
+```js
+window.CodexAndroid.getClientInfo()
+window.CodexAndroid.openSettings()
+window.CodexAndroid.copyText(text)
+window.CodexAndroid.setTaskState(state, title, detail)
+window.CodexAndroid.clearTaskState()
+window.CodexAndroid.getPendingShare()
+window.CodexAndroid.readSharedContent(uri)
+window.CodexAndroid.clearPendingShare()
 ```
 
-## First Run
+The activity also dispatches `codex-native-ready`, `codex-native-share`,
+`codex-native-network-online`, `codex-native-network-offline`,
+`codex-native-pause`, and `codex-native-resume` `CustomEvent`s. The task state
+values are the shared observer states (`queued`, `starting`, `running`,
+`waiting_approval`, `waiting_user_input`, `steering`, `completed`, `failed`,
+and `canceled`).
 
-On first launch, the app will:
+## Security notes
 
-1. Extract the bootstrap environment (~30 MB compressed, ~100 MB extracted)
-2. Run `apt-get install nodejs-lts` (downloads ~30 MB)
-3. Run `npm install -g @openai/codex codex-web-local`
-4. Prompt for your OpenAI API key (stored encrypted on device)
-5. Start the server and load the WebView
-
-Steps 1-3 only happen once. Subsequent launches skip straight to step 4-5.
-
-## Minimum Requirements
-
-- Android 7.0 (API 24) or higher
-- arm64-v8a device (most modern Android phones)
-- ~500 MB free storage for bootstrap + Node.js + Codex
-- Internet connection (for API calls and first-run package installs)
+- The app does not bypass TLS certificate errors.
+- The JavaScript bridge is intentionally available only to the configured
+  same-origin remote page; do not point the app at an untrusted site.
+- A task notification can start a short-lived foreground data-sync service;
+  it never executes commands on Android.
+- The computer-side app-server still needs its own authentication and safe
+  sandbox/approval policy. Tailscale connectivity alone is not a substitute for
+  those controls when devices or users are not fully trusted.

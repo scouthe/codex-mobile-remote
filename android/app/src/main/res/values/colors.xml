@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="codex_background">#F8FAFC</color>
+    <color name="codex_toolbar">#FFFFFF</color>
+    <color name="codex_surface">#FFFFFF</color>
+    <color name="codex_border">#CBD5E1</color>
+    <color name="codex_accent">#4F46E5</color>
+    <color name="codex_primary_text">#0F172A</color>
+    <color name="codex_secondary_text">#475569</color>
+    <color name="codex_muted_text">#64748B</color>
+    <color name="connection_online">#22C55E</color>
+    <color name="connection_offline">#F59E0B</color>
+</resources>

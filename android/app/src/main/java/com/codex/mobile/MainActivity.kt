@@ -1,342 +1,780 @@
 package com.codex.mobile
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.net.http.SslError
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.PowerManager
-import android.provider.Settings
+import android.provider.OpenableColumns
+import android.util.Base64
 import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
+import android.webkit.SslErrorHandler
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageButton
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.util.UUID
 
+/**
+ * A lightweight native shell for a codexapp instance running on the user's
+ * computer. No Termux environment, Node.js process, Codex binary, or local
+ * HTTP server is started on Android.
+ */
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        private const val TAG = "CodexMainActivity"
+        private const val TAG = "CodexRemote"
+        private const val ANDROID_BRIDGE_NAME = "CodexAndroid"
+        private const val CLIENT_PREFS = "codex_remote_client"
+        private const val CLIENT_ID_KEY = "client_id"
+        private const val MAX_SHARED_FILE_BYTES = 20 * 1024 * 1024
     }
 
     private lateinit var webView: WebView
-    private lateinit var loadingOverlay: View
+    private lateinit var appContent: View
+    private lateinit var setupOverlay: View
+    private lateinit var configurationForm: LinearLayout
+    private lateinit var serverUrlInput: EditText
+    private lateinit var passwordInput: EditText
+    private lateinit var allowHttpCheckBox: CheckBox
+    private lateinit var connectButton: Button
+    private lateinit var retryButton: Button
+    private lateinit var cancelButton: Button
     private lateinit var statusText: TextView
     private lateinit var statusDetail: TextView
     private lateinit var progressBar: ProgressBar
-    private lateinit var serverManager: CodexServerManager
+    private lateinit var connectionStatusDot: TextView
+    private lateinit var connectionStatusText: TextView
+    private lateinit var settingsButton: ImageButton
+
+    private lateinit var connectionStore: RemoteConnectionStore
+    private lateinit var connectionManager: RemoteConnectionManager
+    private var currentProfile: RemoteConnectionStore.Profile? = null
+    private var currentBaseUri: Uri? = null
+    private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+    private var mainFrameFailed = false
+    private var pageReady = false
+    private var passwordAttempted = false
+    private var pendingNotification: TaskNotification? = null
+
+    private val shareLock = Any()
+    private var pendingShareText: String? = null
+    private val pendingShareUris = LinkedHashMap<String, SharedContent>()
+
+    private data class TaskNotification(
+        val state: String,
+        val title: String,
+        val detail: String,
+    )
+
+    private data class SharedContent(
+        val uri: Uri,
+        val name: String,
+        val mimeType: String,
+    )
+
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val callback = fileChooserCallback
+        fileChooserCallback = null
+        callback?.onReceiveValue(
+            if (result.resultCode == RESULT_OK) {
+                WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+            } else {
+                null
+            },
+        )
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        val pending = pendingNotification
+        pendingNotification = null
+        if (granted && pending != null) {
+            CodexForegroundService.showTask(
+                this,
+                pending.state,
+                pending.title,
+                pending.detail,
+                currentProfile?.baseUrl.orEmpty(),
+            )
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        webView = findViewById(R.id.webView)
-        loadingOverlay = findViewById(R.id.loadingOverlay)
-        statusText = findViewById(R.id.statusText)
-        statusDetail = findViewById(R.id.statusDetail)
-        progressBar = findViewById(R.id.progressBar)
+        bindViews()
+        connectionStore = RemoteConnectionStore(this)
+        connectionManager = RemoteConnectionManager(
+            context = this,
+            onNetworkAvailable = ::onNetworkAvailable,
+            onNetworkLost = ::onNetworkLost,
+        )
 
-        serverManager = CodexServerManager(this)
-
-        requestBatteryOptimizationExemption()
-        startForegroundService()
         setupWebView()
-        startSetupFlow()
+        setupControls()
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                when {
+                    setupOverlay.visibility == View.VISIBLE && pageReady -> {
+                        setupOverlay.visibility = View.GONE
+                        appContent.visibility = View.VISIBLE
+                    }
+                    webView.canGoBack() -> webView.goBack()
+                    else -> finish()
+                }
+            }
+        })
+        collectShareIntent(intent)
+
+        val savedProfile = connectionStore.load()
+        if (savedProfile == null) {
+            showConfiguration()
+        } else {
+            fillConfiguration(savedProfile)
+            connect(savedProfile)
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        connectionManager.start()
+    }
+
+    override fun onStop() {
+        CookieManager.getInstance().flush()
+        connectionManager.stop()
+        super.onStop()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        dispatchWindowEvent("codex-native-resume")
+        if (mainFrameFailed && connectionManager.isOnline()) scheduleReconnect()
+    }
+
+    override fun onPause() {
+        dispatchWindowEvent("codex-native-pause")
+        CookieManager.getInstance().flush()
+        super.onPause()
     }
 
     override fun onDestroy() {
+        connectionManager.stop()
+        fileChooserCallback?.onReceiveValue(null)
+        fileChooserCallback = null
+        webView.apply {
+            stopLoading()
+            removeJavascriptInterface(ANDROID_BRIDGE_NAME)
+            webChromeClient = null
+            webViewClient = WebViewClient()
+            destroy()
+        }
         super.onDestroy()
-        serverManager.stopServer()
-        stopService(Intent(this, CodexForegroundService::class.java))
     }
 
-    private fun requestBatteryOptimizationExemption() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
-        val pm = getSystemService(PowerManager::class.java) ?: return
-        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        collectShareIntent(intent)
+        if (pageReady) dispatchPendingShare()
+    }
 
-        try {
-            @Suppress("BatteryLife")
-            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                data = Uri.parse("package:$packageName")
+    private fun bindViews() {
+        webView = findViewById(R.id.webView)
+        appContent = findViewById(R.id.appContent)
+        setupOverlay = findViewById(R.id.setupOverlay)
+        configurationForm = findViewById(R.id.configurationForm)
+        serverUrlInput = findViewById(R.id.serverUrlInput)
+        passwordInput = findViewById(R.id.passwordInput)
+        allowHttpCheckBox = findViewById(R.id.allowHttpCheckBox)
+        connectButton = findViewById(R.id.connectButton)
+        retryButton = findViewById(R.id.retryButton)
+        cancelButton = findViewById(R.id.cancelButton)
+        statusText = findViewById(R.id.statusText)
+        statusDetail = findViewById(R.id.statusDetail)
+        progressBar = findViewById(R.id.progressBar)
+        connectionStatusDot = findViewById(R.id.connectionStatusDot)
+        connectionStatusText = findViewById(R.id.connectionStatusText)
+        settingsButton = findViewById(R.id.settingsButton)
+    }
+
+    private fun setupControls() {
+        connectButton.setOnClickListener { saveAndConnect() }
+        retryButton.setOnClickListener {
+            currentProfile?.let(::connect) ?: showConfiguration()
+        }
+        cancelButton.setOnClickListener {
+            if (pageReady) {
+                setupOverlay.visibility = View.GONE
+                appContent.visibility = View.VISIBLE
+            } else {
+                finish()
             }
-            startActivity(intent)
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not request battery optimization exemption: ${e.message}")
+        }
+        settingsButton.setOnClickListener { showConfiguration() }
+        settingsButton.setOnLongClickListener {
+            confirmClearConnection()
+            true
         }
     }
 
-    private fun startForegroundService() {
-        val intent = Intent(this, CodexForegroundService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
-    }
-
-    @Deprecated("Use onBackPressedDispatcher")
-    override fun onBackPressed() {
-        if (webView.canGoBack()) {
-            webView.goBack()
-        } else {
-            @Suppress("DEPRECATION")
-            super.onBackPressed()
-        }
-    }
-
-    @android.annotation.SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(webView, false)
+        }
+
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
-            databaseEnabled = true
+            databaseEnabled = false
             allowFileAccess = false
+            allowContentAccess = true
+            allowFileAccessFromFileURLs = false
+            allowUniversalAccessFromFileURLs = false
+            mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            javaScriptCanOpenWindowsAutomatically = false
+            setSupportMultipleWindows(false)
             setSupportZoom(false)
+            mediaPlaybackRequiresUserGesture = true
+            userAgentString = "$userAgentString CodexRemoteAndroid/${BuildConfig.VERSION_NAME}"
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) safeBrowsingEnabled = true
         }
 
+        webView.addJavascriptInterface(AndroidBridge(), ANDROID_BRIDGE_NAME)
         webView.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
                 view: WebView,
-                url: String,
-            ): Boolean = false
+                request: WebResourceRequest,
+            ): Boolean {
+                val uri = request.url
+                if (request.isForMainFrame && isAllowedInWebView(uri)) return false
+                if (!request.isForMainFrame) return false
+                return openExternal(uri)
+            }
+
+            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                if (!mainFrameFailed) setConnectionStatus(false, getString(R.string.status_connecting_short))
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                if (mainFrameFailed || !isAllowedInWebView(Uri.parse(url))) return
+                trySavedPasswordOrShowPage()
+            }
+
+            override fun onReceivedError(
+                view: WebView,
+                request: WebResourceRequest,
+                error: WebResourceError,
+            ) {
+                super.onReceivedError(view, request, error)
+                if (!request.isForMainFrame) return
+                onMainFrameFailure(error.description?.toString() ?: getString(R.string.error_connection))
+            }
+
+            override fun onReceivedSslError(
+                view: WebView,
+                handler: SslErrorHandler,
+                error: SslError,
+            ) {
+                // Never provide a certificate bypass for a remote command UI.
+                handler.cancel()
+                onMainFrameFailure(getString(R.string.error_tls_certificate), retry = false)
+            }
         }
 
         webView.webChromeClient = object : WebChromeClient() {
-            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
-                Log.d(TAG, "[WebView] ${msg.sourceId()}:${msg.lineNumber()} ${msg.message()}")
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
+                if (BuildConfig.DEBUG) {
+                    Log.d(
+                        TAG,
+                        "[WebView] ${consoleMessage.sourceId()}:" +
+                            "${consoleMessage.lineNumber()} ${consoleMessage.message()}",
+                    )
+                }
                 return true
             }
+
+            override fun onProgressChanged(view: WebView, newProgress: Int) {
+                if (setupOverlay.visibility == View.VISIBLE && configurationForm.visibility == View.GONE) {
+                    statusDetail.text = getString(R.string.status_loading_percent, newProgress)
+                    statusDetail.visibility = View.VISIBLE
+                }
+            }
+
+            override fun onShowFileChooser(
+                webView: WebView,
+                filePathCallback: ValueCallback<Array<Uri>>,
+                fileChooserParams: FileChooserParams,
+            ): Boolean {
+                this@MainActivity.fileChooserCallback?.onReceiveValue(null)
+                this@MainActivity.fileChooserCallback = filePathCallback
+                return try {
+                    fileChooserLauncher.launch(fileChooserParams.createIntent())
+                    true
+                } catch (error: Exception) {
+                    Log.w(TAG, "Unable to open file chooser", error)
+                    this@MainActivity.fileChooserCallback = null
+                    filePathCallback.onReceiveValue(null)
+                    false
+                }
+            }
+
+            override fun onPermissionRequest(request: PermissionRequest) {
+                // Camera/microphone access is not required by the remote shell.
+                request.deny()
+            }
         }
     }
 
-    private fun startSetupFlow() {
-        showLoading(true)
-        setStatus("Initializing…")
+    private fun saveAndConnect() {
+        val raw = serverUrlInput.text.toString().trim()
+        val candidate = if (raw.contains("://")) raw else "https://$raw"
+        val normalized = RemoteConnectionStore.normalizeUrl(candidate)
+        if (normalized == null) {
+            serverUrlInput.error = getString(R.string.error_invalid_url)
+            return
+        }
 
-        Thread {
-            try {
-                runSetup()
-            } catch (e: Exception) {
-                Log.e(TAG, "Setup failed", e)
-                runOnUiThread {
-                    showError(e.message ?: "Unknown error")
-                }
-            }
-        }.start()
+        val uri = Uri.parse(normalized)
+        if (uri.scheme.equals("http", ignoreCase = true) && !allowHttpCheckBox.isChecked) {
+            allowHttpCheckBox.error = getString(R.string.error_http_confirmation)
+            return
+        }
+
+        val password = passwordInput.text.toString().takeIf(String::isNotBlank)
+        try {
+            connectionStore.save(normalized, password)
+        } catch (error: Exception) {
+            showConfiguration(getString(R.string.error_save_connection, error.message.orEmpty()))
+            return
+        }
+        connect(RemoteConnectionStore.Profile(normalized, password))
     }
 
-    private fun runSetup() {
-        // Step 1: Extract bootstrap
-        if (!BootstrapInstaller.isBootstrapInstalled(this)) {
-            updateStatus("Extracting environment…")
-            BootstrapInstaller.install(this) { msg -> updateStatus(msg) }
-        }
-        updateStatus("Environment ready")
+    private fun connect(profile: RemoteConnectionStore.Profile) {
+        currentProfile = profile
+        currentBaseUri = Uri.parse(profile.baseUrl)
+        mainFrameFailed = false
+        pageReady = false
+        passwordAttempted = false
+        connectionManager.cancelReconnect()
+        fillConfiguration(profile)
+        showConnecting(profile.baseUrl)
+        webView.visibility = View.VISIBLE
+        webView.loadUrl(
+            "${profile.baseUrl}/",
+            mapOf(
+                "X-Codex-Client-Type" to "android",
+                "X-Codex-Client-Mode" to "observer",
+            ),
+        )
+    }
 
-        // Step 1b: Install proot (needed for dpkg/apt-get path remapping)
-        if (!serverManager.isProotInstalled()) {
-            updateStatus("Installing proot…", "Needed for package management")
-            val prootOk = serverManager.installProot { msg -> updateDetail(msg) }
-            if (!prootOk) {
-                throw RuntimeException("Failed to install proot")
+    private fun trySavedPasswordOrShowPage() {
+        val password = currentProfile?.password
+        if (password.isNullOrEmpty() || passwordAttempted) {
+            showWebContent()
+            return
+        }
+
+        passwordAttempted = true
+        val quotedPassword = JSONObject.quote(password)
+        val script = """
+            (async function () {
+              if (!document.getElementById('pw') || !document.getElementById('f')) return 'not-needed';
+              try {
+                const response = await fetch('/auth/login', {
+                  method: 'POST',
+                  headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({password: $quotedPassword})
+                });
+                if (!response.ok) return 'rejected';
+                window.location.replace('/');
+                return 'accepted';
+              } catch (_) {
+                return 'network-error';
+              }
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(script) { encoded ->
+            when (encoded?.trim('"')) {
+                "accepted" -> Unit // The replacement navigation will finish shortly.
+                "rejected" -> showConfiguration(getString(R.string.error_saved_password))
+                "network-error" -> onMainFrameFailure(getString(R.string.error_connection))
+                else -> showWebContent()
             }
-        }
-        updateStatus("proot ready")
-
-        // Step 2: Install Node.js
-        if (!serverManager.isNodeInstalled()) {
-            updateStatus("Installing Node.js (first run)…", "This may take a few minutes")
-            val nodeOk = serverManager.installNode { msg -> updateDetail(msg) }
-            if (!nodeOk) {
-                throw RuntimeException("Failed to install Node.js")
-            }
-        }
-        updateStatus("Node.js ready")
-
-        // Step 2b: Install Python
-        if (!serverManager.isPythonInstalled()) {
-            updateStatus("Installing Python…")
-            val pyOk = serverManager.installPython { msg -> updateDetail(msg) }
-            if (!pyOk) {
-                Log.w(TAG, "Python install failed — continuing without it")
-            }
-        }
-
-        // Step 3: Install Codex CLI
-        if (!serverManager.isCodexInstalled()) {
-            updateStatus("Installing Codex CLI…", "This may take a few minutes")
-            val codexOk = serverManager.installCodex { msg -> updateDetail(msg) }
-            if (!codexOk) {
-                throw RuntimeException("Failed to install Codex")
-            }
-        }
-
-        // Ensure codex wrapper script exists
-        serverManager.ensureCodexWrapperScript()
-
-        // Step 3a: Extract web UI from APK assets (every launch)
-        updateStatus("Updating web UI…")
-        serverManager.installServerBundle { msg -> updateDetail(msg) }
-
-        // Step 3b: Install native platform binary
-        if (!serverManager.isPlatformBinaryInstalled()) {
-            updateStatus("Installing Codex platform binary…")
-            val binOk = serverManager.installPlatformBinary { msg -> updateDetail(msg) }
-            if (!binOk) {
-                throw RuntimeException("Failed to install Codex platform binary")
-            }
-        }
-        updateStatus("Codex ready")
-
-        // Step 3c: Write full-access config and create default workspace
-        serverManager.ensureFullAccessConfig()
-        serverManager.ensureDefaultWorkspace()
-
-        // Step 4: Start CONNECT proxy (needed for native binary DNS/TLS)
-        updateStatus("Starting network proxy…")
-        if (!serverManager.startProxy()) {
-            throw RuntimeException("Failed to start network proxy")
-        }
-
-        // Step 5: Authenticate via `codex login`
-        updateStatus("Checking authentication…")
-        if (!serverManager.isLoggedIn()) {
-            updateStatus("Login required — opening browser…")
-            val authOk = serverManager.loginWithUrl(
-                onLoginUrl = { url ->
-                    runOnUiThread {
-                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                    }
-                },
-                onProgress = { msg -> updateDetail(msg) },
-            )
-            if (!authOk && !serverManager.isLoggedIn()) {
-                updateStatus("Browser login failed — enter API key manually")
-                val apiKey = requestApiKey()
-                if (apiKey.isBlank()) {
-                    throw RuntimeException("No API key provided")
-                }
-                val loginOk = serverManager.loginWithApiKey(apiKey)
-                if (!loginOk) {
-                    throw RuntimeException("Login failed — check your API key")
-                }
-            }
-        }
-        updateStatus("Authenticated")
-
-        // Step 6: Health check
-        updateStatus("Verifying API access…", "Sending test message")
-        val healthOk = serverManager.healthCheck { msg -> updateDetail(msg) }
-        if (!healthOk) {
-            throw RuntimeException("API health check failed — Codex could not reach OpenAI")
-        }
-        updateStatus("API verified")
-
-        // Step 7: Start web server
-        updateStatus("Starting server…")
-        val started = serverManager.startServer()
-        if (!started) {
-            throw RuntimeException("Failed to start server")
-        }
-
-        // Step 8: Wait for ready
-        updateStatus("Waiting for server…")
-        val ready = serverManager.waitForServer(timeoutMs = 90_000)
-        if (!ready) {
-            throw RuntimeException("Server did not start in time")
-        }
-
-        // Step 9: Show web UI
-        runOnUiThread {
-            showLoading(false)
-            webView.visibility = View.VISIBLE
-            webView.loadUrl("http://127.0.0.1:${CodexServerManager.SERVER_PORT}/")
         }
     }
 
-    /**
-     * Fallback: prompt for API key if browser login fails.
-     */
-    private fun requestApiKey(): String {
-        var result = ""
-        val lock = Object()
-
-        runOnUiThread {
-            val input = EditText(this).apply {
-                hint = getString(R.string.api_key_hint)
-                setSingleLine(true)
-            }
-            val padding = (24 * resources.displayMetrics.density).toInt()
-            val container = android.widget.FrameLayout(this).apply {
-                setPadding(padding, padding / 2, padding, 0)
-                addView(input)
-            }
-
-            AlertDialog.Builder(this)
-                .setTitle(R.string.api_key_title)
-                .setMessage(R.string.api_key_message)
-                .setView(container)
-                .setCancelable(false)
-                .setPositiveButton(R.string.ok) { _, _ ->
-                    result = input.text.toString().trim()
-                    synchronized(lock) { lock.notifyAll() }
-                }
-                .setNegativeButton(R.string.cancel) { _, _ ->
-                    synchronized(lock) { lock.notifyAll() }
-                }
-                .show()
-        }
-
-        synchronized(lock) {
-            lock.wait(300_000)
-        }
-        return result
+    private fun showWebContent() {
+        pageReady = true
+        mainFrameFailed = false
+        connectionManager.markConnected()
+        setupOverlay.visibility = View.GONE
+        appContent.visibility = View.VISIBLE
+        webView.visibility = View.VISIBLE
+        setConnectionStatus(true, currentBaseUri?.host ?: getString(R.string.status_connected))
+        dispatchNativeReady()
+        dispatchPendingShare()
     }
 
-    // ── UI helpers ──────────────────────────────────────────────────────────
+    private fun onMainFrameFailure(message: String, retry: Boolean = true) {
+        mainFrameFailed = true
+        pageReady = false
+        setConnectionStatus(false, getString(R.string.status_disconnected))
+        showConfiguration(message)
+        if (retry && connectionManager.isOnline()) scheduleReconnect()
+    }
 
-    private fun showError(message: String) {
+    private fun scheduleReconnect() {
+        connectionManager.scheduleReconnect {
+            if (!mainFrameFailed || !connectionManager.isOnline()) return@scheduleReconnect
+            val profile = currentProfile ?: return@scheduleReconnect
+            showConnecting(profile.baseUrl, getString(R.string.status_reconnecting))
+            webView.reload()
+        }
+    }
+
+    private fun onNetworkAvailable() {
+        if (mainFrameFailed) {
+            setConnectionStatus(false, getString(R.string.status_reconnecting))
+            scheduleReconnect()
+        } else if (pageReady) {
+            setConnectionStatus(true, currentBaseUri?.host ?: getString(R.string.status_connected))
+            dispatchWindowEvent("codex-native-network-online")
+        }
+    }
+
+    private fun onNetworkLost() {
+        setConnectionStatus(false, getString(R.string.status_offline))
+        dispatchWindowEvent("codex-native-network-offline")
+    }
+
+    private fun showConfiguration(error: String? = null) {
+        currentProfile?.let(::fillConfiguration)
+        setupOverlay.visibility = View.VISIBLE
+        configurationForm.visibility = View.VISIBLE
+        progressBar.visibility = View.GONE
+        statusText.text = if (error == null) {
+            getString(R.string.setup_title)
+        } else {
+            getString(R.string.error_connection_title)
+        }
+        statusDetail.text = error ?: getString(R.string.setup_description)
+        statusDetail.visibility = View.VISIBLE
+        retryButton.visibility = if (currentProfile == null) View.GONE else View.VISIBLE
+        cancelButton.visibility = if (pageReady) View.VISIBLE else View.GONE
+    }
+
+    private fun showConnecting(serverUrl: String, status: String = getString(R.string.status_connecting)) {
+        setupOverlay.visibility = View.VISIBLE
+        configurationForm.visibility = View.GONE
+        progressBar.visibility = View.VISIBLE
+        statusText.text = status
+        statusDetail.text = Uri.parse(serverUrl).host ?: serverUrl
+        statusDetail.visibility = View.VISIBLE
+        retryButton.visibility = View.GONE
+        cancelButton.visibility = View.GONE
+    }
+
+    private fun fillConfiguration(profile: RemoteConnectionStore.Profile) {
+        serverUrlInput.setText(profile.baseUrl)
+        passwordInput.setText(profile.password.orEmpty())
+        allowHttpCheckBox.isChecked = Uri.parse(profile.baseUrl).scheme.equals("http", true)
+    }
+
+    private fun setConnectionStatus(connected: Boolean, text: String) {
+        connectionStatusDot.setTextColor(
+            ContextCompat.getColor(
+                this,
+                if (connected) R.color.connection_online else R.color.connection_offline,
+            ),
+        )
+        connectionStatusText.text = text
+    }
+
+    private fun confirmClearConnection() {
         AlertDialog.Builder(this)
-            .setTitle(R.string.error_title)
-            .setMessage(message)
-            .setPositiveButton(R.string.retry) { _, _ ->
-                startSetupFlow()
+            .setTitle(R.string.clear_connection_title)
+            .setMessage(R.string.clear_connection_message)
+            .setPositiveButton(R.string.clear) { _, _ ->
+                connectionStore.clear()
+                CookieManager.getInstance().removeAllCookies(null)
+                CookieManager.getInstance().flush()
+                currentProfile = null
+                currentBaseUri = null
+                pageReady = false
+                webView.loadUrl("about:blank")
+                serverUrlInput.text.clear()
+                passwordInput.text.clear()
+                allowHttpCheckBox.isChecked = false
+                showConfiguration()
             }
-            .setNegativeButton(R.string.cancel) { _, _ ->
-                finish()
-            }
-            .setCancelable(false)
+            .setNegativeButton(R.string.cancel, null)
             .show()
     }
 
-    private fun showLoading(show: Boolean) {
-        loadingOverlay.visibility = if (show) View.VISIBLE else View.GONE
+    private fun isAllowedInWebView(uri: Uri): Boolean {
+        val base = currentBaseUri ?: return false
+        if (!uri.scheme.equals(base.scheme, true)) return false
+        if (!uri.host.equals(base.host, true)) return false
+        return effectivePort(uri) == effectivePort(base)
     }
 
-    private fun setStatus(text: String, detail: String? = null) {
-        statusText.text = text
-        if (detail != null) {
-            statusDetail.text = detail
-            statusDetail.visibility = View.VISIBLE
-        } else {
-            statusDetail.visibility = View.GONE
+    private fun effectivePort(uri: Uri): Int {
+        if (uri.port >= 0) return uri.port
+        return if (uri.scheme.equals("https", true)) 443 else 80
+    }
+
+    private fun openExternal(uri: Uri): Boolean {
+        return try {
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
+            true
+        } catch (error: Exception) {
+            Log.w(TAG, "No application can open $uri", error)
+            true
         }
     }
 
-    private fun updateStatus(text: String, detail: String? = null) {
-        runOnUiThread { setStatus(text, detail) }
+    private fun dispatchNativeReady() {
+        val detail = JSONObject()
+            .put("clientId", clientId())
+            .put("clientType", "android")
+            .put("mode", "remote-observer")
+            .put("version", BuildConfig.VERSION_NAME)
+        dispatchWindowEvent("codex-native-ready", detail)
     }
 
-    private fun updateDetail(text: String) {
-        runOnUiThread {
-            statusDetail.text = text
-            statusDetail.visibility = View.VISIBLE
+    private fun dispatchWindowEvent(name: String, detail: JSONObject? = null) {
+        if (!pageReady) return
+        val eventName = JSONObject.quote(name)
+        val detailValue = detail?.toString() ?: "null"
+        webView.evaluateJavascript(
+            "window.dispatchEvent(new CustomEvent($eventName,{detail:$detailValue}));",
+            null,
+        )
+    }
+
+    private fun clientId(): String {
+        val prefs = getSharedPreferences(CLIENT_PREFS, MODE_PRIVATE)
+        return prefs.getString(CLIENT_ID_KEY, null) ?: UUID.randomUUID().toString().also {
+            prefs.edit().putString(CLIENT_ID_KEY, it).apply()
+        }
+    }
+
+    private fun collectShareIntent(source: Intent?) {
+        if (source == null) return
+        if (source.action != Intent.ACTION_SEND && source.action != Intent.ACTION_SEND_MULTIPLE) return
+
+        val text = source.getStringExtra(Intent.EXTRA_TEXT)?.takeIf(String::isNotBlank)
+        val uris = mutableListOf<Uri>()
+        source.clipData?.let { clip ->
+            for (index in 0 until clip.itemCount) clip.getItemAt(index).uri?.let(uris::add)
+        }
+        if (uris.isEmpty()) {
+            @Suppress("DEPRECATION")
+            if (source.action == Intent.ACTION_SEND_MULTIPLE) {
+                source.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.let(uris::addAll)
+            } else {
+                source.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let(uris::add)
+            }
+        }
+
+        synchronized(shareLock) {
+            pendingShareText = text
+            pendingShareUris.clear()
+            uris.distinct().forEach { uri ->
+                val key = uri.toString()
+                pendingShareUris[key] = SharedContent(
+                    uri = uri,
+                    name = displayName(uri),
+                    mimeType = contentResolver.getType(uri) ?: source.type ?: "application/octet-stream",
+                )
+            }
+        }
+    }
+
+    private fun displayName(uri: Uri): String {
+        if (uri.scheme == "content") {
+            try {
+                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (index >= 0) return cursor.getString(index)
+                        }
+                    }
+            } catch (_: Exception) {
+                // Fall back to the last path segment.
+            }
+        }
+        return uri.lastPathSegment ?: getString(R.string.shared_file_default_name)
+    }
+
+    private fun pendingShareJson(): JSONObject {
+        synchronized(shareLock) {
+            val files = JSONArray()
+            pendingShareUris.values.forEach { item ->
+                files.put(
+                    JSONObject()
+                        .put("uri", item.uri.toString())
+                        .put("name", item.name)
+                        .put("mimeType", item.mimeType),
+                )
+            }
+            return JSONObject()
+                .put("text", pendingShareText ?: JSONObject.NULL)
+                .put("files", files)
+        }
+    }
+
+    private fun dispatchPendingShare() {
+        val payload = pendingShareJson()
+        val hasText = payload.optString("text").isNotEmpty()
+        val hasFiles = payload.optJSONArray("files")?.length()?.let { it > 0 } == true
+        if (!hasText && !hasFiles) return
+        dispatchWindowEvent("codex-native-share", payload)
+    }
+
+    private fun readSharedContent(uriText: String): String {
+        val item = synchronized(shareLock) { pendingShareUris[uriText] }
+            ?: return JSONObject().put("error", "not-authorized").toString()
+        return try {
+            val output = ByteArrayOutputStream()
+            contentResolver.openInputStream(item.uri)?.use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                var total = 0
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    total += count
+                    if (total > MAX_SHARED_FILE_BYTES) {
+                        return JSONObject().put("error", "file-too-large").toString()
+                    }
+                    output.write(buffer, 0, count)
+                }
+            } ?: return JSONObject().put("error", "unreadable").toString()
+
+            JSONObject()
+                .put("name", item.name)
+                .put("mimeType", item.mimeType)
+                .put("base64", Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP))
+                .toString()
+        } catch (error: Exception) {
+            JSONObject().put("error", error.message ?: "unreadable").toString()
+        }
+    }
+
+    private fun showTaskNotification(state: String, title: String, detail: String) {
+        val notification = TaskNotification(state, title, detail)
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingNotification = notification
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        CodexForegroundService.showTask(
+            this,
+            state,
+            title,
+            detail,
+            currentProfile?.baseUrl.orEmpty(),
+        )
+    }
+
+    inner class AndroidBridge {
+        @JavascriptInterface
+        fun getClientInfo(): String = JSONObject()
+            .put("clientId", clientId())
+            .put("clientType", "android")
+            .put("mode", "remote-observer")
+            .put("version", BuildConfig.VERSION_NAME)
+            .toString()
+
+        @JavascriptInterface
+        fun openSettings() {
+            runOnUiThread { showConfiguration() }
+        }
+
+        @JavascriptInterface
+        fun copyText(text: String) {
+            runOnUiThread {
+                val clipboard = getSystemService(ClipboardManager::class.java)
+                clipboard.setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), text))
+            }
+        }
+
+        @JavascriptInterface
+        fun setTaskState(state: String, title: String?, detail: String?) {
+            runOnUiThread {
+                showTaskNotification(
+                    state.take(32),
+                    title?.take(120) ?: getString(R.string.notification_task_running),
+                    detail?.take(240).orEmpty(),
+                )
+            }
+        }
+
+        @JavascriptInterface
+        fun clearTaskState() {
+            runOnUiThread { CodexForegroundService.clearTask(this@MainActivity) }
+        }
+
+        @JavascriptInterface
+        fun getPendingShare(): String = pendingShareJson().toString()
+
+        @JavascriptInterface
+        fun readSharedContent(uri: String): String = this@MainActivity.readSharedContent(uri)
+
+        @JavascriptInterface
+        fun clearPendingShare() {
+            synchronized(shareLock) {
+                pendingShareText = null
+                pendingShareUris.clear()
+            }
         }
     }
 }
