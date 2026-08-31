@@ -61,6 +61,13 @@ import type {
   UiTokenUsageBreakdown,
   UiThread,
 } from '../types/codex'
+import type {
+  TaskActiveRequest,
+  TaskQueueSummary,
+  TaskSnapshot,
+  TaskWriterIdentity,
+} from '../types/task'
+import { reduceTaskSnapshot } from '../task/taskStateReducer'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
@@ -1405,6 +1412,10 @@ export function useDesktopState() {
   const liveCommandsByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveFileChangeMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const inProgressById = ref<Record<string, boolean>>({})
+  // A single reducer-backed view of task lifecycle.  Legacy maps remain in
+  // place for compatibility with existing components while new clients can
+  // consume this authoritative snapshot without inferring `inProgress`.
+  const taskSnapshotsByThreadId = ref<Record<string, TaskSnapshot>>({})
   type FileAttachment = { label: string; path: string; fsPath: string }
   type QueuedMessage = {
     id: string
@@ -1583,6 +1594,47 @@ export function useDesktopState() {
     }
     return rows.sort((first, second) => first.receivedAtIso.localeCompare(second.receivedAtIso))
   })
+  const selectedTaskSnapshot = computed<TaskSnapshot | null>(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? taskSnapshotsByThreadId.value[threadId] ?? null : null
+  })
+
+  function updateTaskSnapshot(observation: {
+    threadId: string
+    atIso?: string
+    notification?: RpcNotification
+    inProgress?: boolean
+    activeTurnId?: string
+    queue?: TaskQueueSummary
+    activeRequest?: TaskActiveRequest | null
+    writerClient?: TaskWriterIdentity | null
+    streamCursor?: TaskSnapshot['streamCursor']
+    error?: string | null
+    revision?: string
+  }): void {
+    const threadId = observation.threadId.trim()
+    if (!threadId) return
+    const previous = taskSnapshotsByThreadId.value[threadId]
+    const next = reduceTaskSnapshot(previous, observation)
+    if (next === previous) return
+    taskSnapshotsByThreadId.value = {
+      ...taskSnapshotsByThreadId.value,
+      [threadId]: next,
+    }
+  }
+
+  function updateTaskQueueSnapshot(threadId: string, queue: QueuedMessage[]): void {
+    const rows = queue ?? []
+    updateTaskSnapshot({
+      threadId,
+      queue: {
+        depth: rows.length,
+        oldestQueuedAt: rows.length > 0 ? new Date().toISOString() : null,
+        clientIds: [],
+      },
+      inProgress: inProgressById.value[threadId] === true,
+    })
+  }
   const selectedLiveOverlay = computed<UiLiveOverlay | null>(() => {
     const threadId = selectedThreadId.value
     if (!threadId) return null
@@ -2297,6 +2349,7 @@ export function useDesktopState() {
     threadTokenUsageByThreadId.value = pruneThreadStateMap(threadTokenUsageByThreadId.value, activeThreadIds)
     eventUnreadByThreadId.value = pruneThreadStateMap(eventUnreadByThreadId.value, activeThreadIds)
     inProgressById.value = pruneThreadStateMap(inProgressById.value, activeThreadIds)
+    taskSnapshotsByThreadId.value = pruneThreadStateMap(taskSnapshotsByThreadId.value, activeThreadIds)
     for (const threadId of sessionActivityByThreadId.keys()) {
       if (!activeThreadIds.has(threadId)) sessionActivityByThreadId.delete(threadId)
     }
@@ -3147,10 +3200,29 @@ export function useDesktopState() {
       ...pendingServerRequestsByThreadId.value,
       [threadId]: nextRows.sort((first, second) => first.receivedAtIso.localeCompare(second.receivedAtIso)),
     }
+    if (request.threadId) {
+      const activeRequest: TaskActiveRequest = {
+        id: request.id,
+        kind: /approval|permission/i.test(request.method)
+          ? 'approval'
+          : /input|requestUserInput/i.test(request.method)
+            ? 'user_input'
+            : 'other',
+        method: request.method,
+        receivedAtIso: request.receivedAtIso,
+      }
+      updateTaskSnapshot({ threadId: request.threadId, activeRequest })
+    }
     applyThreadFlags()
   }
 
   function removePendingServerRequestById(requestId: number): void {
+    const affectedThreadIds = new Set<string>()
+    for (const [threadId, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
+      if (requests.some((request) => request.id === requestId) && threadId !== GLOBAL_SERVER_REQUEST_SCOPE) {
+        affectedThreadIds.add(threadId)
+      }
+    }
     const next: Record<string, UiServerRequest[]> = {}
     for (const [threadId, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
       const filtered = requests.filter((request) => request.id !== requestId)
@@ -3159,6 +3231,21 @@ export function useDesktopState() {
       }
     }
     pendingServerRequestsByThreadId.value = next
+    for (const threadId of affectedThreadIds) {
+      const remaining = next[threadId] ?? []
+      const request = remaining[0]
+      updateTaskSnapshot({
+        threadId,
+        activeRequest: request
+          ? {
+            id: request.id,
+            kind: /approval|permission/i.test(request.method) ? 'approval' : /input|requestUserInput/i.test(request.method) ? 'user_input' : 'other',
+            method: request.method,
+            receivedAtIso: request.receivedAtIso,
+          }
+          : null,
+      })
+    }
     applyThreadFlags()
   }
 
@@ -3176,6 +3263,21 @@ export function useDesktopState() {
     }
 
     pendingServerRequestsByThreadId.value = next
+    const threadIds = new Set(Object.keys(next).filter((threadId) => threadId !== GLOBAL_SERVER_REQUEST_SCOPE))
+    for (const threadId of threadIds) {
+      const request = next[threadId]?.[0]
+      updateTaskSnapshot({
+        threadId,
+        activeRequest: request
+          ? {
+            id: request.id,
+            kind: /approval|permission/i.test(request.method) ? 'approval' : /input|requestUserInput/i.test(request.method) ? 'user_input' : 'other',
+            method: request.method,
+            receivedAtIso: request.receivedAtIso,
+          }
+          : null,
+      })
+    }
   }
 
   function handleServerRequestNotification(notification: RpcNotification): boolean {
@@ -3768,6 +3870,14 @@ export function useDesktopState() {
   }
 
   function applyRealtimeUpdates(notification: RpcNotification): void {
+    const taskThreadId = extractThreadIdFromNotification(notification)
+    if (taskThreadId) {
+      updateTaskSnapshot({
+        threadId: taskThreadId,
+        notification,
+        atIso: notification.atIso,
+      })
+    }
     if (handleServerRequestNotification(notification)) {
       return
     }
@@ -4325,6 +4435,9 @@ export function useDesktopState() {
     hasLoadedPersistedQueueState = true
     try {
       queuedMessagesByThreadId.value = await getThreadQueueState()
+      for (const [threadId, queue] of Object.entries(queuedMessagesByThreadId.value)) {
+        updateTaskQueueSnapshot(threadId, queue)
+      }
     } catch {
       // Backend queue state is optional during startup.
     }
@@ -4595,6 +4708,16 @@ export function useDesktopState() {
         sessionRevision: detailSessionRevision,
         sessionActivityKnown,
       } = detail
+      const detailStreamCursor = 'streamCursor' in detail && detail.streamCursor && typeof detail.streamCursor === 'object'
+        ? detail.streamCursor as TaskSnapshot['streamCursor']
+        : undefined
+      updateTaskSnapshot({
+        threadId,
+        inProgress,
+        activeTurnId,
+        streamCursor: detailStreamCursor,
+        revision: detailSessionRevision,
+      })
       const observedSessionRevision = detailSessionRevision?.trim() || sessionRevision
       if (sessionActivityKnown === true || observedSessionRevision) {
         reconcileThreadSessionActivity(threadId, {
@@ -5088,6 +5211,7 @@ export function useDesktopState() {
             ...queuedMessagesByThreadId.value,
             [threadId]: result.queue,
           }
+          updateTaskQueueSnapshot(threadId, result.queue)
           return
         } catch {
           // Fall through to the local update and best-effort persistence.
@@ -5103,6 +5227,7 @@ export function useDesktopState() {
         ...queuedMessagesByThreadId.value,
         [threadId]: nextQueue,
       }
+      updateTaskQueueSnapshot(threadId, nextQueue)
       persistQueueState()
       return
     }
@@ -5376,6 +5501,7 @@ export function useDesktopState() {
     }
     try {
       queuedMessagesByThreadId.value = await getThreadQueueState()
+      updateTaskQueueSnapshot(threadId, queuedMessagesByThreadId.value[threadId] ?? [])
     } catch {
       // Backend queue state is optional during transient bridge failures.
     } finally {
@@ -5928,6 +6054,7 @@ export function useDesktopState() {
     liveReasoningTextByThreadId.value = {}
     liveCommandsByThreadId.value = {}
     liveFileChangeMessagesByThreadId.value = {}
+    taskSnapshotsByThreadId.value = {}
     turnIndexByTurnIdByThreadId.value = {}
     turnActivityByThreadId.value = {}
     turnSummaryByThreadId.value = {}
@@ -5958,6 +6085,7 @@ export function useDesktopState() {
     queuedMessagesByThreadId.value = next.length > 0
       ? { ...queuedMessagesByThreadId.value, [threadId]: next }
       : omitKey(queuedMessagesByThreadId.value, threadId)
+    updateTaskQueueSnapshot(threadId, next)
     persistQueueState()
   }
 
@@ -5978,6 +6106,7 @@ export function useDesktopState() {
       ...queuedMessagesByThreadId.value,
       [threadId]: next,
     }
+    updateTaskQueueSnapshot(threadId, next)
     persistQueueState()
   }
 
@@ -6005,6 +6134,8 @@ export function useDesktopState() {
     selectedThreadTerminalOpen,
     isSelectedThreadInterruptPending,
     selectedThreadServerRequests,
+    selectedTaskSnapshot,
+    taskSnapshotsByThreadId,
     selectedLiveOverlay,
     codexQuota,
     selectedThreadId,
