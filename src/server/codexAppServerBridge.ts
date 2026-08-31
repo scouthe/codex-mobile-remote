@@ -5968,6 +5968,158 @@ type StoredQueuedMessage = {
 
 type ThreadQueueState = Record<string, StoredQueuedMessage[]>
 
+type TaskSnapshotResponse = {
+  taskState: 'queued' | 'starting' | 'running' | 'waiting_approval' | 'waiting_user_input' | 'steering' | 'completed' | 'failed' | 'canceled'
+  currentActivity: { kind: string; label: string; details: string[] }
+  queueDepth: number
+  activeRequest: { id: number; kind: 'approval' | 'user_input' | 'other'; method: string; receivedAtIso: string } | null
+  writerClient: null
+  startedAt: string | null
+  finishedAt: string | null
+  timeline: Array<{
+    id: string
+    type: string
+    atIso: string
+    label: string
+    details: string[]
+    turnId: string
+    itemId?: string
+    status?: string
+  }>
+}
+
+function classifyTaskRequest(method: string): 'approval' | 'user_input' | 'other' {
+  const normalized = method.toLowerCase()
+  if (normalized.includes('approval') || normalized.includes('permission')) return 'approval'
+  if (normalized.includes('input') || normalized.includes('requestuserinput')) return 'user_input'
+  return 'other'
+}
+
+function readTaskRequestThreadId(request: PendingServerRequest): string {
+  const params = asRecord(request.params)
+  return readNonEmptyString(params?.threadId)
+    || readNonEmptyString(params?.thread_id)
+    || readNonEmptyString(params?.conversationId)
+    || readNonEmptyString(params?.conversation_id)
+}
+
+export function buildTaskSnapshotResponse(
+  threadId: string,
+  isInProgress: boolean,
+  queueDepth: number,
+  pendingRequests: PendingServerRequest[],
+  streamEvents: Array<{ seq: number; method: string; params: unknown; atIso: string }>,
+  streamCursor: { streamEpoch: string; latestSeq: number; oldestSeq: number | null },
+  sessionActivity: { known: boolean; inProgress: boolean; lastEventAt: number | null; turnId: string } | null,
+): TaskSnapshotResponse {
+  const request = pendingRequests.find((row) => readTaskRequestThreadId(row) === threadId)
+  const activeRequest = request
+    ? {
+      id: request.id,
+      kind: classifyTaskRequest(request.method),
+      method: request.method,
+      receivedAtIso: request.receivedAtIso,
+    }
+    : null
+  const relevantEvents = streamEvents.slice(-40)
+  let currentActivity: TaskSnapshotResponse['currentActivity'] = {
+    kind: isInProgress ? 'thinking' : 'idle',
+    label: isInProgress ? 'Thinking' : 'Completed',
+    details: [],
+  }
+  let state: TaskSnapshotResponse['taskState'] = isInProgress ? 'running' : queueDepth > 0 ? 'queued' : 'completed'
+  let startedAt: string | null = null
+  let finishedAt: string | null = null
+  const timeline: TaskSnapshotResponse['timeline'] = []
+
+  for (const event of relevantEvents) {
+    const params = asRecord(event.params)
+    const item = asRecord(params?.item)
+    const itemType = readNonEmptyString(item?.type).toLowerCase()
+    const turn = asRecord(params?.turn)
+    const turnId = readNonEmptyString(turn?.id) || readNonEmptyString(params?.turnId) || readNonEmptyString(params?.turn_id)
+    let label = ''
+    let kind = 'activity'
+    const details: string[] = []
+    if (event.method === 'turn/started') {
+      state = 'starting'
+      startedAt = startedAt ?? event.atIso
+      label = 'Task started'
+      kind = 'task_started'
+      currentActivity = { kind: 'thinking', label: 'Thinking', details: [] }
+    } else if (event.method === 'turn/completed') {
+      state = 'completed'
+      finishedAt = event.atIso
+      label = 'Task completed'
+      kind = 'task_completed'
+      currentActivity = { kind: 'idle', label: 'Completed', details: [] }
+    } else if (event.method === 'error') {
+      state = 'failed'
+      label = 'Task failed'
+      kind = 'error'
+      const message = readNonEmptyString(params?.message)
+      if (message) details.push(message)
+      currentActivity = { kind: 'error', label, details }
+    } else if (event.method === 'item/started' && itemType === 'commandexecution') {
+      state = state === 'starting' ? 'running' : state
+      kind = 'command'
+      label = 'Running command'
+      const command = readNonEmptyString(item?.command)
+      if (command) details.push(command)
+      currentActivity = { kind, label, details }
+    } else if (event.method === 'item/started' && itemType === 'filechange') {
+      state = state === 'starting' ? 'running' : state
+      kind = 'file_change'
+      label = 'Applying changes'
+      currentActivity = { kind, label, details }
+    } else if (event.method === 'item/started' && itemType === 'agentmessage') {
+      state = state === 'starting' ? 'running' : state
+      kind = 'response'
+      label = 'Writing response'
+      currentActivity = { kind, label, details }
+    } else if (event.method === 'item/commandExecution/outputDelta') {
+      state = state === 'starting' ? 'running' : state
+      label = 'Running command'
+      currentActivity = { kind: 'command', label, details }
+    } else {
+      continue
+    }
+    timeline.push({
+      id: `${threadId}:${event.seq}:${event.method}`,
+      type: kind,
+      atIso: event.atIso,
+      label,
+      details,
+      turnId,
+      status: state === 'completed' ? 'completed' : state === 'failed' ? 'failed' : 'active',
+    })
+  }
+
+  if (activeRequest?.kind === 'approval') {
+    state = 'waiting_approval'
+    currentActivity = { kind: 'approval', label: 'Approval required', details: [] }
+  } else if (activeRequest?.kind === 'user_input') {
+    state = 'waiting_user_input'
+    currentActivity = { kind: 'user_input', label: 'Input required', details: [] }
+  }
+  if (sessionActivity?.known && sessionActivity.lastEventAt) {
+    const markerIso = new Date(sessionActivity.lastEventAt).toISOString()
+    if (sessionActivity.inProgress) startedAt = startedAt ?? markerIso
+    else if (!isInProgress) finishedAt = finishedAt ?? markerIso
+  }
+
+  return {
+    taskState: state,
+    currentActivity,
+    queueDepth,
+    activeRequest,
+    writerClient: null,
+    startedAt,
+    finishedAt,
+    timeline,
+  }
+}
+
 type BackendQueuedTurn = {
   threadId: string
   message: StoredQueuedMessage
@@ -8792,7 +8944,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
           const cached = appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize, sessionRevision)
           if (cached) {
-            setJson(res, 200, cached)
+            const cachedRecord = asRecord(cached)
+            const cachedInProgress = cachedRecord?.isInProgress === true || cachedRecord?.inProgress === true
+            const queueState = await readThreadQueueState()
+            const taskSnapshot = buildTaskSnapshotResponse(
+              threadId,
+              cachedInProgress,
+              queueState[threadId]?.length ?? 0,
+              appServer.listPendingServerRequests(),
+              appServer.getStreamEvents(threadId, 40),
+              appServer.getStreamCursor(),
+              sessionActivity,
+            )
+            setJson(res, 200, { ...cachedRecord, ...taskSnapshot })
             return
           }
 
@@ -8831,6 +8995,17 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               thread?.inProgress === true ||
               ['inProgress', 'running', 'active'].includes(readNonEmptyString(threadStatus?.type))
 
+          const queueState = await readThreadQueueState()
+          const taskSnapshot = buildTaskSnapshotResponse(
+            threadId,
+            isInProgress,
+            queueState[threadId]?.length ?? 0,
+            appServer.listPendingServerRequests(),
+            appServer.getStreamEvents(threadId, 40),
+            appServer.getStreamCursor(),
+            sessionActivity,
+          )
+
           const responseData = {
             threadId,
             thread: {
@@ -8844,6 +9019,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             liveStateError: null,
             isInProgress,
             streamCursor: appServer.getStreamCursor(),
+            ...taskSnapshot,
             ...(sessionActivity?.known
               ? {
                 sessionActivityKnown: true,
@@ -8866,6 +9042,14 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               liveStateError: null,
               isInProgress: true,
               streamCursor: appServer.getStreamCursor(),
+              taskState: 'running',
+              currentActivity: { kind: 'thinking', label: 'Thinking', details: [] },
+              queueDepth: 0,
+              activeRequest: null,
+              writerClient: null,
+              startedAt: null,
+              finishedAt: null,
+              timeline: [],
             })
             return
           }
@@ -8886,6 +9070,14 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               },
               isInProgress: false,
               streamCursor: appServer.getStreamCursor(),
+              taskState: 'failed',
+              currentActivity: { kind: 'error', label: 'Task failed', details: [getErrorMessage(error, 'thread/read failed')] },
+              queueDepth: 0,
+              activeRequest: null,
+              writerClient: null,
+              startedAt: null,
+              finishedAt: new Date().toISOString(),
+              timeline: [],
             })
           } else {
             setJson(res, 200, {
@@ -8898,6 +9090,14 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               },
               isInProgress: false,
               streamCursor: appServer.getStreamCursor(),
+              taskState: 'failed',
+              currentActivity: { kind: 'error', label: 'Task failed', details: [getErrorMessage(error, 'thread/read failed')] },
+              queueDepth: 0,
+              activeRequest: null,
+              writerClient: null,
+              startedAt: null,
+              finishedAt: new Date().toISOString(),
+              timeline: [],
             })
           }
         }

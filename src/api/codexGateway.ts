@@ -56,6 +56,7 @@ import type {
   UiThreadAutomation,
   UiThreadAutomationStatus,
 } from '../types/codex'
+import type { TaskSnapshot, TaskState, TaskActivity, TaskActiveRequest, TaskTimelineEvent, TaskWriterIdentity } from '../types/task'
 import { normalizePathForUi } from '../pathUtils.js'
 
 type CurrentModelConfig = {
@@ -748,6 +749,15 @@ export type ThreadLiveState = {
     oldestSeq: number | null
   } | null
   liveStateError: string | null
+  /** Unified task-center snapshot; optional for older bridge responses. */
+  taskState?: TaskState
+  currentActivity?: TaskActivity
+  queueDepth?: number
+  activeRequest?: TaskActiveRequest | null
+  writerClient?: TaskWriterIdentity | null
+  startedAt?: string | null
+  finishedAt?: string | null
+  timeline?: TaskTimelineEvent[]
 }
 
 async function getThreadGroupsPageV2(cursor: string | null, limit: number): Promise<ThreadGroupsPage> {
@@ -953,6 +963,62 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
         oldestSeq: typeof cursorRecord.oldestSeq === 'number' ? Math.floor(cursorRecord.oldestSeq) : null,
       }
       : null
+    const taskStates: TaskState[] = [
+      'queued', 'starting', 'running', 'waiting_approval', 'waiting_user_input',
+      'steering', 'completed', 'failed', 'canceled',
+    ]
+    const taskState = typeof record?.taskState === 'string' && taskStates.includes(record.taskState as TaskState)
+      ? record.taskState as TaskState
+      : undefined
+    const activityRecord = asRecord(record?.currentActivity)
+    const activityKinds: TaskActivity['kind'][] = [
+      'thinking', 'command', 'file_change', 'response', 'approval', 'user_input', 'queue', 'error', 'idle',
+    ]
+    const activityKind = typeof activityRecord?.kind === 'string' && activityKinds.includes(activityRecord.kind as TaskActivity['kind'])
+      ? activityRecord.kind as TaskActivity['kind']
+      : undefined
+    const currentActivity = activityKind
+      ? {
+        kind: activityKind,
+        label: readString(activityRecord?.label) || 'Idle',
+        details: Array.isArray(activityRecord?.details)
+          ? activityRecord.details.filter((item): item is string => typeof item === 'string')
+          : [],
+      }
+      : undefined
+    const activeRequestRecord = asRecord(record?.activeRequest)
+    const activeRequest = activeRequestRecord && typeof activeRequestRecord.id === 'number'
+      ? {
+        id: Math.trunc(activeRequestRecord.id),
+        kind: activeRequestRecord.kind === 'approval' || activeRequestRecord.kind === 'user_input' ? activeRequestRecord.kind : 'other',
+        method: readString(activeRequestRecord.method),
+        receivedAtIso: readString(activeRequestRecord.receivedAtIso),
+      } as TaskActiveRequest
+      : record?.activeRequest === null ? null : undefined
+    const timeline = Array.isArray(record?.timeline)
+      ? record.timeline.flatMap((item) => {
+        const row = asRecord(item)
+        if (!row) return []
+        const id = readString(row.id)
+        const type = readString(row.type)
+        const atIso = readString(row.atIso)
+        const label = readString(row.label)
+        if (!id || !type || !atIso || !label) return []
+        return [{
+          id,
+          type: type as TaskTimelineEvent['type'],
+          atIso,
+          label,
+          details: Array.isArray(row.details) ? row.details.filter((value): value is string => typeof value === 'string') : [],
+          turnId: readString(row.turnId) ?? '',
+          ...((readString(row.itemId) ?? '') ? { itemId: readString(row.itemId) ?? '' } : {}),
+          ...(typeof row.status === 'string' ? { status: row.status as TaskTimelineEvent['status'] } : {}),
+        }]
+      })
+      : undefined
+    const writerClient = record?.writerClient && typeof record.writerClient === 'object'
+      ? record.writerClient as TaskWriterIdentity
+      : record?.writerClient === null ? null : undefined
     const liveStateErrorRecord = asRecord(record?.liveStateError)
     const explicitInProgress = sessionActivityKnown
       ? typeof record?.isInProgress === 'boolean'
@@ -979,6 +1045,14 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
       streamCursor,
       liveStateError: readString(liveStateErrorRecord?.message),
+      ...(taskState ? { taskState } : {}),
+      ...(currentActivity ? { currentActivity } : {}),
+      ...(typeof record?.queueDepth === 'number' ? { queueDepth: Math.max(0, Math.trunc(record.queueDepth)) } : {}),
+      ...(activeRequest !== undefined ? { activeRequest } : {}),
+      ...(writerClient !== undefined ? { writerClient } : {}),
+      ...(typeof record?.startedAt === 'string' ? { startedAt: record.startedAt } : {}),
+      ...(typeof record?.finishedAt === 'string' ? { finishedAt: record.finishedAt } : {}),
+      ...(timeline ? { timeline } : {}),
     }
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load live thread state ${normalizedThreadId}`, 'thread-live-state')
