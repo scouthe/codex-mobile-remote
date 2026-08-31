@@ -32,12 +32,14 @@
    `codex-native-share` event is delivered and the text appears in the active
    composer. Reopen the app or deliver a second share and confirm each intent
    is delivered once.
-7. Share one small text file and one image. Confirm each URI appears as an
-   attachment candidate with its display name and MIME type, and that the web
-   consumer calls `readSharedContent(uri)` only for the selected attachment.
-8. Share a file larger than 20 MiB. Confirm the consumer reports the native
-   `file-too-large` error without freezing the WebView or sending a partial
-   upload.
+7. Share one small text file and one image. Confirm both files are read through
+   the bridge, uploaded through the existing composer attachment flow, and
+   appear with their display names and MIME types. The web consumer must not
+   read any URI that was not included in the share payload.
+8. Share a file larger than 20 MiB (or a batch larger than 40 MiB). Confirm the
+   consumer reports the native `file-too-large`/batch-limit error without
+   freezing the WebView or sending a partial upload; the share remains pending
+   for a later retry.
 9. Disconnect Wi-Fi/Tailscale briefly, then reconnect. Confirm the app emits
    the online/offline lifecycle events, reconnects its WebSocket/SSE stream,
    and does not issue a duplicate `thread/resume` for the same thread.
@@ -63,4 +65,3 @@
 - Stop any active turn and remove the temporary Android app/data if this was a
   device-only verification.
 - Clear the saved server profile with the settings button's long press.
-

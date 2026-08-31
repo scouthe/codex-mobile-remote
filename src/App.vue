@@ -544,6 +544,16 @@
             <span v-else-if="isAutomationsRoute" class="skills-route-header-icon automations-route-header-icon" aria-hidden="true">
               <IconTablerBolt />
             </span>
+            <span
+              v-if="showAndroidObserverBadge"
+              class="android-observer-badge"
+              :title="t('The desktop is the active writer. This device is observing and can queue messages.')"
+              role="status"
+            >
+              <span class="android-observer-badge-primary">{{ t('Android observer') }}</span>
+              <span class="android-observer-badge-separator" aria-hidden="true">·</span>
+              <span>{{ t('Desktop writer') }}</span>
+            </span>
           </template>
           <template #actions>
             <ComposerDropdown
@@ -1006,7 +1016,7 @@
                   <QueuedMessages
                     :messages="selectedThreadQueuedMessages"
                     @edit="onEditQueuedMessage"
-                    @steer="steerQueuedMessage"
+                    @steer="onSteerQueuedMessage"
                     @delete="removeQueuedMessage"
                     @reorder="onReorderQueuedMessage"
                   />
@@ -1194,6 +1204,7 @@ import IconTablerTerminal from './components/icons/IconTablerTerminal.vue'
 import IconTablerX from './components/icons/IconTablerX.vue'
 import { useDesktopState } from './composables/useDesktopState'
 import { useMobile } from './composables/useMobile'
+import { ANDROID_SHARED_BATCH_LIMIT_BYTES, useAndroidBridge } from './composables/useAndroidBridge'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
 import {
@@ -1238,6 +1249,12 @@ import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, Telegra
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
+import {
+  CODEX_ANDROID_EVENTS,
+  parseSharePayload,
+  type CodexAndroidSharePayload,
+  type CodexAndroidTaskState,
+} from './native/codexAndroid'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
 const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
@@ -1481,6 +1498,7 @@ const {
 const route = useRoute()
 const router = useRouter()
 const { isMobile } = useMobile()
+const androidBridge = useAndroidBridge()
 type SidebarThreadTreeExposed = {
   openAutomationEditorFromPanel: (payload: AutomationEditRequest) => void
   openAutomationCreatorFromPanel: () => void
@@ -1721,6 +1739,16 @@ const telegramStatus = ref<TelegramStatus>({
 const mobileHiddenAtMs = ref<number | null>(null)
 const mobileResumeReloadTriggered = ref(false)
 const mobileResumeSyncInProgress = ref(false)
+const androidTaskState = ref<CodexAndroidTaskState | null>(null)
+const androidTaskThreadId = ref('')
+const androidTaskStateTimer = ref<number | null>(null)
+const androidSteeringThreadId = ref('')
+const androidSteeringClearTimer = ref<number | null>(null)
+const androidNativeShare = ref<CodexAndroidSharePayload | null>(null)
+const androidShareProcessing = ref(false)
+const androidNetworkOnline = ref(true)
+const androidInterruptRequestedThreads = new Set<string>()
+const removeAndroidListeners: Array<() => void> = []
 const visualViewportHeight = ref(typeof window !== 'undefined' ? window.visualViewport?.height ?? window.innerHeight : 0)
 const visualViewportOffsetTop = ref(typeof window !== 'undefined' ? window.visualViewport?.offsetTop ?? 0 : 0)
 const layoutViewportHeight = ref(typeof window !== 'undefined' ? window.innerHeight : 0)
@@ -1815,6 +1843,101 @@ const isAccountSwitchBlocked = computed(() =>
   isSelectedThreadInProgress.value ||
   selectedThreadServerRequests.value.length > 0,
 )
+
+const isAndroidRemoteObserver = computed(() => (
+  androidBridge.nativeAvailable.value &&
+  androidBridge.clientInfo.value?.clientType === 'android'
+))
+const showAndroidObserverBadge = computed(() => (
+  isAndroidRemoteObserver.value && showThreadContextBadge.value
+))
+
+type AndroidTaskSnapshot = {
+  threadId: string
+  state: CodexAndroidTaskState | null
+  title: string
+  detail: string
+}
+
+function isAndroidApprovalMethod(method: string): boolean {
+  const normalized = method.trim().toLowerCase()
+  return normalized.includes('approval') || normalized === 'applypatchapproval' || normalized === 'execcommandapproval'
+}
+
+function buildAndroidTaskDetail(state: CodexAndroidTaskState, threadId: string): string {
+  const pending = selectedThreadServerRequests.value
+  const queueCount = selectedThreadQueuedMessages.value.length
+  const activity = liveOverlay.value
+  const activityLines = activity?.activityDetails?.filter((line) => line.trim().length > 0) ?? []
+
+  if (state === 'waiting_approval') {
+    const request = pending.find((item) => isAndroidApprovalMethod(item.method)) ?? pending[pending.length - 1]
+    return request?.method ? `${t('Approval required')}: ${request.method}` : t('Approval required')
+  }
+  if (state === 'waiting_user_input') return t('Waiting for your input')
+  if (state === 'queued') {
+    return queueCount === 1 ? t('1 message queued') : t('{count} messages queued', { count: queueCount })
+  }
+  if (state === 'starting') return t('Starting Codex task')
+  if (state === 'steering') return t('Sending guidance to the active task')
+  if (state === 'failed') {
+    return activity?.errorText?.trim() || t('Codex task failed')
+  }
+  if (state === 'completed') return t('Task completed')
+  if (state === 'canceled') return t('Task canceled')
+
+  if (activity) {
+    const label = activity.activityLabel.trim() || t('Working')
+    const activityDetail = activityLines.length > 0 ? `${label}: ${activityLines.join(' · ')}` : label
+    if (queueCount > 0) {
+      const queueDetail = queueCount === 1
+        ? t('1 message queued next')
+        : t('{count} messages queued next', { count: queueCount })
+      return `${activityDetail} · ${queueDetail}`
+    }
+    return activityDetail
+  }
+  if (queueCount > 0) {
+    return queueCount === 1 ? t('1 message queued next') : t('{count} messages queued next', { count: queueCount })
+  }
+  return threadId ? t('Codex is working') : t('Starting Codex task')
+}
+
+const androidTaskSnapshot = computed<AndroidTaskSnapshot>(() => {
+  const threadId = isHomeRoute.value ? '__new-thread__' : selectedThreadId.value.trim()
+  const title = selectedThread.value?.title?.trim() || t('Codex task')
+  if (!threadId) return { threadId: '', state: null, title, detail: '' }
+
+  const pending = selectedThreadServerRequests.value
+  const isInProgress = isSelectedThreadInProgress.value
+  const isStarting = isSendingMessage.value && (isHomeRoute.value || !isInProgress)
+  const isSteering = androidSteeringThreadId.value === threadId && isInProgress
+  const errorText = liveOverlay.value?.errorText?.trim() ?? ''
+  let state: CodexAndroidTaskState | null = null
+
+  if (pending.some((request) => isAndroidApprovalMethod(request.method))) {
+    state = 'waiting_approval'
+  } else if (pending.length > 0) {
+    state = 'waiting_user_input'
+  } else if (isSteering) {
+    state = 'steering'
+  } else if (isStarting) {
+    state = 'starting'
+  } else if (isInProgress) {
+    state = 'running'
+  } else if (selectedThreadQueuedMessages.value.length > 0) {
+    state = 'queued'
+  } else if (errorText) {
+    state = 'failed'
+  }
+
+  return {
+    threadId,
+    state,
+    title,
+    detail: state ? buildAndroidTaskDetail(state, threadId) : '',
+  }
+})
 
 function formatCompactTokenCount(value: number): string {
   if (!Number.isFinite(value)) return '0'
@@ -2129,6 +2252,250 @@ const telegramStatusText = computed(() => {
   return `${base}, ${mapped}${error}`
 })
 
+const ANDROID_TASK_TERMINAL_CLEAR_DELAY_MS = 8_000
+const ANDROID_TASK_ACTIVE_STATES = new Set<CodexAndroidTaskState>([
+  'queued',
+  'starting',
+  'running',
+  'waiting_approval',
+  'waiting_user_input',
+  'steering',
+])
+const androidTaskStartedAtByThread = new Map<string, number>()
+const ANDROID_STEERING_DISPLAY_MS = 2_500
+
+function clearAndroidSteeringMarker(): void {
+  if (androidSteeringClearTimer.value !== null && typeof window !== 'undefined') {
+    window.clearTimeout(androidSteeringClearTimer.value)
+  }
+  androidSteeringClearTimer.value = null
+  androidSteeringThreadId.value = ''
+}
+
+/**
+ * Steering is a short-lived command sent to the active desktop turn. Keep it
+ * visible long enough for the native notification to communicate the action,
+ * then let the ordinary running/activity state take over.
+ */
+function markAndroidSteering(threadId: string): void {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) return
+  clearAndroidSteeringMarker()
+  androidSteeringThreadId.value = normalizedThreadId
+  if (typeof window !== 'undefined') {
+    androidSteeringClearTimer.value = window.setTimeout(() => {
+      androidSteeringClearTimer.value = null
+      if (androidSteeringThreadId.value === normalizedThreadId) {
+        androidSteeringThreadId.value = ''
+      }
+    }, ANDROID_STEERING_DISPLAY_MS)
+  }
+}
+
+function formatAndroidDuration(durationMs: number): string {
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000))
+  if (totalSeconds < 60) return `${Math.max(1, totalSeconds)}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes < 60) return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  const remainderMinutes = minutes % 60
+  return remainderMinutes > 0 ? `${hours}h ${remainderMinutes}m` : `${hours}h`
+}
+
+function clearAndroidTaskStateTimer(): void {
+  if (androidTaskStateTimer.value === null || typeof window === 'undefined') return
+  window.clearTimeout(androidTaskStateTimer.value)
+  androidTaskStateTimer.value = null
+}
+
+function publishAndroidTaskSnapshot(snapshot: AndroidTaskSnapshot): void {
+  if (!isAndroidRemoteObserver.value || !snapshot.state) return
+  clearAndroidTaskStateTimer()
+  if (ANDROID_TASK_ACTIVE_STATES.has(snapshot.state) && !androidTaskStartedAtByThread.has(snapshot.threadId)) {
+    androidTaskStartedAtByThread.set(snapshot.threadId, Date.now())
+  }
+  androidBridge.setTaskState(snapshot.state, snapshot.title, snapshot.detail)
+  androidTaskState.value = snapshot.state
+  androidTaskThreadId.value = snapshot.threadId
+}
+
+function publishAndroidTerminalState(
+  threadId: string,
+  state: Extract<CodexAndroidTaskState, 'completed' | 'failed' | 'canceled'>,
+  title: string,
+  detail: string,
+): void {
+  if (!isAndroidRemoteObserver.value || !threadId) return
+  clearAndroidTaskStateTimer()
+  clearAndroidSteeringMarker()
+  const startedAt = androidTaskStartedAtByThread.get(threadId)
+  const duration = typeof startedAt === 'number' ? ` · ${formatAndroidDuration(Date.now() - startedAt)}` : ''
+  const terminalDetail = `${detail}${duration}`.trim()
+  androidBridge.setTaskState(state, title, terminalDetail)
+  androidTaskState.value = state
+  androidTaskThreadId.value = threadId
+  androidTaskStartedAtByThread.delete(threadId)
+  if (typeof window !== 'undefined') {
+    androidTaskStateTimer.value = window.setTimeout(() => {
+      androidTaskStateTimer.value = null
+      androidBridge.clearTaskState()
+      androidTaskState.value = null
+      androidTaskThreadId.value = ''
+    }, ANDROID_TASK_TERMINAL_CLEAR_DELAY_MS)
+  }
+}
+
+function clearAndroidTaskNotification(): void {
+  clearAndroidTaskStateTimer()
+  clearAndroidSteeringMarker()
+  androidBridge.clearTaskState()
+  if (androidTaskThreadId.value) {
+    androidTaskStartedAtByThread.delete(androidTaskThreadId.value)
+  }
+  androidTaskState.value = null
+  androidTaskThreadId.value = ''
+}
+
+function syncAndroidTaskNotification(
+  next: AndroidTaskSnapshot = androidTaskSnapshot.value,
+  previous?: AndroidTaskSnapshot,
+): void {
+  if (!isAndroidRemoteObserver.value) return
+
+  const previousThreadId = previous?.threadId || androidTaskThreadId.value
+  const previousState = previous?.state || androidTaskState.value
+  if (previousThreadId && next.threadId && previousThreadId !== next.threadId) {
+    clearAndroidTaskNotification()
+  }
+
+  if (next.state) {
+    if (next.state === 'failed') {
+      androidInterruptRequestedThreads.delete(next.threadId)
+      publishAndroidTerminalState(next.threadId, 'failed', next.title, next.detail || t('Codex task failed'))
+      return
+    }
+    publishAndroidTaskSnapshot(next)
+    return
+  }
+
+  if (previousThreadId && previousThreadId === next.threadId && previousState && ANDROID_TASK_ACTIVE_STATES.has(previousState)) {
+    const terminalState = androidInterruptRequestedThreads.has(previousThreadId) ? 'canceled' : 'completed'
+    androidInterruptRequestedThreads.delete(previousThreadId)
+    clearAndroidSteeringMarker()
+    publishAndroidTerminalState(
+      previousThreadId,
+      terminalState,
+      previous?.title || next.title,
+      terminalState === 'canceled' ? t('Task canceled') : t('Task completed'),
+    )
+    return
+  }
+
+  // A failed state is already terminal and should not be rewritten as a
+  // successful completion when the transient error overlay is cleared.
+  if (previousState === 'failed' && previousThreadId === next.threadId) return
+  clearAndroidTaskNotification()
+}
+
+async function flushAndroidShare(): Promise<void> {
+  if (androidShareProcessing.value) return
+  const payload = androidNativeShare.value
+  if (!payload) return
+  const composer = isHomeRoute.value ? homeThreadComposerRef.value : threadComposerRef.value
+  if (!composer) return
+
+  androidShareProcessing.value = true
+  try {
+    const files: File[] = []
+    let failed = false
+    let totalBytes = 0
+    for (const sharedFile of payload.files) {
+      const result = androidBridge.readSharedContent(sharedFile.uri)
+      if (result.file) {
+        totalBytes += result.file.size
+        if (totalBytes > ANDROID_SHARED_BATCH_LIMIT_BYTES) {
+          failed = true
+          recordVisibleFailure(t('Shared files exceed the 40 MiB limit'))
+          break
+        }
+        files.push(result.file)
+      } else {
+        failed = true
+        recordVisibleFailure(`${t('Could not attach')} ${sharedFile.name}: ${result.error}`)
+      }
+    }
+    // Keep a failed share pending so a transient ContentResolver/WebView error
+    // can be retried after the next resume. Do not append text or partial files
+    // before all file payloads have been read, otherwise a retry would create
+    // duplicate attachments in the composer.
+    if (failed) return
+
+    androidNativeShare.value = null
+    if (payload.text?.trim()) {
+      composer.appendTextToDraft(payload.text)
+    }
+    if (files.length > 0) {
+      composer.attachIncomingFiles(files)
+    }
+    androidBridge.clearPendingShare()
+  } finally {
+    androidShareProcessing.value = false
+  }
+}
+
+function enqueueAndroidShare(payload: CodexAndroidSharePayload): void {
+  const previous = androidNativeShare.value
+  const textParts = [previous?.text?.trim(), payload.text?.trim()].filter((value): value is string => Boolean(value))
+  const files = [...(previous?.files ?? [])]
+  const seenUris = new Set(files.map((file) => file.uri))
+  for (const file of payload.files) {
+    if (seenUris.has(file.uri)) continue
+    seenUris.add(file.uri)
+    files.push(file)
+  }
+  androidNativeShare.value = {
+    text: textParts.length > 0 ? textParts.join('\n') : null,
+    files,
+  }
+  void nextTick(() => {
+    void flushAndroidShare()
+  })
+}
+
+function onAndroidReady(event: CustomEvent<unknown>): void {
+  androidBridge.refresh()
+  androidNetworkOnline.value = true
+  const payload = parseSharePayload(event.detail) ?? androidBridge.getPendingShare()
+  if (payload) enqueueAndroidShare(payload)
+  syncAndroidTaskNotification()
+}
+
+function onAndroidShare(event: CustomEvent<unknown>): void {
+  const payload = parseSharePayload(event.detail)
+  if (!payload) return
+  enqueueAndroidShare(payload)
+}
+
+function onAndroidNetworkOnline(): void {
+  androidNetworkOnline.value = true
+  if (hasInitialized.value) {
+    void syncAfterMobileResume()
+  }
+}
+
+function onAndroidNetworkOffline(): void {
+  androidNetworkOnline.value = false
+}
+
+function onAndroidResume(): void {
+  androidBridge.refresh()
+  if (hasInitialized.value) {
+    void syncAfterMobileResume()
+  }
+  void flushAndroidShare()
+}
+
 onMounted(() => {
   document.addEventListener('pointerdown', onDocumentPointerDown)
   window.addEventListener('keydown', onWindowKeyDown)
@@ -2138,6 +2505,17 @@ onMounted(() => {
   window.addEventListener('resize', updateVisualViewportState)
   window.visualViewport?.addEventListener('resize', updateVisualViewportState)
   window.visualViewport?.addEventListener('scroll', updateVisualViewportState)
+  androidBridge.refresh()
+  removeAndroidListeners.push(
+    androidBridge.listen(CODEX_ANDROID_EVENTS.ready, onAndroidReady),
+    androidBridge.listen(CODEX_ANDROID_EVENTS.share, onAndroidShare),
+    androidBridge.listen(CODEX_ANDROID_EVENTS.networkOnline, onAndroidNetworkOnline),
+    androidBridge.listen(CODEX_ANDROID_EVENTS.networkOffline, onAndroidNetworkOffline),
+    androidBridge.listen(CODEX_ANDROID_EVENTS.resume, onAndroidResume),
+  )
+  const pendingShare = androidBridge.getPendingShare()
+  if (pendingShare) enqueueAndroidShare(pendingShare)
+  void flushAndroidShare()
   updateVisualViewportState()
   applyDarkMode()
   darkModeMediaQuery?.addEventListener('change', applyDarkMode)
@@ -2182,8 +2560,28 @@ onUnmounted(() => {
     threadSearchTimer = null
   }
   clearTerminalKeyboardFocusFallbackTimer()
+  for (const removeListener of removeAndroidListeners.splice(0)) {
+    removeListener()
+  }
+  clearAndroidTaskStateTimer()
+  clearAndroidSteeringMarker()
   stopPolling()
 })
+
+watch(
+  androidTaskSnapshot,
+  (next, previous) => {
+    syncAndroidTaskNotification(next, previous)
+  },
+  { deep: true, immediate: true },
+)
+
+watch(
+  () => [route.name, selectedThreadId.value, selectedThreadPendingRequest.value] as const,
+  () => {
+    void nextTick(() => flushAndroidShare())
+  },
+)
 
 function updateVisualViewportState(): void {
   if (typeof window === 'undefined') return
@@ -3072,6 +3470,9 @@ async function handleServerRequestResponse(payload: UiServerRequestReply): Promi
   if (!responded || !followUpMessageText || isHomeRoute.value) return
 
   try {
+    if (isSelectedThreadInProgress.value) {
+      markAndroidSteering(selectedThreadId.value)
+    }
     await sendMessageToSelectedThread(followUpMessageText, [], [], 'steer', [])
   } catch {
     // sendMessageToSelectedThread already surfaces the error through shared state.
@@ -3427,6 +3828,9 @@ async function syncAfterMobileResume(): Promise<void> {
 
 function onSubmitThreadMessage(payload: { text: string; imageUrls: string[]; fileAttachments: Array<{ label: string; path: string; fsPath: string }>; skills: Array<{ name: string; path: string }>; mode: 'steer' | 'queue' }): void {
   const text = payload.text
+  const steeringThreadId = !isHomeRoute.value && payload.mode === 'steer' && isSelectedThreadInProgress.value
+    ? selectedThreadId.value
+    : ''
   scheduleMobileConversationJumpToLatest()
   const editingState = editingQueuedMessageState.value
   const queueInsertIndex =
@@ -3440,7 +3844,15 @@ function onSubmitThreadMessage(payload: { text: string; imageUrls: string[]; fil
     void submitFirstMessageForNewThread(text, payload.imageUrls, payload.skills, payload.fileAttachments)
     return
   }
+  if (steeringThreadId) markAndroidSteering(steeringThreadId)
   void sendMessageToSelectedThread(text, payload.imageUrls, payload.skills, payload.mode, payload.fileAttachments, queueInsertIndex)
+}
+
+function onSteerQueuedMessage(messageId: string): void {
+  if (isSelectedThreadInProgress.value) {
+    markAndroidSteering(selectedThreadId.value)
+  }
+  steerQueuedMessage(messageId)
 }
 
 function onEditQueuedMessage(messageId: string): void {
@@ -4183,8 +4595,21 @@ function onSelectSpeedMode(mode: SpeedMode): void {
   void updateSelectedSpeedMode(mode)
 }
 
-function onInterruptTurn(): void {
-  void interruptSelectedThreadTurn()
+async function onInterruptTurn(): Promise<void> {
+  const threadId = selectedThreadId.value.trim()
+  if (!threadId || !isSelectedThreadInProgress.value) return
+  androidInterruptRequestedThreads.add(threadId)
+  try {
+    await interruptSelectedThreadTurn()
+    if (isSelectedThreadInProgress.value) {
+      androidInterruptRequestedThreads.delete(threadId)
+    }
+  } catch {
+    // The shared state composable normally surfaces the failure itself. Clear
+    // the marker if the interrupt could not be issued so a later completion is
+    // not misreported as canceled.
+    androidInterruptRequestedThreads.delete(threadId)
+  }
 }
 
 function onRollback(payload: { turnId: string }): void {
@@ -4208,6 +4633,9 @@ function onImplementPlan(payload: { turnId: string }): void {
   if (isHomeRoute.value || !selectedThreadId.value) return
   setSelectedCollaborationMode('default')
   scheduleMobileConversationJumpToLatest()
+  if (isSelectedThreadInProgress.value) {
+    markAndroidSteering(selectedThreadId.value)
+  }
   void sendMessageToSelectedThread('Implement', [], [], 'steer', [], undefined, 'default')
 }
 
@@ -5094,6 +5522,26 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 
 .automations-route-header-icon {
   @apply bg-amber-500 shadow-[0_16px_32px_-20px_rgba(245,158,11,0.9)];
+}
+
+.android-observer-badge {
+  @apply inline-flex max-w-[min(42vw,15rem)] items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-1 text-[10px] font-medium leading-4 text-sky-700;
+}
+
+.android-observer-badge-primary {
+  @apply font-semibold;
+}
+
+.android-observer-badge-separator {
+  @apply text-sky-400;
+}
+
+:root.dark .android-observer-badge {
+  @apply border-sky-800 bg-sky-950/50 text-sky-300;
+}
+
+:root.dark .android-observer-badge-separator {
+  @apply text-sky-500;
 }
 
 .skills-route-header-icon :deep(svg) {
