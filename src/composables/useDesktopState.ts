@@ -3281,6 +3281,8 @@ export function useDesktopState() {
   }
 
   function replacePendingServerRequests(requests: UiServerRequest[]): void {
+    const previousThreadIds = Object.keys(pendingServerRequestsByThreadId.value)
+      .filter((threadId) => threadId !== GLOBAL_SERVER_REQUEST_SCOPE)
     const next: Record<string, UiServerRequest[]> = {}
     for (const request of requests) {
       const threadId = request.threadId || GLOBAL_SERVER_REQUEST_SCOPE
@@ -3294,7 +3296,10 @@ export function useDesktopState() {
     }
 
     pendingServerRequestsByThreadId.value = next
-    const threadIds = new Set(Object.keys(next).filter((threadId) => threadId !== GLOBAL_SERVER_REQUEST_SCOPE))
+    const threadIds = new Set([
+      ...previousThreadIds,
+      ...Object.keys(next).filter((threadId) => threadId !== GLOBAL_SERVER_REQUEST_SCOPE),
+    ])
     for (const threadId of threadIds) {
       const request = next[threadId]?.[0]
       updateTaskSnapshot({
