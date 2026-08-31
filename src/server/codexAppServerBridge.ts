@@ -2218,6 +2218,21 @@ function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TU
     if (itemId && turn.items.some((candidate) => readNonEmptyString(candidate.id) === itemId)) return
     const assistantText = item.type === 'agentMessage' ? readNonEmptyString(item.text) : ''
     if (assistantText && turn.items.some((candidate) => candidate.type === 'agentMessage' && readNonEmptyString(candidate.text) === assistantText)) return
+    if (item.type === 'userMessage') {
+      const content = Array.isArray(item.content) ? item.content : []
+      const userText = content
+        .map((block) => readNonEmptyString(asRecord(block)?.text))
+        .filter(Boolean)
+        .join('\n')
+      if (userText && turn.items.some((candidate) => {
+        if (candidate.type !== 'userMessage') return false
+        const candidateContent = Array.isArray(candidate.content) ? candidate.content : []
+        return candidateContent
+          .map((block) => readNonEmptyString(asRecord(block)?.text))
+          .filter(Boolean)
+          .join('\n') === userText
+      })) return
+    }
     turn.items.push(item)
   }
 
@@ -2263,6 +2278,16 @@ function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TU
             id: readNonEmptyString(payload.id) || `${turn.id}-session-agent-${turn.items.length}`,
             type: 'agentMessage',
             text,
+          })
+        }
+      } else if (eventType === 'user_message') {
+        const text = readNonEmptyString(payload.message)
+        const turn = ensureTurn(eventTurnId || currentTurnId)
+        if (turn && text) {
+          addItem(turn, {
+            id: readNonEmptyString(payload.id) || `${turn.id}-session-user-${turn.items.length}`,
+            type: 'userMessage',
+            content: [{ type: 'text', text }],
           })
         }
       }
