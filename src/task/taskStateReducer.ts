@@ -130,6 +130,9 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
   if (observation.inProgress === true && state === 'completed') {
     state = 'running'
     startedAt = startedAt ?? atIso
+    if (currentActivity.kind === 'idle') {
+      currentActivity = { kind: 'thinking', label: 'Thinking', details: [] }
+    }
   } else if (observation.inProgress === false && !method) {
     if (state === 'running' || state === 'starting' || state === 'steering' || state === 'waiting_approval' || state === 'waiting_user_input') {
       state = 'completed'
@@ -216,4 +219,3 @@ export function reduceTaskSnapshots(
   if (!threadId) return snapshots
   return { ...snapshots, [threadId]: reduceTaskSnapshot(snapshots[threadId], observation) }
 }
-
