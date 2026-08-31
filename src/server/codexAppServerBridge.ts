@@ -1932,10 +1932,21 @@ async function mergeSessionActivityIntoThreadListResult(
     const currentStatus = asRecord(itemRecord.status)
     const currentStatusType = readNonEmptyString(currentStatus?.type)
     const nextStatusType = activity.inProgress ? 'inProgress' : 'idle'
+    const taskState = activity.inProgress
+      ? 'running'
+      : activity.terminalState === 'failed'
+        ? 'failed'
+        : activity.terminalState === 'canceled'
+          ? 'canceled'
+          : 'completed'
+    const taskError = activity.terminalError?.trim() ?? ''
     const alreadyMatches = currentStatusType === nextStatusType
       && itemRecord.inProgress === activity.inProgress
       && itemRecord.sessionRevision === activity.revision
       && itemRecord.sessionActivityKnown === true
+      && itemRecord.taskState === taskState
+      && (itemRecord.taskError ?? '') === taskError
+      && (itemRecord.terminalTurnId ?? '') === (activity.terminalTurnId ?? '')
     if (alreadyMatches) return item
     changed = true
     return {
@@ -1944,6 +1955,9 @@ async function mergeSessionActivityIntoThreadListResult(
       status: { ...currentStatus, type: nextStatusType },
       sessionActivityKnown: true,
       sessionRevision: activity.revision,
+      taskState,
+      taskError,
+      terminalTurnId: activity.terminalTurnId ?? '',
     }
   })
 
@@ -1966,22 +1980,40 @@ async function mergeSessionActivityIntoThreadResult(
   const currentStatus = asRecord(thread.status)
   const currentStatusType = readNonEmptyString(currentStatus?.type)
   const nextStatusType = activity.inProgress ? 'inProgress' : 'idle'
+  const taskState = activity.inProgress
+    ? 'running'
+    : activity.terminalState === 'failed'
+      ? 'failed'
+      : activity.terminalState === 'canceled'
+        ? 'canceled'
+        : 'completed'
+  const taskError = activity.terminalError?.trim() ?? ''
   const alreadyMatches = currentStatusType === nextStatusType
     && thread.inProgress === activity.inProgress
     && thread.sessionRevision === activity.revision
     && thread.sessionActivityKnown === true
     && record.sessionRevision === activity.revision
+    && thread.taskState === taskState
+    && (thread.taskError ?? '') === taskError
+    && (thread.terminalTurnId ?? '') === (activity.terminalTurnId ?? '')
   if (alreadyMatches) return result
   return {
     ...record,
     sessionActivityKnown: true,
     sessionRevision: activity.revision,
+    activeTurnId: activity.inProgress ? activity.turnId : '',
+    terminalTurnId: activity.terminalTurnId ?? '',
     thread: {
       ...thread,
       inProgress: activity.inProgress,
       status: { ...currentStatus, type: nextStatusType },
       sessionActivityKnown: true,
       sessionRevision: activity.revision,
+      taskState,
+      taskError,
+      terminalState: activity.terminalState ?? '',
+      terminalError: activity.terminalError ?? '',
+      terminalTurnId: activity.terminalTurnId ?? '',
     },
   }
 }
@@ -1989,6 +2021,8 @@ async function mergeSessionActivityIntoThreadResult(
 type SessionProjectionFallback = {
   turnId: string
   items: Record<string, unknown>[]
+  status: 'completed' | 'failed' | 'canceled'
+  error: string
 }
 
 function readThreadTurns(result: unknown): unknown[] {
@@ -2164,12 +2198,21 @@ function buildSessionProjectionFallback(
   if (!targetTurnId) return null
   const items = itemsByTurnId.get(targetTurnId)
   if (!items || items.length === 0) return null
-  return { turnId: targetTurnId, items }
+  return {
+    turnId: targetTurnId,
+    items,
+    status: activity.terminalState === 'failed'
+      ? 'failed'
+      : activity.terminalState === 'canceled'
+        ? 'canceled'
+        : 'completed',
+    error: activity.terminalError ?? '',
+  }
 }
 
 type FastSessionTurn = {
   id: string
-  status: 'inProgress' | 'completed'
+  status: 'inProgress' | 'completed' | 'failed' | 'interrupted'
   items: Record<string, unknown>[]
 }
 
@@ -2204,7 +2247,7 @@ function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TU
     if (!normalizedId) return null
     const existing = turnsById.get(normalizedId)
     if (existing) {
-      if (status === 'completed') existing.status = status
+      if (status !== 'inProgress') existing.status = status
       return existing
     }
     const turn: FastSessionTurn = { id: normalizedId, status, items: [] }
@@ -2267,8 +2310,13 @@ function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TU
         ensureTurn(currentTurnId, 'inProgress')
       } else if (eventType === 'task_complete' || eventType === 'task_completed' || eventType === 'turn_complete' || eventType === 'turn_completed' || eventType === 'turn_aborted' || eventType === 'task_failed') {
         const completedTurnId = eventTurnId || currentTurnId
-        const turn = ensureTurn(completedTurnId, 'completed')
-        if (turn) turn.status = 'completed'
+        const terminalStatus: FastSessionTurn['status'] = eventType === 'task_failed'
+          ? 'failed'
+          : eventType === 'turn_aborted'
+            ? 'interrupted'
+            : 'completed'
+        const turn = ensureTurn(completedTurnId, terminalStatus)
+        if (turn) turn.status = terminalStatus
         if (completedTurnId === currentTurnId) currentTurnId = ''
       } else if (eventType === 'agent_message') {
         const text = readNonEmptyString(payload.message)
@@ -2340,8 +2388,13 @@ function mergeSessionProjectionFallbackIntoTurns(
         ...turns,
         {
           id: fallback.turnId,
-          status: markComplete ? 'completed' : 'inProgress',
+          status: markComplete
+            ? fallback.status === 'canceled' ? 'interrupted' : fallback.status
+            : 'inProgress',
           items: fallback.items,
+          ...(markComplete && fallback.status === 'failed' && fallback.error
+            ? { error: { message: fallback.error } }
+            : {}),
         },
       ],
       changed: true,
@@ -2367,13 +2420,16 @@ function mergeSessionProjectionFallbackIntoTurns(
     if (text && existingAssistantTexts.has(text)) return false
     return true
   })
-  const nextStatus = markComplete ? 'completed' : existingTurn.status
-  const statusChanged = markComplete && readTurnStatusType(existingTurn) !== 'completed'
+  const nextStatus = markComplete ? fallback.status === 'canceled' ? 'interrupted' : fallback.status : existingTurn.status
+  const statusChanged = markComplete && readTurnStatusType(existingTurn) !== nextStatus
   if (missingItems.length === 0 && !statusChanged) return { turns, changed: false }
   const nextTurns = [...turns]
   nextTurns[targetIndex] = {
     ...existingTurn,
     ...(markComplete ? { status: nextStatus } : {}),
+    ...(markComplete && fallback.status === 'failed' && fallback.error
+      ? { error: { message: fallback.error } }
+      : {}),
     ...(missingItems.length > 0 ? { items: [...existingItems, ...missingItems] } : {}),
   }
   return { turns: nextTurns, changed: true }
@@ -6141,6 +6197,8 @@ type ThreadQueueState = Record<string, StoredQueuedMessage[]>
 
 type TaskSnapshotResponse = {
   taskState: 'queued' | 'starting' | 'running' | 'waiting_approval' | 'waiting_user_input' | 'steering' | 'completed' | 'failed' | 'canceled'
+  activeTurnId: string
+  terminalTurnId: string
   currentActivity: { kind: string; label: string; details: string[] }
   queueDepth: number
   activeRequest: { id: number; kind: 'approval' | 'user_input' | 'other'; method: string; receivedAtIso: string } | null
@@ -6153,6 +6211,7 @@ type TaskSnapshotResponse = {
   } | null
   startedAt: string | null
   finishedAt: string | null
+  error: string | null
   timeline: Array<{
     id: string
     type: string
@@ -6172,12 +6231,20 @@ function classifyTaskRequest(method: string): 'approval' | 'user_input' | 'other
   return 'other'
 }
 
+function readTaskRequestThreadIdValue(value: unknown, depth = 0): string {
+  if (depth > 3) return ''
+  const params = asRecord(value)
+  if (!params) return ''
+  return readNonEmptyString(params.threadId)
+    || readNonEmptyString(params.thread_id)
+    || readNonEmptyString(params.conversationId)
+    || readNonEmptyString(params.conversation_id)
+    || readTaskRequestThreadIdValue(params.params, depth + 1)
+    || readTaskRequestThreadIdValue(params.request, depth + 1)
+}
+
 function readTaskRequestThreadId(request: PendingServerRequest): string {
-  const params = asRecord(request.params)
-  return readNonEmptyString(params?.threadId)
-    || readNonEmptyString(params?.thread_id)
-    || readNonEmptyString(params?.conversationId)
-    || readNonEmptyString(params?.conversation_id)
+  return readTaskRequestThreadIdValue(request.params)
 }
 
 export function buildTaskSnapshotResponse(
@@ -6187,11 +6254,25 @@ export function buildTaskSnapshotResponse(
   pendingRequests: PendingServerRequest[],
   streamEvents: Array<{ seq: number; method: string; params: unknown; atIso: string }>,
   streamCursor: { streamEpoch: string; latestSeq: number; oldestSeq: number | null },
-  sessionActivity: { known: boolean; inProgress: boolean; lastEventAt: number | null; turnId: string } | null,
+  sessionActivity: {
+    known: boolean
+    inProgress: boolean
+    lastEventAt: number | null
+    turnId: string
+    terminalTurnId?: string
+    terminalState?: 'completed' | 'failed' | 'canceled' | ''
+    terminalError?: string
+  } | null,
   writerClient: { clientId: string; clientType: 'desktop' | 'android' | 'web' | 'unknown'; generation: number; claimedAt: string } | null = null,
 ): TaskSnapshotResponse {
-  const request = pendingRequests.find((row) => readTaskRequestThreadId(row) === threadId)
-  const activeRequest = request
+  // A pending request belongs to an active turn.  Once the shared session
+  // marker says the turn is idle, an app-server-local request can be stale
+  // (for example after a desktop process interrupted the task); it must not
+  // resurrect a waiting card on another client.
+  const request = sessionActivity?.known && !sessionActivity.inProgress
+    ? undefined
+    : pendingRequests.find((row) => readTaskRequestThreadId(row) === threadId)
+  let activeRequest = request
     ? {
       id: request.id,
       kind: classifyTaskRequest(request.method),
@@ -6200,14 +6281,23 @@ export function buildTaskSnapshotResponse(
     }
     : null
   const relevantEvents = streamEvents.slice(-40)
+  const initialTaskState: TaskSnapshotResponse['taskState'] = isInProgress
+    ? 'running'
+    : queueDepth > 0
+      ? 'queued'
+      : 'completed'
   let currentActivity: TaskSnapshotResponse['currentActivity'] = {
-    kind: isInProgress ? 'thinking' : 'idle',
-    label: isInProgress ? 'Thinking' : 'Completed',
-    details: [],
+    kind: isInProgress ? 'thinking' : queueDepth > 0 ? 'queue' : 'idle',
+    label: isInProgress ? 'Thinking' : queueDepth > 0 ? 'Queued' : 'Completed',
+    details: queueDepth > 0 ? [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] : [],
   }
-  let state: TaskSnapshotResponse['taskState'] = isInProgress ? 'running' : queueDepth > 0 ? 'queued' : 'completed'
+  let state: TaskSnapshotResponse['taskState'] = initialTaskState
+  let activeTurnId = ''
+  let terminalTurnId = sessionActivity?.terminalTurnId ?? ''
   let startedAt: string | null = null
   let finishedAt: string | null = null
+  let error: string | null = null
+  let lastStateEventAtMs: number | null = null
   const timeline: TaskSnapshotResponse['timeline'] = []
 
   for (const event of relevantEvents) {
@@ -6215,29 +6305,199 @@ export function buildTaskSnapshotResponse(
     const item = asRecord(params?.item)
     const itemType = readNonEmptyString(item?.type).toLowerCase()
     const turn = asRecord(params?.turn)
-    const turnId = readNonEmptyString(turn?.id) || readNonEmptyString(params?.turnId) || readNonEmptyString(params?.turn_id)
+    const turnId = readNonEmptyString(turn?.id)
+      || readNonEmptyString(params?.turnId)
+      || readNonEmptyString(params?.turn_id)
+      || readNonEmptyString(item?.turnId)
+      || readNonEmptyString(item?.turn_id)
+    const isLateTerminalTurnEvent = Boolean(
+      turnId
+      && terminalTurnId
+      && turnId === terminalTurnId
+      && !activeTurnId
+      && ['queued', 'completed', 'failed', 'canceled'].includes(state),
+    )
+    const isForeignActiveTurnEvent = Boolean(
+      turnId
+      && activeTurnId
+      && turnId !== activeTurnId
+      && event.method !== 'turn/started'
+      && !event.method.startsWith('queue/'),
+    )
+    if (isLateTerminalTurnEvent || isForeignActiveTurnEvent) continue
     let label = ''
     let kind = 'activity'
     const details: string[] = []
     if (event.method === 'turn/started') {
       state = 'starting'
+      activeTurnId = turnId
       startedAt = startedAt ?? event.atIso
+      error = null
+      const eventAtMs = Date.parse(event.atIso)
+      lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
       label = 'Task started'
       kind = 'task_started'
       currentActivity = { kind: 'thinking', label: 'Thinking', details: [] }
     } else if (event.method === 'turn/completed') {
-      state = 'completed'
+      // The stream can contain a late completion for a previous turn while a
+      // newer turn is already active.  Do not let that historical frame
+      // terminate the current task snapshot.
+      if (activeTurnId && turnId && turnId !== activeTurnId) continue
+      const turnStatus = readNonEmptyString(turn?.status) || readNonEmptyString(params?.status)
+      const completionError = getErrorMessage(turn?.error, '') || getErrorMessage(params?.error, '') || readNonEmptyString(params?.message)
+      const failed = turnStatus.toLowerCase() === 'failed' || Boolean(completionError)
+      state = failed ? 'failed' : 'completed'
+      activeTurnId = ''
+      terminalTurnId = turnId || terminalTurnId
       finishedAt = event.atIso
-      label = 'Task completed'
-      kind = 'task_completed'
-      currentActivity = { kind: 'idle', label: 'Completed', details: [] }
+      const eventAtMs = Date.parse(event.atIso)
+      lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
+      if (failed) {
+        error = completionError || 'Task failed'
+        if (completionError) details.push(completionError)
+        label = 'Task failed'
+        kind = 'error'
+        currentActivity = { kind: 'error', label, details: [error] }
+      } else {
+        error = null
+        label = 'Task completed'
+        kind = 'task_completed'
+        currentActivity = { kind: 'idle', label: 'Completed', details: [] }
+      }
+      if (queueDepth > 0) {
+        state = 'queued'
+        error = null
+        currentActivity = { kind: 'queue', label: 'Queued', details: [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] }
+      }
     } else if (event.method === 'error') {
-      state = 'failed'
-      label = 'Task failed'
+      if (activeTurnId && turnId && turnId !== activeTurnId) continue
+      const retryable = params?.willRetry === true
+      state = retryable
+        ? ['starting', 'running', 'steering', 'waiting_approval', 'waiting_user_input'].includes(state)
+          ? state
+          : isInProgress ? 'running' : state
+        : 'failed'
+      label = retryable ? 'Retrying task' : 'Task failed'
       kind = 'error'
-      const message = readNonEmptyString(params?.message)
+      const message = getErrorMessage(params?.error, '') || readNonEmptyString(params?.message)
       if (message) details.push(message)
+      error = message || 'Task failed'
+      if (!retryable) {
+        finishedAt = event.atIso
+        terminalTurnId = turnId || terminalTurnId
+      }
+      const eventAtMs = Date.parse(event.atIso)
+      lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
       currentActivity = { kind: 'error', label, details }
+    } else if (event.method === 'turn/interrupt') {
+      if (activeTurnId && turnId && turnId !== activeTurnId) continue
+      state = 'canceled'
+      activeTurnId = ''
+      terminalTurnId = turnId || terminalTurnId
+      finishedAt = event.atIso
+      error = null
+      label = 'Task canceled'
+      kind = 'task_canceled'
+      currentActivity = { kind: 'idle', label: 'Canceled', details: [] }
+      const eventAtMs = Date.parse(event.atIso)
+      lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
+    } else if (event.method === 'queue/enqueued' || event.method === 'queue/updated') {
+      const queueStatus = readNonEmptyString(params?.status).toLowerCase()
+      const eventQueueDepth = typeof params?.queueDepth === 'number' && Number.isFinite(params.queueDepth)
+        ? Math.max(0, Math.trunc(params.queueDepth))
+        : queueDepth
+      queueDepth = eventQueueDepth
+      if (queueStatus === 'processing') {
+        state = 'starting'
+        startedAt = startedAt ?? event.atIso
+        finishedAt = null
+        error = null
+        label = 'Thinking'
+        kind = 'activity'
+        currentActivity = { kind: 'thinking', label, details: [] }
+        const eventAtMs = Date.parse(event.atIso)
+        lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
+      } else if (queueStatus === 'failed' && eventQueueDepth > 0) {
+        state = 'queued'
+        activeTurnId = ''
+        finishedAt = null
+        error = null
+        label = 'Queued'
+        kind = 'queued'
+        currentActivity = { kind: 'queue', label, details: [`${eventQueueDepth} message${eventQueueDepth === 1 ? '' : 's'}`] }
+      } else if (eventQueueDepth === 0 && state === 'queued') {
+        state = 'completed'
+        activeTurnId = ''
+        finishedAt = event.atIso
+        error = null
+        label = 'Task completed'
+        kind = 'task_completed'
+        currentActivity = { kind: 'idle', label: 'Completed', details: [] }
+      } else if (eventQueueDepth > 0 && !['starting', 'running', 'steering', 'waiting_approval', 'waiting_user_input'].includes(state)) {
+        state = 'queued'
+        label = 'Queued'
+        kind = 'queued'
+        currentActivity = { kind: 'queue', label, details: [`${eventQueueDepth} message${eventQueueDepth === 1 ? '' : 's'}`] }
+      } else {
+        continue
+      }
+    } else if (event.method === 'server/request') {
+      const requestRecord = asRecord(params)
+      const requestMethod = readNonEmptyString(requestRecord?.method)
+      const requestKind = classifyTaskRequest(requestMethod)
+      if (requestKind === 'approval' || requestKind === 'user_input') {
+        label = requestKind === 'approval' ? 'Approval required' : 'Input required'
+        kind = requestKind === 'approval' ? 'approval_request' : 'user_input_request'
+        currentActivity = requestKind === 'approval'
+          ? { kind: 'approval', label, details: [] }
+          : { kind: 'user_input', label, details: [] }
+        state = requestKind === 'approval' ? 'waiting_approval' : 'waiting_user_input'
+      } else {
+        continue
+      }
+    } else if (event.method === 'server/request/resolved') {
+      const resolvedId = typeof params?.id === 'number' && Number.isInteger(params.id) ? params.id : null
+      if (resolvedId !== null && activeRequest && activeRequest.id !== resolvedId) continue
+
+      // A resolved notification can be observed after the bridge-local
+      // pending-request map has already been cleared (or while it still
+      // contains the resolved row).  Re-select another pending request for
+      // this thread when one exists; otherwise leave the waiting state.
+      const nextRequest = pendingRequests.find((row) => (
+        readTaskRequestThreadId(row) === threadId && (resolvedId === null || row.id !== resolvedId)
+      ))
+      activeRequest = nextRequest
+        ? {
+          id: nextRequest.id,
+          kind: classifyTaskRequest(nextRequest.method),
+          method: nextRequest.method,
+          receivedAtIso: nextRequest.receivedAtIso,
+        }
+        : null
+      if (activeRequest?.kind === 'approval') {
+        state = 'waiting_approval'
+        label = 'Approval required'
+        kind = 'approval_request'
+        currentActivity = { kind: 'approval', label, details: [] }
+      } else if (activeRequest?.kind === 'user_input') {
+        state = 'waiting_user_input'
+        label = 'Input required'
+        kind = 'user_input_request'
+        currentActivity = { kind: 'user_input', label, details: [] }
+      } else {
+        if (state === 'waiting_approval' || state === 'waiting_user_input') {
+          state = sessionActivity?.known && sessionActivity.inProgress
+            ? 'running'
+            : queueDepth > 0 ? 'queued' : 'completed'
+        }
+        label = 'Thinking'
+        kind = 'activity'
+        currentActivity = state === 'running'
+          ? { kind: 'thinking', label, details: [] }
+          : queueDepth > 0
+            ? { kind: 'queue', label: 'Queued', details: [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] }
+            : { kind: 'idle', label: 'Completed', details: [] }
+      }
     } else if (event.method === 'item/started' && itemType === 'commandexecution') {
       state = state === 'starting' ? 'running' : state
       kind = 'command'
@@ -6269,7 +6529,19 @@ export function buildTaskSnapshotResponse(
       label,
       details,
       turnId,
-      status: state === 'completed' ? 'completed' : state === 'failed' ? 'failed' : 'active',
+      status: kind === 'approval_request' || kind === 'user_input_request'
+        ? 'pending'
+        : kind === 'task_completed'
+          ? 'completed'
+        : state === 'completed'
+        ? 'completed'
+        : state === 'failed'
+          ? 'failed'
+          : state === 'canceled'
+            ? 'canceled'
+            : state === 'queued'
+              ? 'pending'
+              : 'active',
     })
   }
 
@@ -6280,14 +6552,65 @@ export function buildTaskSnapshotResponse(
     state = 'waiting_user_input'
     currentActivity = { kind: 'user_input', label: 'Input required', details: [] }
   }
+
+  // The shared session marker is authoritative over the bridge's local event
+  // buffer.  The buffer may still contain a stale turn/started or command
+  // event after a desktop writer has completed the same session.
+  if (sessionActivity?.known) {
+    if (sessionActivity.inProgress) {
+      activeTurnId = sessionActivity.turnId || activeTurnId
+      if (!activeRequest) {
+        if (state === 'completed' || state === 'failed' || state === 'queued') {
+          state = 'running'
+        }
+        if (currentActivity.kind === 'idle') {
+          currentActivity = { kind: 'thinking', label: 'Thinking', details: [] }
+        }
+      }
+    } else if (!activeRequest && queueDepth > 0) {
+      // A completed/failed turn can leave messages waiting for the next
+      // queue drain.  The queue is the next actionable state and should not
+      // be hidden by the previous terminal outcome.
+      activeTurnId = ''
+      state = 'queued'
+      error = null
+      currentActivity = { kind: 'queue', label: 'Queued', details: [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] }
+    } else if (!activeRequest && sessionActivity.terminalState === 'failed') {
+      // The desktop Codex process may have written the terminal marker
+      // without sending this bridge's turn/completed notification.  Preserve
+      // that outcome instead of inferring `completed` from an idle marker.
+      activeTurnId = ''
+      state = 'failed'
+      error = sessionActivity.terminalError?.trim() || error || 'Task failed'
+      currentActivity = { kind: 'error', label: 'Task failed', details: [error] }
+    } else if (!activeRequest && sessionActivity.terminalState === 'canceled') {
+      activeTurnId = ''
+      state = 'canceled'
+      error = null
+      currentActivity = { kind: 'idle', label: 'Canceled', details: [] }
+    } else if (!activeRequest && !(
+      (state === 'failed' && error && lastStateEventAtMs !== null && (sessionActivity.lastEventAt === null || lastStateEventAtMs >= sessionActivity.lastEventAt))
+      || (state === 'starting' && lastStateEventAtMs !== null && sessionActivity.lastEventAt !== null && lastStateEventAtMs >= sessionActivity.lastEventAt)
+      || (state === 'canceled' && lastStateEventAtMs !== null && (sessionActivity.lastEventAt === null || lastStateEventAtMs >= sessionActivity.lastEventAt))
+    )) {
+      activeTurnId = ''
+      state = queueDepth > 0 ? 'queued' : 'completed'
+      error = null
+      currentActivity = queueDepth > 0
+        ? { kind: 'queue', label: 'Queued', details: [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] }
+        : { kind: 'idle', label: 'Completed', details: [] }
+    }
+  }
   if (sessionActivity?.known && sessionActivity.lastEventAt) {
     const markerIso = new Date(sessionActivity.lastEventAt).toISOString()
-    if (sessionActivity.inProgress) startedAt = startedAt ?? markerIso
-    else if (!isInProgress) finishedAt = finishedAt ?? markerIso
+    if (sessionActivity.inProgress) startedAt = markerIso
+    else finishedAt = markerIso
   }
 
   return {
     taskState: state,
+    activeTurnId,
+    terminalTurnId,
     currentActivity,
     queueDepth,
     activeRequest,
@@ -6299,13 +6622,14 @@ export function buildTaskSnapshotResponse(
       : null,
     startedAt,
     finishedAt,
+    error,
     timeline,
   }
 }
 
 function resolveTaskWriterClient(
   threadId: string,
-  sessionActivity: { known: boolean; inProgress: boolean } | null,
+  sessionActivity: { known: boolean; inProgress: boolean; lastEventAt?: number | null } | null,
   appServer: AppServerProcess,
   threadBroker: ThreadSessionBroker,
 ): { clientId: string; clientType: 'desktop' | 'android' | 'web' | 'unknown'; generation: number; claimedAt: string } | null {
@@ -6319,7 +6643,7 @@ function resolveTaskWriterClient(
       clientId: 'desktop-session',
       clientType: 'desktop',
       generation: appServer.getProcessGeneration(),
-      claimedAt: new Date().toISOString(),
+      claimedAt: new Date(sessionActivity.lastEventAt ?? Date.now()).toISOString(),
     }
   }
   return null
@@ -6470,6 +6794,7 @@ async function appendThreadQueuedMessage(threadId: string, message: StoredQueued
 async function enqueueThreadQueuedMessage(
   threadId: string,
   message: StoredQueuedMessage,
+  beforeMessageId = '',
 ): Promise<{ state: ThreadQueueState; inserted: boolean }> {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) throw new Error('threadId is required')
@@ -6478,10 +6803,12 @@ async function enqueueThreadQueuedMessage(
     if (queue.some((entry) => entry.id === message.id)) {
       return { nextState: state, result: { state, inserted: false } }
     }
-    const nextState = {
-      ...state,
-      [normalizedThreadId]: [...queue, message],
-    }
+    const insertionIndex = beforeMessageId
+      ? Math.max(0, queue.findIndex((entry) => entry.id === beforeMessageId))
+      : queue.length
+    const nextQueue = [...queue]
+    nextQueue.splice(insertionIndex < 0 ? nextQueue.length : insertionIndex, 0, message)
+    const nextState = { ...state, [normalizedThreadId]: nextQueue }
     return { nextState, result: { state: nextState, inserted: true } }
   })
 }
@@ -6562,6 +6889,14 @@ function extractThreadIdFromNotificationParams(params: unknown): string {
     (typeof record.conversationId === 'string' ? record.conversationId : '') ||
     (typeof record.conversation_id === 'string' ? record.conversation_id : '')
   if (threadId) return threadId
+  // Server-initiated requests are wrapped as `{ id, method, params }`.
+  // Resolve the thread from that nested payload so approval/input events are
+  // retained in the per-thread stream and every observer sees the same task.
+  const nestedParams = asRecord(record.params)
+  if (nestedParams) {
+    const nestedThreadId = extractThreadIdFromNotificationParams(nestedParams)
+    if (nestedThreadId) return nestedThreadId
+  }
   const thread = asRecord(record.thread)
   if (thread && typeof thread.id === 'string') return thread.id
   const turn = asRecord(record.turn)
@@ -7286,6 +7621,16 @@ class AppServerProcess {
     this.nextStreamSeq = 0
     this.streamEventsByThreadId.clear()
     this.streamEventHistory.length = 0
+    // All projections below are tied to the previous app-server generation.
+    // Keeping them after a restart can resurrect an old turn, command item,
+    // or failed read on the first observer request before the new process has
+    // emitted any events.
+    this.lastThreadReadSnapshotByThreadId.clear()
+    this.threadSummaryById.clear()
+    this.threadTurnPageReadCacheByThreadId.clear()
+    this.threadTurnPageReadPromiseByThreadId.clear()
+    this.capturedItemsByThreadId.clear()
+    this.liveStateCache.clear()
     const config = this.buildAppServerConfig()
     this.activeConfigSignature = this.getAppServerConfigSignature(config)
     const invocation = getSpawnInvocation(this.getCodexCommand(), config.args)
@@ -7411,6 +7756,14 @@ class AppServerProcess {
       (typeof record.conversationId === 'string' ? record.conversationId : '') ||
       (typeof record.conversation_id === 'string' ? record.conversation_id : '')
     if (threadId) return threadId
+    // `server/request` notifications carry their actual thread metadata in a
+    // nested `params` object.  Keeping this lookup recursive makes stream
+    // replay and per-thread task timelines consistent with live request rows.
+    const nestedParams = asRecord(record.params)
+    if (nestedParams) {
+      const nestedThreadId = this.extractThreadIdFromParams(nestedParams)
+      if (nestedThreadId) return nestedThreadId
+    }
     const thread = asRecord(record.thread)
     if (thread && typeof thread.id === 'string') return thread.id
     const turn = asRecord(record.turn)
@@ -7656,11 +8009,7 @@ class AppServerProcess {
     this.pendingServerRequests.delete(requestId)
 
     this.sendServerRequestReply(requestId, reply)
-    const requestParams = asRecord(pendingRequest.params)
-    const threadId =
-      typeof requestParams?.threadId === 'string' && requestParams.threadId.length > 0
-        ? requestParams.threadId
-        : ''
+    const threadId = readTaskRequestThreadIdValue(pendingRequest.params)
     this.emitNotification({
       method: 'server/request/resolved',
       params: {
@@ -9202,9 +9551,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             partial: true,
             hasMoreOlder: sessionTail.size > FAST_THREAD_SESSION_TAIL_BYTES || turns.length >= THREAD_RESPONSE_TURN_LIMIT,
             inProgress,
-            activeTurnId: sessionActivity.inProgress ? sessionActivity.turnId : '',
             sessionActivityKnown: sessionActivity.known,
             sessionRevision: sessionActivity.revision,
+            streamCursor: appServer.getStreamCursor(),
             ...activitySnapshot,
           })
         } catch (error) {
@@ -9424,57 +9773,78 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               writerClient: null,
               startedAt: null,
               finishedAt: null,
+              error: null,
               timeline: [],
             })
             return
           }
 
+          // A read failure is a transport/projection problem, not evidence
+          // that the Codex task failed.  Keep the last usable projection (or
+          // summary), re-check the shared session marker when possible, and
+          // expose the read error separately for diagnostics.  This prevents
+          // an observer poll from overwriting a running/completed state with
+          // a synthetic terminal `failed` state.
           const snapshot = appServer.getLastThreadReadSnapshot(threadId)
-          if (snapshot) {
-            const record = asRecord(snapshot)
-            const thread = asRecord(record?.thread)
-            const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-            const turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
-            setJson(res, 200, {
-              threadId,
-              conversationState: { turns },
-              ownerClientId: null,
-              liveStateError: {
-                kind: 'readFailed',
-                message: getErrorMessage(error, 'thread/read failed'),
-              },
-              isInProgress: false,
-              streamCursor: appServer.getStreamCursor(),
-              taskState: 'failed',
-              currentActivity: { kind: 'error', label: 'Task failed', details: [getErrorMessage(error, 'thread/read failed')] },
-              queueDepth: 0,
-              activeRequest: null,
-              writerClient: null,
-              startedAt: null,
-              finishedAt: new Date().toISOString(),
-              timeline: [],
-            })
-          } else {
-            setJson(res, 200, {
-              threadId,
-              conversationState: null,
-              ownerClientId: null,
-              liveStateError: {
-                kind: 'readFailed',
-                message: getErrorMessage(error, 'thread/read failed'),
-              },
-              isInProgress: false,
-              streamCursor: appServer.getStreamCursor(),
-              taskState: 'failed',
-              currentActivity: { kind: 'error', label: 'Task failed', details: [getErrorMessage(error, 'thread/read failed')] },
-              queueDepth: 0,
-              activeRequest: null,
-              writerClient: null,
-              startedAt: null,
-              finishedAt: new Date().toISOString(),
-              timeline: [],
-            })
+            ?? appServer.getThreadSummarySnapshot(threadId)
+          const snapshotRecord = asRecord(snapshot)
+          const snapshotThread = asRecord(snapshotRecord?.thread)
+          const rawTurns = Array.isArray(snapshotThread?.turns) ? snapshotThread.turns : []
+          const turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
+          let sessionActivity: ThreadSessionActivity | null = null
+          const sessionPath = readNonEmptyString(snapshotThread?.path)
+          if (sessionPath && isAbsolute(sessionPath)) {
+            try {
+              sessionActivity = await appServer.getSessionActivityReader().read(sessionPath)
+            } catch {
+              sessionActivity = null
+            }
           }
+
+          const status = asRecord(snapshotThread?.status)
+          const statusType = readNonEmptyString(status?.type).toLowerCase()
+          const projectionInProgress = snapshotThread?.inProgress === true
+            || ['inprogress', 'running', 'active'].includes(statusType)
+            || turns.some((turn) => readNonEmptyString(asRecord(turn)?.status).toLowerCase() === 'inprogress')
+          const isInProgress = sessionActivity?.known
+            ? sessionActivity.inProgress
+            : projectionInProgress
+          const queueState = await readThreadQueueState()
+          const queueDepth = queueState[threadId]?.length ?? 0
+          const taskSnapshot = buildTaskSnapshotResponse(
+            threadId,
+            isInProgress,
+            queueDepth,
+            appServer.listPendingServerRequests(),
+            appServer.getStreamEvents(threadId, 40),
+            appServer.getStreamCursor(),
+            sessionActivity,
+            resolveTaskWriterClient(threadId, sessionActivity, appServer, threadBroker),
+          )
+          const readError = getErrorMessage(error, 'thread/read failed')
+          setJson(res, 200, {
+            threadId,
+            ...(snapshotThread
+              ? {
+                thread: { ...snapshotThread, turns },
+                conversationState: { turns },
+              }
+              : { conversationState: null }),
+            ownerClientId: null,
+            liveStateError: {
+              kind: 'readFailed',
+              message: readError,
+            },
+            isInProgress,
+            streamCursor: appServer.getStreamCursor(),
+            ...taskSnapshot,
+            ...(sessionActivity?.known
+              ? {
+                sessionActivityKnown: true,
+                sessionRevision: sessionActivity.revision,
+              }
+              : {}),
+          })
         }
         return
       }
@@ -9751,6 +10121,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       if (req.method === 'POST' && url.pathname === '/codex-api/thread-queue/enqueue') {
         const payload = asRecord(await readJsonBody(req))
         const threadId = readNonEmptyString(payload?.threadId)
+        const beforeMessageId = readNonEmptyString(payload?.beforeMessageId)
         const rawMessage = asRecord(payload?.message) ?? payload
         const messageId = readNonEmptyString(rawMessage?.id)
           || `web-${Date.now()}-${randomBytes(3).toString('hex')}`
@@ -9759,7 +10130,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           setJson(res, 400, { error: 'Missing threadId or valid queued message' })
           return
         }
-        const result = await enqueueThreadQueuedMessage(threadId, message)
+        const result = await enqueueThreadQueuedMessage(threadId, message, beforeMessageId)
         appServer.publishNotification('queue/updated', {
           threadId,
           messageId: message.id,
@@ -9771,6 +10142,51 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         setJson(res, 200, {
           queued: true,
           inserted: result.inserted,
+          data: result.state[threadId] ?? [],
+        })
+        return
+      }
+
+      if (req.method === 'POST' && (url.pathname === '/codex-api/thread-queue/remove' || url.pathname === '/codex-api/thread-queue/reorder')) {
+        const payload = asRecord(await readJsonBody(req))
+        const threadId = readNonEmptyString(payload?.threadId)
+        const messageId = readNonEmptyString(payload?.messageId)
+        const targetId = readNonEmptyString(payload?.targetId)
+        if (!threadId || !messageId || (url.pathname.endsWith('/reorder') && !targetId)) {
+          setJson(res, 400, { error: 'Missing threadId, messageId, or targetId' })
+          return
+        }
+
+        const result = await withThreadQueueStateUpdate<{ state: ThreadQueueState; changed: boolean }>((state) => {
+          const queue = state[threadId] ?? []
+          const fromIndex = queue.findIndex((message) => message.id === messageId)
+          if (fromIndex < 0) return { nextState: state, result: { state, changed: false } }
+
+          if (url.pathname.endsWith('/remove')) {
+            const nextQueue = queue.filter((message) => message.id !== messageId)
+            const nextState = { ...state }
+            if (nextQueue.length > 0) nextState[threadId] = nextQueue
+            else delete nextState[threadId]
+            return { nextState, result: { state: nextState, changed: true } }
+          }
+
+          const targetIndex = queue.findIndex((message) => message.id === targetId)
+          if (targetIndex < 0 || targetIndex === fromIndex) return { nextState: state, result: { state, changed: false } }
+          const nextQueue = [...queue]
+          const [moved] = nextQueue.splice(fromIndex, 1)
+          nextQueue.splice(targetIndex, 0, moved)
+          const nextState = { ...state, [threadId]: nextQueue }
+          return { nextState, result: { state: nextState, changed: true } }
+        })
+        appServer.publishNotification('queue/updated', {
+          threadId,
+          messageId,
+          queueDepth: result.state[threadId]?.length ?? 0,
+          status: url.pathname.endsWith('/remove') ? 'removed' : 'reordered',
+          atIso: new Date().toISOString(),
+        })
+        setJson(res, 200, {
+          changed: result.changed,
           data: result.state[threadId] ?? [],
         })
         return

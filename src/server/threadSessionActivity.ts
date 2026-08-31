@@ -15,6 +15,10 @@ export type ThreadSessionActivity = {
   turnId: string
   /** Turn identified by the most recent terminal marker, when available. */
   terminalTurnId: string
+  /** Terminal outcome recorded by the session writer, when known. */
+  terminalState?: 'completed' | 'failed' | 'canceled' | ''
+  /** Human-readable failure reason recorded alongside a failed marker. */
+  terminalError?: string
   lastEventAt: number | null
   /** Stable marker for the observed file revision (size/mtime/last event). */
   revision: string
@@ -58,6 +62,13 @@ function readString(record: Record<string, unknown> | null, ...keys: string[]): 
   return ''
 }
 
+function readErrorMessage(value: unknown): string {
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const record = value as Record<string, unknown>
+  return readString(record, 'message', 'reason', 'detail') || readErrorMessage(record.error)
+}
+
 function readTimestamp(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) {
     // Codex event timestamps are normally ISO strings, but tolerate epoch
@@ -94,6 +105,8 @@ function unknownActivity(revision = ''): ThreadSessionActivity {
     inProgress: false,
     turnId: '',
     terminalTurnId: '',
+    terminalState: '',
+    terminalError: '',
     lastEventAt: null,
     revision,
   }
@@ -108,6 +121,8 @@ function parseSessionActivity(
     inProgress: false,
     turnId: '',
     terminalTurnId: '',
+    terminalState: '',
+    terminalError: '',
     lastEventAt: null,
   }
   for (const line of raw.split(/\r?\n/u)) {
@@ -136,16 +151,27 @@ function parseSessionActivity(
         inProgress: true,
         turnId: readString(event, 'turn_id', 'turnId'),
         terminalTurnId: '',
+        terminalState: '',
+        terminalError: '',
         lastEventAt: eventAt,
       }
       continue
     }
     if (TERMINAL_EVENT_TYPES.has(eventType)) {
+      const eventStatus = readString(event, 'status', 'state').toLowerCase()
+      const eventError = readErrorMessage(event.error) || readErrorMessage(event)
+      const terminalState = eventType === 'task_failed' || eventStatus === 'failed' || Boolean(eventError)
+        ? 'failed'
+        : eventType === 'turn_aborted' || eventStatus === 'interrupted' || eventStatus === 'canceled' || eventStatus === 'cancelled'
+          ? 'canceled'
+          : 'completed'
       activity = {
         known: true,
         inProgress: false,
         turnId: '',
         terminalTurnId: readString(event, 'turn_id', 'turnId') || activity.turnId,
+        terminalState,
+        terminalError: terminalState === 'failed' ? eventError : '',
         lastEventAt: eventAt ?? activity.lastEventAt,
       }
     }

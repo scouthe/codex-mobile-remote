@@ -51,7 +51,49 @@ describe('thread session activity', () => {
       { timestamp: '2026-08-31T01:00:10.000Z', type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'turn-1' } },
     ])
 
-    await expect(readThreadSessionActivity(path)).resolves.toMatchObject({ known: true, inProgress: false })
+    await expect(readThreadSessionActivity(path)).resolves.toMatchObject({
+      known: true,
+      inProgress: false,
+      terminalState: 'canceled',
+      terminalTurnId: 'turn-1',
+    })
+  })
+
+  it('preserves a failed terminal marker and its error for observers', async () => {
+    const path = await makeSession([
+      { timestamp: '2026-08-31T01:00:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } },
+      {
+        timestamp: '2026-08-31T01:00:10.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_failed', turn_id: 'turn-1', error: { message: 'provider unavailable' } },
+      },
+    ])
+
+    await expect(readThreadSessionActivity(path)).resolves.toMatchObject({
+      known: true,
+      inProgress: false,
+      terminalState: 'failed',
+      terminalError: 'provider unavailable',
+      terminalTurnId: 'turn-1',
+    })
+  })
+
+  it('treats a task_complete marker with an embedded failure as failed', async () => {
+    const path = await makeSession([
+      { timestamp: '2026-08-31T01:00:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1' } },
+      {
+        timestamp: '2026-08-31T01:00:10.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'turn-1', status: 'failed', reason: 'upstream timeout' },
+      },
+    ])
+
+    await expect(readThreadSessionActivity(path)).resolves.toMatchObject({
+      known: true,
+      inProgress: false,
+      terminalState: 'failed',
+      terminalError: 'upstream timeout',
+    })
   })
 
   it('distinguishes an unreadable activity marker from an explicit idle marker', async () => {

@@ -612,6 +612,19 @@ function toUiThread(summary: Thread): UiThread {
     rawSummary.worktreePath !== undefined ||
     comparableCwd.includes('/.codex/worktrees/') ||
     comparableCwd.includes('/.git/worktrees/')
+  const taskStates = new Set<NonNullable<UiThread['taskState']>>([
+    'queued', 'starting', 'running', 'waiting_approval', 'waiting_user_input',
+    'steering', 'completed', 'failed', 'canceled',
+  ])
+  const rawTaskState = typeof rawSummary.taskState === 'string' && taskStates.has(rawSummary.taskState as NonNullable<UiThread['taskState']>)
+    ? rawSummary.taskState as NonNullable<UiThread['taskState']>
+    : undefined
+  const taskError = typeof rawSummary.taskError === 'string' && rawSummary.taskError.trim().length > 0
+    ? rawSummary.taskError.trim()
+    : undefined
+  const terminalTurnId = typeof rawSummary.terminalTurnId === 'string' && rawSummary.terminalTurnId.trim().length > 0
+    ? rawSummary.terminalTurnId.trim()
+    : undefined
 
   return {
     id: summary.id,
@@ -626,6 +639,9 @@ function toUiThread(summary: Thread): UiThread {
     inProgress: readThreadInProgress(summary),
     ...(activityMarker.revision ? { sessionRevision: activityMarker.revision } : {}),
     ...(activityMarker.known ? { sessionActivityKnown: true } : {}),
+    ...(rawTaskState ? { taskState: rawTaskState } : {}),
+    ...(taskError ? { taskError } : {}),
+    ...(terminalTurnId ? { terminalTurnId } : {}),
   }
 }
 

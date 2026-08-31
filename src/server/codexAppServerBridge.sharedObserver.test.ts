@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createServer as createHttpServer, type Server } from 'node:http'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from './httpServer.js'
@@ -12,6 +12,7 @@ type RpcCall = { method: string; params: unknown }
 function installFakeSharedBridge(options: {
   blockResume?: boolean
   failFirstTurnStart?: boolean
+  failThreadRead?: boolean
   rejectDuplicateResume?: boolean
   rejectResumeWithActiveWriter?: boolean
   threadListResult?: unknown
@@ -48,6 +49,7 @@ function installFakeSharedBridge(options: {
         return { turn: { id: 'turn-2' } }
       }
       if (method === 'thread/read') {
+        if (options.failThreadRead) throw new Error('app-server unavailable')
         const configured = options.threadReadResults?.[threadReadCalls]
         threadReadCalls += 1
         return configured ?? options.threadReadResults?.at(-1) ?? { thread: { id: 'shared-thread', turns: [] } }
@@ -70,6 +72,7 @@ function installFakeSharedBridge(options: {
     getThreadSummarySnapshot: () => null,
     getSessionActivityReader: () => appServer.sessionActivityReader,
     storeThreadReadSnapshot: () => undefined,
+    getLastThreadReadSnapshot: () => null,
     mergeItemsIntoTurns: (_threadId: string, turns: unknown[]) => turns,
     getCachedLiveState: () => null,
     cacheLiveState: () => { cacheLiveStateCalls += 1 },
@@ -130,6 +133,59 @@ afterEach(() => {
 })
 
 describe('shared thread observer HTTP path', () => {
+  it('serializes queue remove and reorder mutations from concurrent clients', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-'))
+    const previousCodexHome = process.env.CODEX_HOME
+    process.env.CODEX_HOME = directory
+    await writeFile(join(directory, '.codex-global-state.json'), JSON.stringify({
+      'thread-queue-state': {
+        'queue-thread': [
+          { id: 'q-a', text: 'a', imageUrls: [], skills: [], fileAttachments: [], collaborationMode: 'default', createdAtIso: '2026-08-31T00:00:00.000Z', sourceClientId: 'a', status: 'queued', attempts: 0, lastError: '' },
+          { id: 'q-b', text: 'b', imageUrls: [], skills: [], fileAttachments: [], collaborationMode: 'default', createdAtIso: '2026-08-31T00:00:01.000Z', sourceClientId: 'b', status: 'queued', attempts: 0, lastError: '' },
+          { id: 'q-c', text: 'c', imageUrls: [], skills: [], fileAttachments: [], collaborationMode: 'default', createdAtIso: '2026-08-31T00:00:02.000Z', sourceClientId: 'c', status: 'queued', attempts: 0, lastError: '' },
+        ],
+      },
+    }), 'utf8')
+    const fake = installFakeSharedBridge()
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const endpoint = `http://127.0.0.1:${address.port}`
+      await Promise.all([
+        fetch(`${endpoint}/codex-api/thread-queue/remove`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ threadId: 'queue-thread', messageId: 'q-b' }),
+        }),
+        fetch(`${endpoint}/codex-api/thread-queue/reorder`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ threadId: 'queue-thread', messageId: 'q-c', targetId: 'q-a' }),
+        }),
+      ])
+
+      const response = await fetch(`${endpoint}/codex-api/thread-queue-state`)
+      expect(response.status).toBe(200)
+      const payload = await response.json() as { data?: Record<string, Array<{ id: string }>> }
+      expect(payload.data?.['queue-thread']?.map((row) => row.id)).toEqual(['q-c', 'q-a'])
+      const persisted = JSON.parse(await readFile(join(directory, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>
+      expect(persisted['thread-queue-state']).toBeDefined()
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = previousCodexHome
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('adds an active status when a desktop-owned session is still running', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-bridge-'))
     const sessionPath = join(directory, 'rollout-shared-thread.jsonl')
@@ -182,6 +238,7 @@ describe('shared thread observer HTTP path', () => {
       const livePayload = await liveResponse.json() as Record<string, unknown>
       expect(livePayload).toMatchObject({
         taskState: 'running',
+        activeTurnId: 'turn-1',
         queueDepth: 0,
         activeRequest: null,
         writerClient: expect.objectContaining({ clientType: 'desktop', label: 'Desktop' }),
@@ -251,6 +308,31 @@ describe('shared thread observer HTTP path', () => {
       instance.dispose()
       fake.restore()
       await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('does not convert a transient live-state read failure into a failed task', async () => {
+    const fake = installFakeSharedBridge({ failThreadRead: true })
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/thread-live-state?threadId=unavailable-thread`)
+      expect(response.status).toBe(200)
+      const payload = await response.json() as Record<string, unknown>
+      expect(payload.liveStateError).toMatchObject({ message: 'app-server unavailable' })
+      expect(payload.taskState).toBe('completed')
+      expect(payload.error).toBeNull()
+      expect(payload.isInProgress).toBe(false)
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
     }
   })
 
