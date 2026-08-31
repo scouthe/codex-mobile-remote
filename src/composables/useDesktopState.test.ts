@@ -1134,8 +1134,8 @@ describe('thread selection latency', () => {
     gatewayMocks.getThreadDetail
       .mockResolvedValueOnce({
         messages: [
-          { id: 'older', role: 'assistant', text: 'older history', messageType: 'agentMessage' },
-          { id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage' },
+          { id: 'older', role: 'assistant', text: 'older history', messageType: 'agentMessage', turnIndex: 0 },
+          { id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage', turnIndex: 1 },
         ],
         inProgress: false,
         activeTurnId: '',
@@ -1143,7 +1143,7 @@ describe('thread selection latency', () => {
         turnIndexByTurnId: {},
       })
       .mockResolvedValueOnce({
-        messages: [{ id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage' }],
+        messages: [{ id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage', turnIndex: 1 }],
         inProgress: false,
         activeTurnId: '',
         hasMoreOlder: true,
@@ -1161,9 +1161,9 @@ describe('thread selection latency', () => {
   it('keeps full history when an event refresh uses a bounded live tail', async () => {
     installTestWindow()
     gatewayMocks.getThreadDetail.mockResolvedValue({
-      messages: [
-        { id: 'older', role: 'assistant', text: 'older history', messageType: 'agentMessage' },
-        { id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage' },
+        messages: [
+          { id: 'older', role: 'assistant', text: 'older history', messageType: 'agentMessage', turnIndex: 0 },
+          { id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage', turnIndex: 1 },
       ],
       inProgress: false,
       activeTurnId: '',
@@ -1171,7 +1171,7 @@ describe('thread selection latency', () => {
       turnIndexByTurnId: {},
     })
     gatewayMocks.getThreadLiveState.mockResolvedValue({
-      messages: [{ id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage' }],
+      messages: [{ id: 'newer', role: 'assistant', text: 'newer history', messageType: 'agentMessage', turnIndex: 1 }],
       inProgress: false,
       activeTurnId: '',
       hasMoreOlder: true,
@@ -1188,6 +1188,36 @@ describe('thread selection latency', () => {
     await state.loadMessages('live-tail-thread', { force: true, preferLiveState: true })
 
     expect(state.messages.value.map((message) => message.text)).toEqual(['older history', 'newer history'])
+  })
+
+  it('removes rows omitted from the indexed partial window while keeping older turns', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail
+      .mockResolvedValueOnce({
+        messages: [
+          { id: 'old', role: 'assistant', text: 'old history', messageType: 'agentMessage', turnIndex: 0 },
+          { id: 'kept', role: 'assistant', text: 'kept history', messageType: 'agentMessage', turnIndex: 1 },
+          { id: 'removed', role: 'assistant', text: 'rolled back', messageType: 'agentMessage', turnIndex: 2 },
+        ],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+      })
+      .mockResolvedValueOnce({
+        messages: [{ id: 'kept', role: 'assistant', text: 'kept history', messageType: 'agentMessage', turnIndex: 1 }],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: true,
+        turnIndexByTurnId: {},
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('partial-window-thread')
+    await state.loadMessages('partial-window-thread', { force: true, fast: false })
+    await state.loadMessages('partial-window-thread', { force: true, fast: false })
+
+    expect(state.messages.value.map((message) => message.text)).toEqual(['old history', 'kept history'])
   })
 
   it('ignores late item and completion events from an older turn', async () => {
