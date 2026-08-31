@@ -682,6 +682,73 @@ describe('shared session activity polling', () => {
     expect(state.messages.value.map((message) => message.text)).toEqual(['final answer'])
   })
 
+  it('clears completed non-selected threads from the sidebar immediately', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{
+          projectName: 'Project',
+          threads: [
+            activityThread('selected-thread', true, 'selected-r1'),
+            activityThread('background-thread', true, 'background-r1'),
+          ],
+        }],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        groups: [{
+          projectName: 'Project',
+          threads: [
+            activityThread('selected-thread', false, 'selected-r2'),
+            activityThread('background-thread', false, 'background-r2'),
+          ],
+        }],
+        nextCursor: null,
+      })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [{ id: 'partial', role: 'assistant', text: 'partial', messageType: 'agentMessage' }],
+      inProgress: true,
+      activeTurnId: 'turn-1',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.getThreadLiveState
+      .mockResolvedValueOnce({
+        messages: [{ id: 'partial', role: 'assistant', text: 'partial', messageType: 'agentMessage' }],
+        inProgress: true,
+        activeTurnId: 'turn-1',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        sessionActivityKnown: true,
+        sessionRevision: 'selected-r1',
+      })
+      .mockResolvedValueOnce({
+        messages: [{ id: 'final', role: 'assistant', text: 'final', messageType: 'agentMessage' }],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        sessionActivityKnown: true,
+        sessionRevision: 'selected-r2',
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('selected-thread')
+
+    await state.syncThreadStatus()
+    expect(state.projectGroups.value[0]?.threads.map((thread) => [thread.id, thread.inProgress])).toEqual([
+      ['selected-thread', true],
+      ['background-thread', true],
+    ])
+
+    await state.syncThreadStatus()
+
+    expect(state.projectGroups.value[0]?.threads.map((thread) => [thread.id, thread.inProgress])).toEqual([
+      ['selected-thread', false],
+      ['background-thread', false],
+    ])
+  })
+
   it('uses a changed session revision to refresh once and reuses the stable result', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage
@@ -846,6 +913,31 @@ describe('shared session activity polling', () => {
     expect(setIntervalMock).toHaveBeenCalledTimes(2)
 
     state.stopPolling()
+  })
+})
+
+describe('thread selection latency', () => {
+  it('does not block the message view on ancillary model refresh', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [{ id: 'message-1', role: 'assistant', text: 'ready', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.getCurrentModelConfig.mockImplementation(() => new Promise(() => {}))
+
+    const state = useDesktopState()
+    const result = await Promise.race([
+      state.selectThread('fast-thread').then(() => 'selected'),
+      new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 50)),
+    ])
+
+    expect(result).toBe('selected')
+    expect(state.messages.value.map((message) => message.text)).toEqual(['ready'])
   })
 })
 
