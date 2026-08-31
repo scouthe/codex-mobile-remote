@@ -146,6 +146,13 @@ describe('shared thread observer HTTP path', () => {
           turns: [],
         }],
       },
+      threadReadResults: [{
+        thread: {
+          id: 'shared-thread',
+          path: sessionPath,
+          turns: [],
+        },
+      }],
     })
     const instance = createServer()
     const server = await new Promise<Server>((resolve) => {
@@ -167,6 +174,16 @@ describe('shared thread observer HTTP path', () => {
       expect(payload.result?.data?.[0]).toMatchObject({
         inProgress: true,
         status: { type: 'inProgress' },
+      })
+
+      const liveResponse = await fetch(`http://127.0.0.1:${address.port}/codex-api/thread-live-state?threadId=shared-thread`)
+      expect(liveResponse.status).toBe(200)
+      const livePayload = await liveResponse.json() as Record<string, unknown>
+      expect(livePayload).toMatchObject({
+        taskState: 'running',
+        queueDepth: 0,
+        activeRequest: null,
+        writerClient: null,
       })
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
