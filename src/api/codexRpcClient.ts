@@ -34,9 +34,10 @@ export function getTaskClientHeaders(): Record<string, string> {
     clientId = `web-${Math.random().toString(36).slice(2, 10)}`
     window.localStorage.setItem(TASK_CLIENT_ID_KEY, clientId)
   }
+  const userAgent = typeof navigator !== 'undefined' ? navigator.userAgent : ''
   return {
     'x-codex-client-id': clientId,
-    'x-codex-client-type': /android|mobile/i.test(navigator.userAgent) ? 'android' : 'desktop',
+    'x-codex-client-type': /android|mobile/i.test(userAgent) ? 'android' : 'desktop',
   }
 }
 
