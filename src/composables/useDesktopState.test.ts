@@ -621,6 +621,234 @@ describe('startup request deduplication', () => {
   })
 })
 
+describe('shared session activity polling', () => {
+  function activityThread(
+    id: string,
+    inProgress: boolean,
+    revision: string,
+    updatedAtIso = '2026-04-28T00:00:00.000Z',
+  ) {
+    return {
+      ...thread(id, '/tmp/project'),
+      inProgress,
+      sessionActivityKnown: true,
+      sessionRevision: revision,
+      updatedAtIso,
+    }
+  }
+
+  it('refreshes final messages when a desktop-owned session changes active to idle', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [activityThread('shared-thread', true, 'r1')] }],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [activityThread('shared-thread', false, 'r2')] }],
+        nextCursor: null,
+      })
+    gatewayMocks.getThreadLiveState
+      .mockResolvedValueOnce({
+        messages: [{ id: 'partial', role: 'assistant', text: 'partial', messageType: 'agentMessage' }],
+        inProgress: true,
+        activeTurnId: 'turn-1',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        sessionActivityKnown: true,
+        sessionRevision: 'r1',
+      })
+      .mockResolvedValueOnce({
+        messages: [{ id: 'final', role: 'assistant', text: 'final answer', messageType: 'agentMessage' }],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        sessionActivityKnown: true,
+        sessionRevision: 'r2',
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('shared-thread')
+
+    await state.syncThreadStatus()
+    expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(true)
+    expect(state.messages.value.map((message) => message.text)).toEqual(['partial'])
+
+    await state.syncThreadStatus()
+
+    expect(gatewayMocks.getThreadLiveState).toHaveBeenCalledTimes(2)
+    expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(false)
+    expect(state.messages.value.map((message) => message.text)).toEqual(['final answer'])
+  })
+
+  it('uses a changed session revision to refresh once and reuses the stable result', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [activityThread('shared-thread', false, 'r1')] }],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [activityThread('shared-thread', false, 'r2')] }],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [activityThread('shared-thread', false, 'r2')] }],
+        nextCursor: null,
+      })
+    gatewayMocks.getThreadLiveState
+      .mockResolvedValueOnce({
+        messages: [{ id: 'first', role: 'assistant', text: 'first', messageType: 'agentMessage' }],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        sessionActivityKnown: true,
+        sessionRevision: 'r1',
+      })
+      .mockResolvedValueOnce({
+        messages: [{ id: 'second', role: 'assistant', text: 'second', messageType: 'agentMessage' }],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        sessionActivityKnown: true,
+        sessionRevision: 'r2',
+      })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('shared-thread')
+
+    await state.syncThreadStatus()
+    await state.syncThreadStatus()
+    await state.syncThreadStatus()
+
+    expect(gatewayMocks.getThreadLiveState).toHaveBeenCalledTimes(2)
+    expect(state.messages.value.map((message) => message.text)).toEqual(['second'])
+  })
+
+  it('detects an idle row even when an older bridge omits activity metadata', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [{ ...thread('legacy-thread', '/tmp/project'), inProgress: true }] }],
+        nextCursor: null,
+      })
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [{ ...thread('legacy-thread', '/tmp/project'), inProgress: false }] }],
+        nextCursor: null,
+      })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [{ id: 'final', role: 'assistant', text: 'final', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('legacy-thread')
+    await state.syncThreadStatus()
+    await state.syncThreadStatus()
+
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('legacy-thread')
+    expect(state.projectGroups.value[0]?.threads[0]?.inProgress).toBe(false)
+  })
+
+  it('retries the live snapshot after a diagnostic fallback instead of consuming the revision', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage
+      .mockResolvedValueOnce({
+        groups: [{ projectName: 'Project', threads: [activityThread('shared-thread', true, 'r1')] }],
+        nextCursor: null,
+      })
+      .mockResolvedValue({
+        groups: [{ projectName: 'Project', threads: [activityThread('shared-thread', false, 'r2')] }],
+        nextCursor: null,
+      })
+    gatewayMocks.getThreadLiveState
+      .mockResolvedValueOnce({
+        messages: [{ id: 'partial', role: 'assistant', text: 'partial', messageType: 'agentMessage' }],
+        inProgress: true,
+        activeTurnId: 'turn-1',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        sessionActivityKnown: true,
+        sessionRevision: 'r1',
+      })
+      .mockResolvedValueOnce({
+        messages: [],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        sessionActivityKnown: true,
+        sessionRevision: 'r2',
+        liveStateError: 'app-server unavailable',
+      })
+      .mockResolvedValueOnce({
+        messages: [{ id: 'final', role: 'assistant', text: 'final answer', messageType: 'agentMessage' }],
+        inProgress: false,
+        activeTurnId: '',
+        hasMoreOlder: false,
+        turnIndexByTurnId: {},
+        sessionActivityKnown: true,
+        sessionRevision: 'r2',
+      })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [{ id: 'partial', role: 'assistant', text: 'partial', messageType: 'agentMessage' }],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('shared-thread')
+
+    await state.syncThreadStatus()
+    await state.syncThreadStatus()
+    expect(state.messages.value.map((message) => message.text)).toEqual(['partial'])
+
+    await state.syncThreadStatus()
+
+    expect(gatewayMocks.getThreadLiveState).toHaveBeenCalledTimes(3)
+    expect(state.messages.value.map((message) => message.text)).toEqual(['final answer'])
+  })
+
+  it('clears and recreates the status poll timer with the polling lifecycle', async () => {
+    installTestWindow()
+    const setIntervalMock = vi.fn(() => 17)
+    const clearIntervalMock = vi.fn()
+    const unsubscribe = vi.fn()
+    Object.assign(window, {
+      setInterval: setIntervalMock,
+      clearInterval: clearIntervalMock,
+    })
+    gatewayMocks.subscribeCodexNotifications.mockReturnValue(unsubscribe)
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
+
+    const state = useDesktopState()
+    state.startPolling()
+    await Promise.resolve()
+
+    expect(setIntervalMock).toHaveBeenCalledWith(expect.any(Function), 1500)
+    expect(setIntervalMock).toHaveBeenCalledTimes(1)
+
+    state.stopPolling()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(clearIntervalMock).toHaveBeenCalledWith(17)
+
+    state.startPolling()
+    await Promise.resolve()
+    expect(setIntervalMock).toHaveBeenCalledTimes(2)
+
+    state.stopPolling()
+  })
+})
+
 describe('live error overlay', () => {
   it('loads an existing thread through read-only detail without resuming it', async () => {
     installTestWindow()

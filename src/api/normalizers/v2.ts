@@ -558,6 +558,14 @@ function isTurnInProgress(turn: Turn | null | undefined): boolean {
 
 function readThreadInProgress(summary: Thread): boolean {
   const rawSummary = summary as Record<string, unknown>
+  // The bridge's session activity marker is an observation of the shared
+  // on-disk session and is therefore authoritative when present.  In
+  // particular, an explicit `false` must win over a stale in-progress turn
+  // left in the app-server projection.  Checking only `=== true` here would
+  // turn a completed external session back into an active one.
+  if (rawSummary.sessionActivityKnown === true && typeof rawSummary.inProgress === 'boolean') {
+    return rawSummary.inProgress
+  }
   if (rawSummary.inProgress === true) return true
   if (rawSummary.status === 'inProgress' || rawSummary.turnStatus === 'inProgress') return true
   const status = rawSummary.status
@@ -571,8 +579,30 @@ function readThreadInProgress(summary: Thread): boolean {
   return isTurnInProgress(lastTurn)
 }
 
+/**
+ * Read the optional session activity marker added by the codexapp bridge.
+ * App-server DTOs intentionally do not model these fields, so keep this
+ * extraction tolerant of both the current name and the older `revision`
+ * spelling used by early bridge builds.
+ */
+function readSessionActivityMarker(summary: Thread): { revision?: string; known?: boolean } {
+  const rawSummary = summary as unknown as Record<string, unknown>
+  const rawRevision = rawSummary.sessionRevision ?? rawSummary.revision
+  const revision = typeof rawRevision === 'string'
+    ? rawRevision.trim()
+    : typeof rawRevision === 'number' && Number.isFinite(rawRevision)
+      ? String(rawRevision)
+      : ''
+  const known = rawSummary.sessionActivityKnown === true
+  return {
+    ...(revision ? { revision } : {}),
+    ...(known ? { known: true } : {}),
+  }
+}
+
 function toUiThread(summary: Thread): UiThread {
   const rawSummary = summary as Record<string, unknown>
+  const activityMarker = readSessionActivityMarker(summary)
   const cwd = normalizePathForUi(typeof rawSummary.cwd === 'string' ? rawSummary.cwd : summary.cwd)
   const comparableCwd = normalizePathForComparison(cwd)
   const hasWorktree =
@@ -594,6 +624,8 @@ function toUiThread(summary: Thread): UiThread {
     preview: summary.preview,
     unread: false,
     inProgress: readThreadInProgress(summary),
+    ...(activityMarker.revision ? { sessionRevision: activityMarker.revision } : {}),
+    ...(activityMarker.known ? { sessionActivityKnown: true } : {}),
   }
 }
 
@@ -659,6 +691,10 @@ export function normalizeThreadMessagesV2(payload: ThreadReadResponse, baseTurnI
 }
 
 export function readThreadInProgressFromResponse(payload: ThreadReadResponse): boolean {
+  const rawThread = payload.thread as unknown as Record<string, unknown>
+  if (rawThread.sessionActivityKnown === true && typeof rawThread.inProgress === 'boolean') {
+    return rawThread.inProgress
+  }
   if (readThreadInProgress(payload.thread)) return true
   const turns = Array.isArray(payload.thread.turns) ? payload.thread.turns : []
   return isTurnInProgress(turns.at(-1))

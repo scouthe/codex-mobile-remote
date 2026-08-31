@@ -42,6 +42,7 @@ import { handleZenProxyRequest } from './zenProxy.js'
 import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { ThreadSessionBroker } from './threadSessionBroker.js'
+import { ThreadSessionActivityReader, type ThreadSessionActivity } from './threadSessionActivity.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
@@ -230,6 +231,10 @@ const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 
 const THREAD_RESPONSE_TURN_LIMIT = 10
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
+// A desktop app-server can append the terminal session marker before its
+// thread/read projection is flushed.  Give that projection a short,
+// read-only grace period before serving/caching an idle snapshot.
+const THREAD_LIVE_STATE_PROJECTION_RETRY_DELAYS_MS = [120, 240, 480] as const
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
 const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
 const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
@@ -1035,6 +1040,25 @@ function mergeStreamTurnErrorsIntoThreadResult(appServer: AppServerProcess, resu
       turns: mergedTurns,
     },
   }
+}
+
+/**
+ * Read a thread for an observer endpoint without returning the entire
+ * rollout.  The public /codex-api/rpc thread/read path applies the same
+ * recent-turn limit, but this helper is also used by /thread-live-state,
+ * whose internal app-server call otherwise bypasses that limit and can
+ * produce tens of megabytes for a long-running session.
+ */
+async function readThreadSnapshotForObserver(
+  appServer: AppServerProcess,
+  threadId: string,
+): Promise<unknown> {
+  const rawResult = await appServer.rpc('thread/read', {
+    threadId,
+    includeTurns: true,
+  })
+  const trimmedResult = trimThreadTurnsInRpcResult('thread/read', rawResult)
+  return mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
 }
 
 const warnedCodexAuthReadFailures = new Set<string>()
@@ -1868,6 +1892,366 @@ function mergeImportedThreadsIntoThreadListResult(result: unknown): unknown {
       return bUpdated - aUpdated
     }),
   }
+}
+
+async function mergeSessionActivityIntoThreadListResult(
+  result: unknown,
+  activityReader: ThreadSessionActivityReader,
+): Promise<unknown> {
+  const record = asRecord(result)
+  const data = Array.isArray(record?.data) ? record.data : null
+  if (!record || !data || data.length === 0) return result
+
+  // Keep filesystem work bounded.  A thread list page can contain 100 rows,
+  // and each session tail may be several megabytes while a task is producing
+  // tool output.  Duplicate paths are read only once per request.
+  const activityByPath = new Map<string, ThreadSessionActivity>()
+  const paths = Array.from(new Set(data
+    .map((item) => readNonEmptyString(asRecord(item)?.path))
+    .filter((path): path is string => Boolean(path && isAbsolute(path)))))
+  const batchSize = 8
+  for (let index = 0; index < paths.length; index += batchSize) {
+    const batch = paths.slice(index, index + batchSize)
+    const activities = await Promise.all(batch.map((path) => activityReader.read(path)))
+    batch.forEach((path, batchIndex) => activityByPath.set(path, activities[batchIndex]))
+  }
+
+  let changed = false
+  const mergedData = data.map((item) => {
+    const itemRecord = asRecord(item)
+    if (!itemRecord) return item
+    const path = readNonEmptyString(itemRecord.path)
+    const activity = path ? activityByPath.get(path) : undefined
+    if (!activity?.known) return item
+
+    const currentStatus = asRecord(itemRecord.status)
+    const currentStatusType = readNonEmptyString(currentStatus?.type)
+    const nextStatusType = activity.inProgress ? 'inProgress' : 'idle'
+    const alreadyMatches = currentStatusType === nextStatusType
+      && itemRecord.inProgress === activity.inProgress
+      && itemRecord.sessionRevision === activity.revision
+      && itemRecord.sessionActivityKnown === true
+    if (alreadyMatches) return item
+    changed = true
+    return {
+      ...itemRecord,
+      inProgress: activity.inProgress,
+      status: { ...currentStatus, type: nextStatusType },
+      sessionActivityKnown: true,
+      sessionRevision: activity.revision,
+    }
+  })
+
+  return changed ? { ...record, data: mergedData } : result
+}
+
+async function mergeSessionActivityIntoThreadResult(
+  result: unknown,
+  activityReader: ThreadSessionActivityReader,
+  activityOverride?: ThreadSessionActivity,
+): Promise<unknown> {
+  const record = asRecord(result)
+  const thread = asRecord(record?.thread)
+  const path = readNonEmptyString(thread?.path)
+  if (!record || !thread || !path || !isAbsolute(path)) return result
+
+  const activity = activityOverride ?? await activityReader.read(path)
+  if (!activity.known) return result
+
+  const currentStatus = asRecord(thread.status)
+  const currentStatusType = readNonEmptyString(currentStatus?.type)
+  const nextStatusType = activity.inProgress ? 'inProgress' : 'idle'
+  const alreadyMatches = currentStatusType === nextStatusType
+    && thread.inProgress === activity.inProgress
+    && thread.sessionRevision === activity.revision
+    && thread.sessionActivityKnown === true
+    && record.sessionRevision === activity.revision
+  if (alreadyMatches) return result
+  return {
+    ...record,
+    sessionActivityKnown: true,
+    sessionRevision: activity.revision,
+    thread: {
+      ...thread,
+      inProgress: activity.inProgress,
+      status: { ...currentStatus, type: nextStatusType },
+      sessionActivityKnown: true,
+      sessionRevision: activity.revision,
+    },
+  }
+}
+
+type SessionProjectionFallback = {
+  turnId: string
+  items: Record<string, unknown>[]
+}
+
+function readThreadTurns(result: unknown): unknown[] {
+  const record = asRecord(result)
+  const thread = asRecord(record?.thread)
+  return Array.isArray(thread?.turns) ? thread.turns : []
+}
+
+function readTurnStatusType(turn: unknown): string {
+  const turnRecord = asRecord(turn)
+  if (!turnRecord) return ''
+  if (typeof turnRecord.status === 'string') return turnRecord.status.trim()
+  return readNonEmptyString(asRecord(turnRecord.status)?.type)
+}
+
+function isProjectedTurnComplete(turn: unknown): boolean {
+  const status = readTurnStatusType(turn).toLowerCase()
+  return status.length > 0 && !['inprogress', 'running', 'active', 'in_progress'].includes(status)
+}
+
+function hasProjectedTerminalTurn(
+  result: unknown,
+  activity: ThreadSessionActivity,
+  baselineResult: unknown,
+): boolean {
+  const turns = readThreadTurns(result)
+  const baselineTurns = readThreadTurns(baselineResult)
+
+  if (activity.terminalTurnId) {
+    const terminalTurn = turns.find((turn) => readNonEmptyString(asRecord(turn)?.id) === activity.terminalTurnId)
+    // The app-server may expose a turn before assigning a status.  Treat a
+    // status-less turn as pending so we do not freeze an idle cache over it.
+    return Boolean(terminalTurn && isProjectedTurnComplete(terminalTurn))
+  }
+
+  // Older session formats do not include turn_id on terminal markers.  In
+  // that case, a projection is considered caught up once it has advanced
+  // beyond the initial snapshot or its previously active turn is complete.
+  if (turns.length > baselineTurns.length) return true
+  const baselineLast = baselineTurns.at(-1)
+  const currentLast = turns.at(-1)
+  const baselineWasActive = ['inprogress', 'running', 'active', 'in_progress'].includes(readTurnStatusType(baselineLast).toLowerCase())
+  return baselineWasActive && isProjectedTurnComplete(currentLast)
+}
+
+function extractSessionMessageText(content: unknown, fallbackText = ''): string {
+  const blocks = Array.isArray(content) ? content : []
+  const text = blocks
+    .map((block) => {
+      const blockRecord = asRecord(block)
+      if (!blockRecord) return ''
+      const type = readNonEmptyString(blockRecord.type)
+      if (type !== 'output_text' && type !== 'text' && type !== 'input_text') return ''
+      return typeof blockRecord.text === 'string' ? blockRecord.text : ''
+    })
+    .filter((value) => value.length > 0)
+    .join('\n')
+    .trim()
+  return text || fallbackText.trim()
+}
+
+function normalizeSessionUserContent(content: unknown): unknown[] {
+  if (!Array.isArray(content)) return []
+  return content.map((block) => {
+    const blockRecord = asRecord(block)
+    if (!blockRecord) return block
+    // Session logs use `input_text`; thread/read DTOs use `text` for the same
+    // user-visible block.  Normalize only this discriminator and preserve all
+    // other fields so attachments/metadata remain available to the client.
+    if (blockRecord.type === 'input_text') return { ...blockRecord, type: 'text' }
+    return block
+  })
+}
+
+function buildSessionProjectionFallback(
+  sessionLogRaw: string,
+  activity: ThreadSessionActivity,
+): SessionProjectionFallback | null {
+  let currentTurnId = ''
+  let latestTurnId = ''
+  const itemsByTurnId = new Map<string, Record<string, unknown>[]>()
+  const seenIdsByTurnId = new Map<string, Set<string>>()
+  const seenAssistantTextByTurnId = new Map<string, Set<string>>()
+
+  const addItem = (turnId: string, item: Record<string, unknown>, assistantText = '') => {
+    if (!turnId) return
+    const items = itemsByTurnId.get(turnId) ?? []
+    const ids = seenIdsByTurnId.get(turnId) ?? new Set<string>()
+    const itemId = readNonEmptyString(item.id)
+    if (itemId && ids.has(itemId)) return
+    if (itemId) ids.add(itemId)
+    if (assistantText) {
+      const texts = seenAssistantTextByTurnId.get(turnId) ?? new Set<string>()
+      if (texts.has(assistantText)) return
+      texts.add(assistantText)
+      seenAssistantTextByTurnId.set(turnId, texts)
+    }
+    items.push(item)
+    itemsByTurnId.set(turnId, items)
+    seenIdsByTurnId.set(turnId, ids)
+  }
+
+  for (const line of sessionLogRaw.split(/\r?\n/u)) {
+    if (!line.trim()) continue
+    let row: Record<string, unknown>
+    try {
+      const parsed = JSON.parse(line) as unknown
+      const record = asRecord(parsed)
+      if (!record) continue
+      row = record
+    } catch {
+      continue
+    }
+
+    const payload = asRecord(row.payload)
+    if (!payload) continue
+
+    if (row.type === 'turn_context') {
+      currentTurnId = readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId) || currentTurnId
+      if (currentTurnId) latestTurnId = currentTurnId
+      continue
+    }
+
+    if (row.type === 'event_msg') {
+      const eventType = readNonEmptyString(payload.type)
+      if (eventType === 'task_started' || eventType === 'turn_started') {
+        currentTurnId = readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId) || currentTurnId
+        if (currentTurnId) latestTurnId = currentTurnId
+      } else if (eventType === 'agent_message') {
+        const text = readNonEmptyString(payload.message)
+        if (text && currentTurnId) {
+          const suffix = `event-${itemsByTurnId.get(currentTurnId)?.length ?? 0}`
+          addItem(currentTurnId, {
+            id: readNonEmptyString(payload.id) || `${currentTurnId}-session-agent-${suffix}`,
+            type: 'agentMessage',
+            text,
+          }, text)
+        }
+      }
+      continue
+    }
+
+    if (row.type !== 'response_item' || !currentTurnId) continue
+    latestTurnId = currentTurnId
+    const itemType = readNonEmptyString(payload.type)
+    if (itemType !== 'message') continue
+    const role = readNonEmptyString(payload.role)
+    const payloadId = readNonEmptyString(payload.id)
+    const content = payload.content
+    if (role === 'assistant') {
+      const text = extractSessionMessageText(content, readNonEmptyString(payload.text))
+      if (!text) continue
+      const suffix = `message-${itemsByTurnId.get(currentTurnId)?.length ?? 0}`
+      addItem(currentTurnId, {
+        id: payloadId || `${currentTurnId}-session-agent-${suffix}`,
+        type: 'agentMessage',
+        text,
+      }, text)
+      continue
+    }
+    if (role === 'user') {
+      const normalizedContent = normalizeSessionUserContent(content)
+      if (normalizedContent.length === 0) continue
+      addItem(currentTurnId, {
+        id: payloadId || `${currentTurnId}-session-user-${itemsByTurnId.get(currentTurnId)?.length ?? 0}`,
+        type: 'userMessage',
+        content: normalizedContent,
+      })
+    }
+  }
+
+  const targetTurnId = activity.terminalTurnId || latestTurnId
+  if (!targetTurnId) return null
+  const items = itemsByTurnId.get(targetTurnId)
+  if (!items || items.length === 0) return null
+  return { turnId: targetTurnId, items }
+}
+
+function mergeSessionProjectionFallbackIntoTurns(
+  turns: unknown[],
+  fallback: SessionProjectionFallback,
+  markComplete: boolean,
+): { turns: unknown[]; changed: boolean } {
+  const targetIndex = turns.findIndex((turn) => readNonEmptyString(asRecord(turn)?.id) === fallback.turnId)
+  if (targetIndex < 0) {
+    return {
+      turns: [
+        ...turns,
+        {
+          id: fallback.turnId,
+          status: markComplete ? 'completed' : 'inProgress',
+          items: fallback.items,
+        },
+      ],
+      changed: true,
+    }
+  }
+
+  const existingTurn = asRecord(turns[targetIndex])
+  if (!existingTurn) return { turns, changed: false }
+  const existingItems = Array.isArray(existingTurn.items) ? (existingTurn.items as unknown[]) : []
+  const existingIds = new Set(existingItems
+    .map((item) => readNonEmptyString(asRecord(item)?.id))
+    .filter(Boolean))
+  const existingAssistantTexts = new Set(existingItems
+    .map((item) => {
+      const itemRecord = asRecord(item)
+      return itemRecord?.type === 'agentMessage' ? readNonEmptyString(itemRecord.text) : ''
+    })
+    .filter(Boolean))
+  const missingItems = fallback.items.filter((item) => {
+    const itemId = readNonEmptyString(item.id)
+    if (itemId && existingIds.has(itemId)) return false
+    const text = item.type === 'agentMessage' ? readNonEmptyString(item.text) : ''
+    if (text && existingAssistantTexts.has(text)) return false
+    return true
+  })
+  const nextStatus = markComplete ? 'completed' : existingTurn.status
+  const statusChanged = markComplete && readTurnStatusType(existingTurn) !== 'completed'
+  if (missingItems.length === 0 && !statusChanged) return { turns, changed: false }
+  const nextTurns = [...turns]
+  nextTurns[targetIndex] = {
+    ...existingTurn,
+    ...(markComplete ? { status: nextStatus } : {}),
+    ...(missingItems.length > 0 ? { items: [...existingItems, ...missingItems] } : {}),
+  }
+  return { turns: nextTurns, changed: true }
+}
+
+async function waitForThreadProjectionRetry(delayMs: number): Promise<void> {
+  if (delayMs <= 0) return
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+}
+
+async function readThreadWithProjectionRetry(
+  appServer: AppServerProcess,
+  threadId: string,
+  initialResult: unknown,
+  initialActivity: ThreadSessionActivity | null,
+  sessionPath: string,
+): Promise<{ result: unknown; activity: ThreadSessionActivity | null; projectionCaughtUp: boolean }> {
+  if (!initialActivity?.known || initialActivity.inProgress || !sessionPath || !isAbsolute(sessionPath)) {
+    return { result: initialResult, activity: initialActivity, projectionCaughtUp: true }
+  }
+  if (hasProjectedTerminalTurn(initialResult, initialActivity, initialResult)) {
+    return { result: initialResult, activity: initialActivity, projectionCaughtUp: true }
+  }
+
+  let result = initialResult
+  let activity = initialActivity
+  for (const delayMs of THREAD_LIVE_STATE_PROJECTION_RETRY_DELAYS_MS) {
+    await waitForThreadProjectionRetry(delayMs)
+    try {
+      // This path intentionally performs only thread/read.  In particular,
+      // an observer must never call thread/resume while another process owns
+      // the writer lock.
+      result = await readThreadSnapshotForObserver(appServer, threadId)
+    } catch {
+      continue
+    }
+    const nextActivity = await appServer.getSessionActivityReader().read(sessionPath)
+    if (nextActivity.known) activity = nextActivity
+    if (hasProjectedTerminalTurn(result, activity, initialResult)) {
+      return { result, activity, projectionCaughtUp: true }
+    }
+  }
+
+  return { result, activity, projectionCaughtUp: false }
 }
 
 async function collectProjectChatZipEntries(projectRoot: string): Promise<ProjectZipVirtualEntry[]> {
@@ -6469,7 +6853,13 @@ class AppServerProcess {
   private readonly threadTurnPageReadCacheByThreadId = new Map<string, { result: unknown; expiresAt: number }>()
   private readonly threadTurnPageReadPromiseByThreadId = new Map<string, Promise<unknown>>()
   private readonly capturedItemsByThreadId = new Map<string, Map<string, CapturedItem>>()
-  private readonly liveStateCache = new Map<string, { data: unknown; turnCount: number; sessionSize: number }>()
+  private readonly liveStateCache = new Map<string, {
+    data: unknown
+    turnCount: number
+    sessionSize: number
+    sessionRevision: string
+  }>()
+  private readonly sessionActivityReader = new ThreadSessionActivityReader()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
   private activeConfigSignature = ''
 
@@ -6716,6 +7106,10 @@ class AppServerProcess {
     return { events, truncated }
   }
 
+  getSessionActivityReader(): ThreadSessionActivityReader {
+    return this.sessionActivityReader
+  }
+
   storeThreadReadSnapshot(threadId: string, snapshot: unknown): void {
     this.lastThreadReadSnapshotByThreadId.set(threadId, snapshot)
     this.threadTurnPageReadCacheByThreadId.delete(threadId)
@@ -6751,14 +7145,37 @@ class AppServerProcess {
     return promise
   }
 
-  cacheLiveState(threadId: string, data: unknown, turnCount: number, sessionSize: number): void {
-    this.liveStateCache.set(threadId, { data, turnCount, sessionSize })
+  cacheLiveState(
+    threadId: string,
+    data: unknown,
+    turnCount: number,
+    sessionSize: number,
+    sessionRevision = '',
+  ): void {
+    // A cache entry without a session revision can hide a session written by
+    // another app-server process.  Only cache observations tied to a real
+    // file revision; callers with no readable session must always re-read.
+    if (!sessionRevision) {
+      this.liveStateCache.delete(threadId)
+      return
+    }
+    this.liveStateCache.set(threadId, { data, turnCount, sessionSize, sessionRevision })
   }
 
-  getCachedLiveState(threadId: string, turnCount: number, sessionSize: number): unknown | null {
+  getCachedLiveState(
+    threadId: string,
+    turnCount: number,
+    sessionSize: number,
+    sessionRevision = '',
+  ): unknown | null {
+    if (!sessionRevision) return null
     const cached = this.liveStateCache.get(threadId)
     if (!cached) return null
-    if (cached.turnCount !== turnCount || cached.sessionSize !== sessionSize) return null
+    if (
+      cached.turnCount !== turnCount
+      || cached.sessionSize !== sessionSize
+      || cached.sessionRevision !== sessionRevision
+    ) return null
     return cached.data
   }
 
@@ -8150,15 +8567,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 	            setJson(res, 200, { result: null })
 	            return
 	          }
-		          if (body.method === 'thread/read' && isEmptyThreadReadError(error)) {
-		            const params = asRecord(body.params)
-		            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
-		            const snapshot = threadId ? appServer.getLastThreadReadSnapshot(threadId) : null
-		            if (snapshot) {
-		              setJson(res, 200, { result: snapshot })
-		              return
-		            }
-		          }
+	          if (body.method === 'thread/read' && isEmptyThreadReadError(error)) {
+	            const params = asRecord(body.params)
+	            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
+	            const snapshot = threadId ? appServer.getLastThreadReadSnapshot(threadId) : null
+	            if (snapshot) {
+	              const mergedSnapshot = await mergeSessionActivityIntoThreadResult(
+                snapshot,
+                appServer.getSessionActivityReader(),
+              )
+	              setJson(res, 200, { result: mergedSnapshot })
+	              return
+	            }
+	          }
           if (body.method === 'thread/read' && isThreadMaterializationPendingError(error)) {
             const params = asRecord(body.params)
             const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
@@ -8182,9 +8603,12 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
           : trimmedResult
         const listMergedResult = body.method === 'thread/list'
-          ? mergeImportedThreadsIntoThreadListResult(errorMergedResult)
+          ? await mergeSessionActivityIntoThreadListResult(mergeImportedThreadsIntoThreadListResult(errorMergedResult), appServer.getSessionActivityReader())
           : errorMergedResult
-        const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, listMergedResult)
+        const activityMergedResult = body.method === 'thread/read' || body.method === 'thread/resume'
+          ? await mergeSessionActivityIntoThreadResult(listMergedResult, appServer.getSessionActivityReader())
+          : listMergedResult
+        const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, activityMergedResult)
         const result = THREAD_METHODS_WITH_TURNS.has(body.method)
           ? await mergeSessionSkillInputsIntoThreadResult(sanitizedResult)
           : sanitizedResult
@@ -8320,10 +8744,35 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         }
 
         try {
-          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.rpc('thread/read', {
+          let rawThreadReadResult = await readThreadSnapshotForObserver(appServer, threadId)
+          const rawThreadRecord = asRecord(rawThreadReadResult)
+          const rawThread = asRecord(rawThreadRecord?.thread)
+          const rawSessionPath = readNonEmptyString(rawThread?.path)
+          let sessionActivity = rawSessionPath && isAbsolute(rawSessionPath)
+            ? await appServer.getSessionActivityReader().read(rawSessionPath)
+            : null
+
+          // The desktop writer appends its terminal marker before the
+          // app-server's thread projection catches up.  Retry only the
+          // read-only projection for a short bounded window.  This keeps the
+          // mobile observer from acquiring the writer lock while still giving
+          // it a chance to receive the final turn in the same poll.
+          const projectionRetry = await readThreadWithProjectionRetry(
+            appServer,
             threadId,
-            includeTurns: true,
-          }))
+            rawThreadReadResult,
+            sessionActivity,
+            rawSessionPath,
+          )
+          rawThreadReadResult = projectionRetry.result
+          sessionActivity = projectionRetry.activity
+          let projectionCaughtUp = projectionRetry.projectionCaughtUp
+
+          const threadReadResult = await mergeSessionActivityIntoThreadResult(
+            rawThreadReadResult,
+            appServer.getSessionActivityReader(),
+            sessionActivity ?? undefined,
+          )
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
           appServer.storeThreadReadSnapshot(threadId, sanitized)
 
@@ -8332,6 +8781,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
 
           const sessionPath = readNonEmptyString(thread?.path)
+          const sessionRevision = sessionActivity?.known ? sessionActivity.revision : ''
           let sessionSize = 0
           if (sessionPath && isAbsolute(sessionPath)) {
             try {
@@ -8340,7 +8790,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             } catch { /* missing */ }
           }
 
-          const cached = appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
+          const cached = appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize, sessionRevision)
           if (cached) {
             setJson(res, 200, cached)
             return
@@ -8352,13 +8802,34 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             try {
               const sessionLogRaw = await readFile(sessionPath, 'utf8')
               turns = mergeSessionCommandsIntoTurns(turns, sessionLogRaw)
+
+              // If the projection remained stale after the retry window,
+              // recover the terminal assistant response directly from the
+              // session JSONL.  Only run this for a known idle session; an
+              // in-progress task must never expose a synthetic final turn.
+              if (sessionActivity?.known && !sessionActivity.inProgress && !projectionCaughtUp) {
+                const fallback = buildSessionProjectionFallback(sessionLogRaw, sessionActivity)
+                if (fallback) {
+                  const mergedFallback = mergeSessionProjectionFallbackIntoTurns(turns, fallback, true)
+                  turns = mergedFallback.turns
+                  // Keep the cache conservative: a synthesized turn is a
+                  // useful response for this poll, but the idle cache should
+                  // remain disabled until thread/read itself catches up.
+                  projectionCaughtUp = false
+                }
+              }
             } catch {
               // Session log not available — continue without command recovery
             }
           }
 
           const lastTurn = turns.length > 0 ? asRecord(turns[turns.length - 1]) : null
-          const isInProgress = lastTurn?.status === 'inProgress'
+          const threadStatus = asRecord(thread?.status)
+          const isInProgress = sessionActivity?.known
+            ? sessionActivity.inProgress
+            : lastTurn?.status === 'inProgress' ||
+              thread?.inProgress === true ||
+              ['inProgress', 'running', 'active'].includes(readNonEmptyString(threadStatus?.type))
 
           const responseData = {
             threadId,
@@ -8373,10 +8844,16 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             liveStateError: null,
             isInProgress,
             streamCursor: appServer.getStreamCursor(),
+            ...(sessionActivity?.known
+              ? {
+                sessionActivityKnown: true,
+                sessionRevision: sessionActivity.revision,
+              }
+              : {}),
           }
 
-          if (!isInProgress) {
-            appServer.cacheLiveState(threadId, responseData, rawTurns.length, sessionSize)
+          if (!isInProgress && projectionCaughtUp) {
+            appServer.cacheLiveState(threadId, responseData, rawTurns.length, sessionSize, sessionRevision)
           }
 
           setJson(res, 200, responseData)

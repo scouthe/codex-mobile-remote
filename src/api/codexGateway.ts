@@ -739,6 +739,9 @@ export type ThreadLiveState = {
   activeTurnId: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
+  /** Optional bridge-side marker for changes written by another client. */
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
   streamCursor: {
     streamEpoch: string
     latestSeq: number
@@ -787,6 +790,8 @@ async function getThreadDetailV2(threadId: string): Promise<{
   activeTurnId: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
 }> {
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
@@ -794,6 +799,14 @@ async function getThreadDetailV2(threadId: string): Promise<{
   })
   const startTurnIndex = readThreadTurnStartIndex(payload)
   const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
+  const rawThread = asRecord(payload.thread)
+  const rawRevision = rawThread?.sessionRevision ?? rawThread?.revision
+  const sessionRevision = typeof rawRevision === 'string'
+    ? rawRevision.trim()
+    : typeof rawRevision === 'number' && Number.isFinite(rawRevision)
+      ? String(rawRevision)
+      : ''
+  const sessionActivityKnown = rawThread?.sessionActivityKnown === true
   return {
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
@@ -802,6 +815,8 @@ async function getThreadDetailV2(threadId: string): Promise<{
     activeTurnId: readActiveTurnIdFromResponse(payload),
     hasMoreOlder: startTurnIndex > 0,
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+    ...(sessionRevision ? { sessionRevision } : {}),
+    ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
   }
 }
 
@@ -882,6 +897,8 @@ export async function getThreadDetail(threadId: string): Promise<{
   activeTurnId: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
 }> {
   try {
     return await getThreadDetailV2(threadId)
@@ -921,6 +938,13 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       modelProvider: readString(record?.modelProvider) ?? readString(thread?.modelProvider) ?? '',
       threadTurnStartIndex: typeof record?.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
     } as unknown as ThreadReadResponse
+    const rawRevision = record?.sessionRevision ?? thread?.sessionRevision ?? thread?.revision
+    const sessionRevision = typeof rawRevision === 'string'
+      ? rawRevision.trim()
+      : typeof rawRevision === 'number' && Number.isFinite(rawRevision)
+        ? String(rawRevision)
+        : ''
+    const sessionActivityKnown = record?.sessionActivityKnown === true || thread?.sessionActivityKnown === true
     const cursorRecord = asRecord(record?.streamCursor)
     const streamCursor = cursorRecord && typeof cursorRecord.streamEpoch === 'string'
       ? {
@@ -930,14 +954,29 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       }
       : null
     const liveStateErrorRecord = asRecord(record?.liveStateError)
+    const explicitInProgress = sessionActivityKnown
+      ? typeof record?.isInProgress === 'boolean'
+        ? record.isInProgress
+        : typeof record?.inProgress === 'boolean'
+          ? record.inProgress
+          : typeof thread?.inProgress === 'boolean'
+            ? thread.inProgress
+            : undefined
+      : undefined
     return {
       model: normalizeThreadModelFromPayload(threadPayload),
       modelProvider: normalizeThreadModelProviderFromPayload(threadPayload),
       messages: normalizeThreadMessagesV2(threadPayload, readThreadTurnStartIndex(threadPayload)),
-      inProgress: record?.isInProgress === true || readThreadInProgressFromResponse(threadPayload),
+      // When the bridge has read the shared session log, its boolean marker
+      // is authoritative even when false.  Falling back with `||` would let
+      // an old projected in-progress turn resurrect the spinner after the
+      // desktop task has completed.
+      inProgress: explicitInProgress ?? readThreadInProgressFromResponse(threadPayload),
       activeTurnId: readActiveTurnIdFromResponse(threadPayload),
       hasMoreOlder: readThreadTurnStartIndex(threadPayload) > 0,
       turnIndexByTurnId: buildTurnIndexByTurnId(threadPayload, readThreadTurnStartIndex(threadPayload)),
+      ...(sessionRevision ? { sessionRevision } : {}),
+      ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
       streamCursor,
       liveStateError: readString(liveStateErrorRecord?.message),
     }

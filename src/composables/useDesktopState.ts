@@ -92,6 +92,7 @@ const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
+const THREAD_STATUS_POLL_INTERVAL_MS = 1500
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
@@ -947,6 +948,8 @@ function areThreadFieldsEqual(first: UiThread, second: UiThread): boolean {
     first.preview === second.preview &&
     first.unread === second.unread &&
     first.inProgress === second.inProgress &&
+    first.sessionRevision === second.sessionRevision &&
+    first.sessionActivityKnown === second.sessionActivityKnown &&
     first.pendingRequestState === second.pendingRequestState
   )
 }
@@ -1446,6 +1449,10 @@ export function useDesktopState() {
   const projectOrder = ref<string[]>(loadProjectOrder())
   const projectDisplayNameById = ref<Record<string, string>>(loadProjectDisplayNames())
   const loadedVersionByThreadId = ref<Record<string, string>>({})
+  // `updatedAtIso` is not guaranteed to change when a second Codex process
+  // appends to a session.  Keep the bridge-provided file revision separately
+  // so a poll can invalidate only the affected thread's message cache.
+  const loadedSessionRevisionByThreadId = ref<Record<string, string>>({})
   const loadedMessagesByThreadId = ref<Record<string, boolean>>({})
   const hasMoreOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const loadingOlderMessagesByThreadId = ref<Record<string, boolean>>({})
@@ -1512,6 +1519,15 @@ export function useDesktopState() {
     return ''
   }
   let stopNotificationStream: (() => void) | null = null
+  let threadStatusPollTimer: number | null = null
+  type ThreadStatusSnapshot = { inProgress: boolean; revision: string }
+  const lastObservedThreadStatusById = new Map<string, ThreadStatusSnapshot>()
+  const sessionActivityByThreadId = new Map<string, ThreadStatusSnapshot>()
+  // A live-state response can be a transient diagnostic envelope while the
+  // app-server is materializing a turn.  Keep retry intent separate from the
+  // observed status so an otherwise successful thread/read fallback does not
+  // suppress the next authoritative live read.
+  const liveStateRetryByThreadId = new Set<string>()
   let lastStreamEpoch = ''
   let lastStreamSeq = 0
   let eventSyncTimer: number | null = null
@@ -2254,6 +2270,7 @@ export function useDesktopState() {
     }
     loadedMessagesByThreadId.value = pruneThreadStateMap(loadedMessagesByThreadId.value, activeThreadIds)
     loadedVersionByThreadId.value = pruneThreadStateMap(loadedVersionByThreadId.value, activeThreadIds)
+    loadedSessionRevisionByThreadId.value = pruneThreadStateMap(loadedSessionRevisionByThreadId.value, activeThreadIds)
     resumedThreadById.value = pruneThreadStateMap(resumedThreadById.value, activeThreadIds)
     turnIndexByTurnIdByThreadId.value = pruneThreadStateMap(turnIndexByTurnIdByThreadId.value, activeThreadIds)
     persistedMessagesByThreadId.value = pruneThreadStateMap(persistedMessagesByThreadId.value, activeThreadIds)
@@ -2280,6 +2297,15 @@ export function useDesktopState() {
     threadTokenUsageByThreadId.value = pruneThreadStateMap(threadTokenUsageByThreadId.value, activeThreadIds)
     eventUnreadByThreadId.value = pruneThreadStateMap(eventUnreadByThreadId.value, activeThreadIds)
     inProgressById.value = pruneThreadStateMap(inProgressById.value, activeThreadIds)
+    for (const threadId of sessionActivityByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) sessionActivityByThreadId.delete(threadId)
+    }
+    for (const threadId of lastObservedThreadStatusById.keys()) {
+      if (!activeThreadIds.has(threadId)) lastObservedThreadStatusById.delete(threadId)
+    }
+    for (const threadId of liveStateRetryByThreadId) {
+      if (!activeThreadIds.has(threadId)) liveStateRetryByThreadId.delete(threadId)
+    }
     const nextPending: Record<string, UiServerRequest[]> = {}
     for (const [threadId, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
       if (threadId === GLOBAL_SERVER_REQUEST_SCOPE || activeThreadIds.has(threadId)) {
@@ -2503,6 +2529,11 @@ export function useDesktopState() {
   function currentThreadVersion(threadId: string): string {
     const thread = flattenThreads(sourceGroups.value).find((row) => row.id === threadId)
     return thread?.updatedAtIso ?? ''
+  }
+
+  function currentThreadSessionRevision(threadId: string): string {
+    const thread = flattenThreads(sourceGroups.value).find((row) => row.id === threadId)
+    return thread?.sessionRevision?.trim() ?? ''
   }
 
   function setThreadTerminalOpen(threadId: string, isOpen: boolean): void {
@@ -4167,6 +4198,7 @@ export function useDesktopState() {
 
     const orderedGroups = orderGroupsByProjectOrder(visibleGroups, projectOrder.value)
     markServerListedThreads(new Set(flattenThreads(orderedGroups).map((thread) => thread.id)))
+    reconcileIncomingSessionActivity(flattenThreads(orderedGroups))
     const mergedWithInProgress = mergeIncomingWithLocalInProgressThreads(
       sourceGroups.value,
       orderedGroups,
@@ -4178,6 +4210,87 @@ export function useDesktopState() {
       new Set(flattenThreads(sourceGroups.value).map((thread) => thread.id)),
     )
     applyThreadFlags()
+  }
+
+  /**
+   * Promote activity observed by the bridge into the local status map.  The
+   * map historically only received websocket notifications, which meant a
+   * desktop-owned session could be marked active in the fresh thread list but
+   * immediately overwritten to idle by `applyThreadFlags`.
+   *
+   * Idle markers are recorded for transition detection, while the local
+   * active bit is cleared by `loadMessages` after it consumes the authoritative
+   * snapshot.  This keeps live-overlay cleanup in one transition path.
+   */
+  function reconcileIncomingSessionActivity(threads: UiThread[]): void {
+    let nextInProgress = inProgressById.value
+    let changed = false
+
+    for (const thread of threads) {
+      const threadId = thread.id.trim()
+      if (!threadId) continue
+
+      // Older bridges may expose only the normalized `inProgress` bit.  A
+      // positive value is still safe to promote; idle values require the
+      // explicit activity marker below before they can clear local state.
+      if (thread.sessionActivityKnown !== true && thread.inProgress === true) {
+        if (nextInProgress[threadId] !== true) {
+          nextInProgress = { ...nextInProgress, [threadId]: true }
+          changed = true
+        }
+        continue
+      }
+      if (thread.sessionActivityKnown !== true) continue
+
+      const revision = thread.sessionRevision?.trim() ?? ''
+      const incoming: ThreadStatusSnapshot = {
+        inProgress: thread.inProgress === true,
+        revision,
+      }
+      const previous = sessionActivityByThreadId.get(threadId)
+      sessionActivityByThreadId.set(threadId, incoming)
+
+      if (incoming.inProgress) {
+        if (nextInProgress[threadId] === true) continue
+        nextInProgress = { ...nextInProgress, [threadId]: true }
+        changed = true
+        continue
+      }
+
+      // Keep a local active bit until `loadMessages` has consumed the idle
+      // snapshot.  `setThreadInProgress(false)` performs the associated live
+      // overlay/interrupt cleanup; clearing the map here would bypass that
+      // transition because the setter would observe an already-idle value.
+    }
+
+    if (changed) {
+      inProgressById.value = nextInProgress
+    }
+  }
+
+  function reconcileThreadSessionActivity(
+    threadId: string,
+    snapshot: ThreadStatusSnapshot,
+  ): void {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return
+
+    sessionActivityByThreadId.set(normalizedThreadId, snapshot)
+
+    if (snapshot.inProgress) {
+      if (inProgressById.value[normalizedThreadId] !== true) {
+        inProgressById.value = {
+          ...inProgressById.value,
+          [normalizedThreadId]: true,
+        }
+        applyThreadFlags()
+      }
+      return
+    }
+
+    // Keep the local active bit until `setThreadInProgress(false)` consumes
+    // the authoritative idle snapshot.  This preserves the cleanup path for
+    // live overlays and interrupt persistence gates.
   }
 
   function normalizeQueueStateForPersistence(state: Record<string, QueuedMessage[]>): ThreadQueueState {
@@ -4221,6 +4334,10 @@ export function useDesktopState() {
     loadedThreadListGroups = removeThreadFromGroups(loadedThreadListGroups, threadId)
     sourceGroups.value = removeThreadFromGroups(sourceGroups.value, threadId)
     inProgressById.value = omitKey(inProgressById.value, threadId)
+    loadedSessionRevisionByThreadId.value = omitKey(loadedSessionRevisionByThreadId.value, threadId)
+    sessionActivityByThreadId.delete(threadId)
+    lastObservedThreadStatusById.delete(threadId)
+    liveStateRetryByThreadId.delete(threadId)
     applyThreadFlags()
   }
 
@@ -4363,13 +4480,20 @@ export function useDesktopState() {
     await loadThreadsPromise
   }
 
-  async function loadMessages(threadId: string, options: { silent?: boolean; force?: boolean } = {}) {
+  async function loadMessages(
+    threadId: string,
+    options: { silent?: boolean; force?: boolean; preferLiveState?: boolean } = {},
+  ) {
     if (!threadId) {
       return
     }
     const recentLoadFailure =
       Date.now() - (lastMessageLoadFailureAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
-    if (turnErrorByThreadId.value[threadId]?.transient && (options.silent === true || recentLoadFailure)) {
+    if (
+      options.force !== true
+      && turnErrorByThreadId.value[threadId]?.transient
+      && (options.silent === true || recentLoadFailure)
+    ) {
       return
     }
 
@@ -4389,10 +4513,16 @@ export function useDesktopState() {
       try {
       const version = currentThreadVersion(threadId)
       const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
+      const sessionRevision = currentThreadSessionRevision(threadId)
+      const loadedSessionRevision = loadedSessionRevisionByThreadId.value[threadId] ?? ''
       const loadedRecently =
         Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
+      const hasSessionRevisionChange = Boolean(
+        sessionRevision && sessionRevision !== loadedSessionRevision,
+      )
+      const shouldPreferLiveState = options.preferLiveState === true
       const canReuseLoadedMessages =
-        options.force !== true && alreadyLoaded &&
+        options.force !== true && !hasSessionRevisionChange && alreadyLoaded &&
         (
           loadedRecently ||
           (
@@ -4411,16 +4541,43 @@ export function useDesktopState() {
       // the app-server's active-writer lock when a second device opens the
       // same in-progress thread.  Writes still resume explicitly in
       // startTurnForThread below, behind the server-side writer path.
-      let detail = await getThreadDetail(threadId)
-      if (detail.inProgress) {
+      let detail: Awaited<ReturnType<typeof getThreadDetail>>
+      let liveStateErrorObserved = false
+      if (shouldPreferLiveState) {
         try {
-          // The live endpoint merges the app-server snapshot with items and
-          // command output observed since the last persisted read.  It is a
-          // read-only supplement and must never resume the thread.
-          detail = await getThreadLiveState(threadId)
+          // A status transition or session revision change can be produced by
+          // another Codex process whose app-server snapshot is stale.  Read
+          // the bridge's live state first so the final assistant text is not
+          // lost when the ordinary thread/read still reports the old turns.
+          const liveDetail = await getThreadLiveState(threadId)
+          liveStateErrorObserved = Boolean(liveDetail.liveStateError)
+          // The live endpoint can return a diagnostic envelope when the
+          // app-server is temporarily unavailable.  Do not treat that empty
+          // envelope as an authoritative conversation and erase cached turns.
+          if (liveDetail.liveStateError && liveDetail.messages.length === 0) {
+            detail = await getThreadDetail(threadId)
+          } else {
+            detail = liveDetail
+          }
         } catch {
-          // Keep the ordinary thread/read result when the live cache is
-          // temporarily unavailable.
+          liveStateErrorObserved = true
+          detail = await getThreadDetail(threadId)
+        }
+      } else {
+        detail = await getThreadDetail(threadId)
+        if (detail.inProgress) {
+          try {
+            // The live endpoint merges the app-server snapshot with items and
+            // command output observed since the last persisted read.  It is a
+            // read-only supplement and must never resume the thread.
+            const liveDetail = await getThreadLiveState(threadId)
+            if (!liveDetail.liveStateError || liveDetail.messages.length > 0) {
+              detail = liveDetail
+            }
+          } catch {
+            // Keep the ordinary thread/read result when the live cache is
+            // temporarily unavailable.
+          }
         }
       }
 
@@ -4430,7 +4587,21 @@ export function useDesktopState() {
       if (detail.model) {
         setThreadModelId(threadId, resolveThreadModelForProvider(threadId, detail.model, detail.modelProvider))
       }
-      const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
+      const {
+        messages: nextMessages,
+        inProgress,
+        activeTurnId,
+        turnIndexByTurnId,
+        sessionRevision: detailSessionRevision,
+        sessionActivityKnown,
+      } = detail
+      const observedSessionRevision = detailSessionRevision?.trim() || sessionRevision
+      if (sessionActivityKnown === true || observedSessionRevision) {
+        reconcileThreadSessionActivity(threadId, {
+          inProgress,
+          revision: observedSessionRevision,
+        })
+      }
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: detail.hasMoreOlder === true,
@@ -4440,7 +4611,15 @@ export function useDesktopState() {
       rebindLiveFileChangeTurnIndices(threadId)
       const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
       const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
-        preserveMissing: options.silent === true || hasOptimisticUserMessages(previousPersisted),
+        // A forced poll is an authoritative snapshot (typically the first
+        // read after an external active→idle transition).  Do not retain
+        // stale live/partial assistant rows that are absent from that final
+        // snapshot; still preserve an optimistic user message while its turn
+        // is being materialized.
+        preserveMissing:
+          (liveStateErrorObserved && nextMessages.length === 0)
+          || (options.silent === true && options.force !== true)
+          || hasOptimisticUserMessages(previousPersisted),
       })
       setPersistedMessagesForThread(threadId, mergedMessages)
 
@@ -4465,6 +4644,19 @@ export function useDesktopState() {
         loadedVersionByThreadId.value = {
           ...loadedVersionByThreadId.value,
           [threadId]: version,
+        }
+      }
+      if (observedSessionRevision) {
+        loadedSessionRevisionByThreadId.value = {
+          ...loadedSessionRevisionByThreadId.value,
+          [threadId]: observedSessionRevision,
+        }
+      }
+      if (shouldPreferLiveState) {
+        if (liveStateErrorObserved) {
+          liveStateRetryByThreadId.add(threadId)
+        } else {
+          liveStateRetryByThreadId.delete(threadId)
         }
       }
       setThreadInProgress(threadId, inProgress)
@@ -5451,20 +5643,92 @@ export function useDesktopState() {
     if (isPolling.value) return
     isPolling.value = true
 
+    const threadIdBeforeRefresh = selectedThreadId.value.trim()
+    const previousThread = threadIdBeforeRefresh
+      ? flattenThreads(sourceGroups.value).find((thread) => thread.id === threadIdBeforeRefresh)
+      : undefined
+    const previousSnapshot: ThreadStatusSnapshot | null = threadIdBeforeRefresh
+      ? (() => {
+        const observed = lastObservedThreadStatusById.get(threadIdBeforeRefresh)
+        return {
+          inProgress: Boolean(
+            observed?.inProgress
+            || inProgressById.value[threadIdBeforeRefresh] === true
+            || previousThread?.inProgress === true,
+          ),
+          revision: observed?.revision || previousThread?.sessionRevision?.trim() || '',
+        }
+      })()
+      : null
+
     try {
-      await loadThreads()
+      // Notifications are scoped to this codexapp process.  A desktop Codex
+      // client may be writing the same session from another process, so force
+      // a lightweight list refresh to observe the session-file activity
+      // marker merged by the server.
+      await loadThreads({ force: true })
 
       if (!selectedThreadId.value) return
 
       const threadId = selectedThreadId.value
+      // Selection can change while the forced list request is in flight.  Do
+      // not apply the prior thread's transition to the newly selected one.
+      const sameSelectedThread = threadId === threadIdBeforeRefresh
+      const currentThread = flattenThreads(sourceGroups.value).find((thread) => thread.id === threadId)
       const currentVersion = currentThreadVersion(threadId)
       const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
+      // `applyThreadFlags` intentionally keeps the local active bit until a
+      // final snapshot has been consumed, so an incoming idle row can still
+      // render as active during that read.  The activity map is populated
+      // from the same server response before flags are applied and is the
+      // authoritative value for transition detection here.
+      const observedSessionActivity = sessionActivityByThreadId.get(threadId)
+      const currentSessionRevision = observedSessionActivity?.revision
+        || currentThread?.sessionRevision?.trim()
+        || ''
+      const loadedSessionRevision = loadedSessionRevisionByThreadId.value[threadId] ?? ''
       const hasVersionChange = currentVersion.length > 0 && currentVersion !== loadedVersion
-      const isInProgress = inProgressById.value[threadId] === true
+      const hasSessionRevisionChange = Boolean(
+        currentSessionRevision && currentSessionRevision !== loadedSessionRevision,
+      )
+      // When the row is present, its status is the server's latest
+      // observation and must be used for transition detection even if the
+      // local map still carries an optimistic active bit.  Fall back to the
+      // map only while a newly-created local thread is absent from the list.
+      const isInProgress = observedSessionActivity
+        ? observedSessionActivity.inProgress
+        : currentThread
+          ? currentThread.inProgress === true
+          : inProgressById.value[threadId] === true
 
-      if (isInProgress || hasVersionChange) {
-        await loadMessages(threadId, { silent: true })
+      const currentSnapshot: ThreadStatusSnapshot = {
+        inProgress: isInProgress,
+        revision: currentSessionRevision,
       }
+      const previousForThread = sameSelectedThread ? previousSnapshot : null
+      const becameIdle = Boolean(previousForThread?.inProgress && !currentSnapshot.inProgress)
+      const shouldRetryLiveState = liveStateRetryByThreadId.has(threadId)
+
+      // While a thread is active, websocket events (when available) provide
+      // incremental content.  Polling only hydrates an unloaded thread; it
+      // performs a forced live read when the status settles or its session
+      // revision changes.  This avoids rereading full turns every interval.
+      const shouldForceRefresh = becameIdle || hasVersionChange || hasSessionRevisionChange || shouldRetryLiveState
+      const shouldPreferLiveState = becameIdle || hasSessionRevisionChange || shouldRetryLiveState
+      const shouldLoadMessages =
+        shouldForceRefresh || (isInProgress && loadedMessagesByThreadId.value[threadId] !== true)
+
+      if (shouldLoadMessages) {
+        await loadMessages(threadId, {
+          silent: true,
+          force: shouldForceRefresh,
+          preferLiveState: shouldPreferLiveState,
+        })
+      }
+      // Record the observation only after a requested hydration succeeds.  If
+      // a transient read fails during active→idle, retaining the prior active
+      // snapshot causes the next poll to retry the authoritative live read.
+      lastObservedThreadStatusById.set(threadId, currentSnapshot)
     } catch {
       // ignore poll failures and keep last known state
     } finally {
@@ -5581,6 +5845,13 @@ export function useDesktopState() {
       applyRealtimeUpdates(notification)
       queueEventDrivenSync(notification)
     })
+
+    if (threadStatusPollTimer === null && typeof window.setInterval === 'function') {
+      threadStatusPollTimer = window.setInterval(() => {
+        void syncThreadStatus()
+      }, THREAD_STATUS_POLL_INTERVAL_MS)
+    }
+    void syncThreadStatus()
   }
 
   async function loadPendingServerRequestsFromBridge(): Promise<void> {
@@ -5614,10 +5885,23 @@ export function useDesktopState() {
       stopNotificationStream()
       stopNotificationStream = null
     }
+    if (
+      threadStatusPollTimer !== null
+      && typeof window !== 'undefined'
+      && typeof window.clearInterval === 'function'
+    ) {
+      window.clearInterval(threadStatusPollTimer)
+      threadStatusPollTimer = null
+    }
+    if (typeof window === 'undefined' || typeof window.clearInterval !== 'function') {
+      threadStatusPollTimer = null
+    }
 
     pendingThreadsRefresh = false
     pendingThreadMessageRefresh.clear()
     pendingTurnStartsById.clear()
+    lastObservedThreadStatusById.clear()
+    sessionActivityByThreadId.clear()
     if (eventSyncTimer !== null && typeof window !== 'undefined') {
       window.clearTimeout(eventSyncTimer)
       eventSyncTimer = null
@@ -5780,6 +6064,7 @@ export function useDesktopState() {
     pinProjectToTop,
     startPolling,
     stopPolling,
+    syncThreadStatus,
     primeSelectedThread,
   }
 }

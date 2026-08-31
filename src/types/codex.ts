@@ -71,6 +71,14 @@ export type UiThread = {
   preview: string
   unread: boolean
   inProgress: boolean
+  /**
+   * Revision of the on-disk session observed by the bridge.  This is
+   * optional because older app-server responses do not include a session
+   * activity marker.
+   */
+  sessionRevision?: string
+  /** True when `inProgress` came from a session activity marker. */
+  sessionActivityKnown?: boolean
   pendingRequestState?: UiPendingRequestState | null
 }
 
