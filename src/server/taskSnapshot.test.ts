@@ -26,13 +26,14 @@ describe('task snapshot response', () => {
       }],
       { streamEpoch: 'epoch-1', latestSeq: 2, oldestSeq: 1 },
       { known: true, inProgress: true, lastEventAt: Date.parse('2026-08-31T00:00:01.000Z'), turnId: 'turn-1' },
+      { clientId: 'desktop-1', clientType: 'desktop', generation: 3, claimedAt: '2026-08-31T00:00:00.000Z' },
     )
 
     expect(snapshot.taskState).toBe('waiting_approval')
     expect(snapshot.queueDepth).toBe(2)
     expect(snapshot.activeRequest?.kind).toBe('approval')
     expect(snapshot.currentActivity.label).toBe('Approval required')
+    expect(snapshot.writerClient).toMatchObject({ clientId: 'desktop-1', label: 'Desktop' })
     expect(snapshot.timeline).toHaveLength(2)
   })
 })
-

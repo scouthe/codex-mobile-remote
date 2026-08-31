@@ -84,4 +84,16 @@ describe('ThreadSessionBroker', () => {
 
     expect(resumeCount).toBe(2)
   })
+
+  it('records the first successful writer identity and clears it with generation changes', async () => {
+    let generation = 1
+    const broker = new ThreadSessionBroker(() => generation)
+    expect(broker.getWriter('thread-1')).toBeNull()
+    await broker.runTurn('thread-1', async () => undefined, async () => {
+      broker.claimWriter('thread-1', { clientId: 'desktop-1', clientType: 'desktop' })
+    })
+    expect(broker.getWriter('thread-1')).toMatchObject({ clientId: 'desktop-1', clientType: 'desktop', generation: 1 })
+    generation = 2
+    expect(broker.getWriter('thread-1')).toBeNull()
+  })
 })
