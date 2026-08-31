@@ -7216,6 +7216,7 @@ class AppServerProcess {
   private readonly streamEventHistory: StreamEventFrame[] = []
   private streamEpoch = randomUUID()
   private nextStreamSeq = 0
+  private readonly threadSummaryById = new Map<string, Record<string, unknown>>()
   private readonly lastThreadReadSnapshotByThreadId = new Map<string, unknown>()
   private readonly threadTurnPageReadCacheByThreadId = new Map<string, { result: unknown; expiresAt: number }>()
   private readonly threadTurnPageReadPromiseByThreadId = new Map<string, Promise<unknown>>()
@@ -7776,7 +7777,11 @@ class AppServerProcess {
   async rpc(method: string, params: unknown): Promise<unknown> {
     this.disposeIfConfigChanged()
     await this.ensureInitialized()
-    return this.call(method, params)
+    const result = await this.call(method, params)
+    if (method === 'thread/list' || (method === 'thread/read' && asRecord(params)?.includeTurns !== true)) {
+      this.rememberThreadSummaries(result)
+    }
+    return result
   }
 
   onNotification(listener: (value: AppServerNotification) => void): () => void {
@@ -7794,6 +7799,27 @@ class AppServerProcess {
 
   getProcessGeneration(): number {
     return this.processGeneration
+  }
+
+  private rememberThreadSummaries(result: unknown): void {
+    const record = asRecord(result)
+    const rows = Array.isArray(record?.data)
+      ? record.data
+      : record?.thread
+        ? [record.thread]
+        : []
+    for (const row of rows) {
+      const summary = asRecord(row)
+      const threadId = readNonEmptyString(summary?.id)
+      const sessionPath = readNonEmptyString(summary?.path)
+      if (!threadId || !sessionPath || !isAbsolute(sessionPath)) continue
+      this.threadSummaryById.set(threadId, { ...summary, turns: [] })
+    }
+  }
+
+  getThreadSummarySnapshot(threadId: string): unknown | null {
+    const summary = this.threadSummaryById.get(threadId.trim())
+    return summary ? { thread: { ...summary, turns: [] } } : null
   }
 
   async respondToServerRequest(payload: unknown): Promise<void> {
@@ -9112,10 +9138,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           // complete rollout.  The path is obtained from Codex itself rather
           // than accepted from the browser, so this endpoint cannot be used
           // as an arbitrary local-file reader.
-          const summaryResult = await appServer.rpc('thread/read', {
-            threadId,
-            includeTurns: false,
-          })
+          const summaryResult = appServer.getThreadSummarySnapshot(threadId)
+            ?? await appServer.rpc('thread/read', {
+              threadId,
+              includeTurns: false,
+            })
           const summaryRecord = asRecord(summaryResult)
           const summaryThread = asRecord(summaryRecord?.thread)
           const sessionPath = readNonEmptyString(summaryThread?.path)

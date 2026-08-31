@@ -67,6 +67,7 @@ function installFakeSharedBridge(options: {
     getStreamEvents: () => [],
     getStreamEventsSince: () => ({ events: [], truncated: false }),
     getProcessGeneration: () => generation,
+    getThreadSummarySnapshot: () => null,
     getSessionActivityReader: () => appServer.sessionActivityReader,
     storeThreadReadSnapshot: () => undefined,
     mergeItemsIntoTurns: (_threadId: string, turns: unknown[]) => turns,
