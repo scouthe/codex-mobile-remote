@@ -44,6 +44,20 @@ describe('task state reducer', () => {
     expect(resumed.activeRequest).toBeNull()
   })
 
+  it('restores a waiting state when a pending request is hydrated after reconnect', () => {
+    const snapshot = reduceTaskSnapshot(createTaskSnapshot('thread-1', { state: 'running' }), {
+      threadId: 'thread-1',
+      activeRequest: {
+        id: 11,
+        kind: 'user_input',
+        method: 'item/tool/requestUserInput',
+        receivedAtIso: '2026-08-31T00:01:00.000Z',
+      },
+    })
+    expect(snapshot.state).toBe('waiting_user_input')
+    expect(snapshot.currentActivity.label).toBe('Input required')
+  })
+
   it('keeps a bounded timeline and marks failures', () => {
     let snapshot = createTaskSnapshot('thread-1')
     for (let index = 0; index < 250; index += 1) {
@@ -61,4 +75,3 @@ describe('task state reducer', () => {
     expect(failed.error).toBe('provider unavailable')
   })
 })
-
