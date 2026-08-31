@@ -5964,6 +5964,11 @@ type StoredQueuedMessage = {
   skills: Array<{ name: string; path: string }>
   fileAttachments: Array<{ label: string; path: string; fsPath: string }>
   collaborationMode: 'default' | 'plan'
+  createdAtIso: string
+  sourceClientId: string
+  status: 'queued' | 'processing' | 'failed'
+  attempts: number
+  lastError: string
 }
 
 type ThreadQueueState = Record<string, StoredQueuedMessage[]>
@@ -6172,6 +6177,11 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     skills: normalizeNamedPathItems(record.skills),
     fileAttachments: normalizeFileAttachments(record.fileAttachments),
     collaborationMode: record.collaborationMode === 'plan' ? 'plan' : 'default',
+    createdAtIso: readNonEmptyString(record.createdAtIso) || new Date().toISOString(),
+    sourceClientId: readNonEmptyString(record.sourceClientId),
+    status: record.status === 'failed' ? 'failed' : record.status === 'processing' ? 'processing' : 'queued',
+    attempts: typeof record.attempts === 'number' && Number.isFinite(record.attempts) ? Math.max(0, Math.trunc(record.attempts)) : 0,
+    lastError: readNonEmptyString(record.lastError),
   }
 }
 
@@ -6329,6 +6339,11 @@ ${escapeHeartbeatXmlText(automation.prompt)}
     skills: [],
     fileAttachments: [],
     collaborationMode: 'default',
+    createdAtIso: new Date().toISOString(),
+    sourceClientId: 'automation',
+    status: 'queued',
+    attempts: 0,
+    lastError: '',
   }
 }
 
@@ -7781,13 +7796,19 @@ export class BackendQueueProcessor {
       }
 
       const [message, ...rest] = queue
+      const processingMessage: StoredQueuedMessage = {
+        ...message,
+        status: 'processing',
+        attempts: message.attempts + 1,
+        lastError: '',
+      }
       const nextState = { ...state }
       if (rest.length > 0) {
         nextState[threadId] = rest
       } else {
         delete nextState[threadId]
       }
-      return { nextState, result: { threadId, message } }
+      return { nextState, result: { threadId, message: processingMessage } }
     })
   }
 
@@ -7797,7 +7818,11 @@ export class BackendQueueProcessor {
       return {
         nextState: {
           ...state,
-          [turn.threadId]: [turn.message, ...queue],
+          [turn.threadId]: [{
+            ...turn.message,
+            status: 'failed',
+            lastError: 'Queued turn failed to start; will retry automatically.',
+          }, ...queue],
         },
         result: undefined,
       }
