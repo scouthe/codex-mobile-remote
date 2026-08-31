@@ -10,6 +10,7 @@ import {
 } from './useDesktopState'
 import type { UiProjectGroup } from '../types/codex'
 import type { WorkspaceRootsState } from '../api/codexGateway'
+import { CodexApiError } from '../api/codexErrors'
 
 const gatewayMocks = vi.hoisted(() => ({
   archiveThread: vi.fn(),
@@ -1113,6 +1114,45 @@ describe('live error overlay', () => {
       'operation-thread', 'guide', [], 'gpt-5.5', 'medium', undefined, [], 'default',
     )
     expect(state.selectedTaskSnapshot.value?.state).toBe('steering')
+  })
+
+  it('queues a direct send when a stale browser state hits the active writer lock', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5', modelProvider: 'openai', messages: [], inProgress: false,
+      activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'gpt-5.5', modelProvider: 'openai', messages: [], inProgress: false,
+      activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+    gatewayMocks.startThreadTurn.mockRejectedValue(new CodexApiError(
+      'RPC turn/start failed with HTTP 502: thread shared-writer-thread already has an active writer',
+      { code: 'http_error', method: 'turn/start', status: 502 },
+    ))
+    gatewayMocks.enqueueThreadMessage.mockImplementation(async (_threadId, message) => ({
+      inserted: true,
+      queue: [message],
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('shared-writer-thread')
+    await state.loadMessages('shared-writer-thread')
+
+    await expect(state.sendMessageToSelectedThread('send after desktop task')).resolves.toBeUndefined()
+
+    expect(gatewayMocks.enqueueThreadMessage).toHaveBeenCalledWith(
+      'shared-writer-thread',
+      expect.objectContaining({
+        text: 'send after desktop task',
+        status: 'queued',
+        sourceClientId: expect.stringMatching(/^web-/),
+      }),
+    )
+    expect(state.selectedThreadQueuedMessages.value).toHaveLength(1)
+    expect(state.selectedTaskSnapshot.value?.queueDepth).toBe(1)
+    expect(state.selectedTaskSnapshot.value?.error).toBeNull()
   })
 
   it('keeps a new live error visible when an older persisted turn error exists', async () => {

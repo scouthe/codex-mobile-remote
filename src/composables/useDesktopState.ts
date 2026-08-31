@@ -1957,6 +1957,60 @@ export function useDesktopState() {
     }
   }
 
+  function isActiveThreadWriterConflict(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? '')
+    const normalized = message.toLowerCase()
+    return normalized.includes('already has an active writer')
+      || normalized.includes('already has a live local writer')
+      || normalized.includes('failed to acquire thread writer lock')
+      || normalized.includes('failed to acquire thread writer coordination lock')
+  }
+
+  /**
+   * A browser can have an optimistic/old activity snapshot and attempt a
+   * direct turn/start while Desktop still owns the thread writer.  Normal
+   * sends must not be dropped in that race: persist the pending request in the
+   * shared queue and let the backend drain it once the writer is available.
+   */
+  async function queuePendingTurnAfterWriterConflict(threadId: string): Promise<boolean> {
+    const pending = pendingTurnRequestByThreadId.value[threadId]
+    if (!pending) return false
+
+    const queuedMessage: QueuedMessage = {
+      id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text: pending.text,
+      imageUrls: [...pending.imageUrls],
+      skills: pending.skills.map((skill) => ({ ...skill })),
+      fileAttachments: pending.fileAttachments.map((file) => ({ ...file })),
+      collaborationMode: pending.collaborationMode,
+      createdAtIso: new Date().toISOString(),
+      sourceClientId: queueClientId,
+      status: 'queued',
+      attempts: 0,
+      lastError: '',
+    }
+
+    try {
+      const result = await enqueueThreadMessage(threadId, queuedMessage)
+      queuedMessagesByThreadId.value = {
+        ...queuedMessagesByThreadId.value,
+        [threadId]: result.queue,
+      }
+      updateTaskQueueSnapshot(threadId, result.queue)
+      setTurnActivityForThread(threadId, {
+        label: 'Queued',
+        details: ['Desktop is still using this task; it will start automatically afterward.'],
+      })
+      setTurnErrorForThread(threadId, null)
+      pendingThreadMessageRefresh.add(threadId)
+      return true
+    } catch {
+      // Preserve the original writer error when queue persistence itself is
+      // unavailable; the caller will surface that error to the user.
+      return false
+    }
+  }
+
   function clearPendingTurnRequest(threadId: string): void {
     if (!pendingTurnRequestByThreadId.value[threadId]) return
     pendingTurnRequestByThreadId.value = omitKey(pendingTurnRequestByThreadId.value, threadId)
@@ -5440,6 +5494,7 @@ export function useDesktopState() {
         skills,
         fileAttachments,
         collaborationModeOverride,
+        true,
       )
     } catch (unknownError) {
       shouldAutoScrollOnNextAgentEvent = false
@@ -5594,6 +5649,7 @@ export function useDesktopState() {
     skills: Array<{ name: string; path: string }> = [],
     fileAttachments: FileAttachment[] = [],
     collaborationModeOverride?: CollaborationModeKind,
+    allowQueueOnWriterConflict = false,
   ): Promise<void> {
     const reasoningEffort = selectedReasoningEffort.value
     const collaborationMode = collaborationModeOverride === 'plan' ? 'plan' : collaborationModeOverride === 'default'
@@ -5690,6 +5746,9 @@ export function useDesktopState() {
       await syncFromNotifications()
       scheduleDelayedTurnSync(threadId)
     } catch (unknownError) {
+      if (allowQueueOnWriterConflict && isActiveThreadWriterConflict(unknownError)) {
+        if (await queuePendingTurnAfterWriterConflict(threadId)) return
+      }
       throw unknownError
     }
   }
