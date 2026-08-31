@@ -58,6 +58,7 @@ import type {
 } from '../types/codex'
 import type { TaskSnapshot, TaskState, TaskActivity, TaskActiveRequest, TaskTimelineEvent, TaskWriterIdentity } from '../types/task'
 import { normalizePathForUi } from '../pathUtils.js'
+import { getTaskClientHeaders } from './codexRpcClient'
 
 type CurrentModelConfig = {
   model: string
@@ -929,7 +930,9 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
   }
 
   try {
-    const response = await fetch(`/codex-api/thread-live-state?threadId=${encodeURIComponent(normalizedThreadId)}`)
+    const response = await fetch(`/codex-api/thread-live-state?threadId=${encodeURIComponent(normalizedThreadId)}`, {
+      headers: getTaskClientHeaders(),
+    })
     const payload = await response.json() as unknown
     if (!response.ok) {
       throw new Error(`Live thread state request failed with ${response.status}`)

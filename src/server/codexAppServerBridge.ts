@@ -5978,7 +5978,13 @@ type TaskSnapshotResponse = {
   currentActivity: { kind: string; label: string; details: string[] }
   queueDepth: number
   activeRequest: { id: number; kind: 'approval' | 'user_input' | 'other'; method: string; receivedAtIso: string } | null
-  writerClient: null
+  writerClient: {
+    clientId: string
+    clientType: 'desktop' | 'android' | 'web' | 'unknown'
+    generation: number
+    label: string
+    claimedAt: string
+  } | null
   startedAt: string | null
   finishedAt: string | null
   timeline: Array<{
@@ -6016,6 +6022,7 @@ export function buildTaskSnapshotResponse(
   streamEvents: Array<{ seq: number; method: string; params: unknown; atIso: string }>,
   streamCursor: { streamEpoch: string; latestSeq: number; oldestSeq: number | null },
   sessionActivity: { known: boolean; inProgress: boolean; lastEventAt: number | null; turnId: string } | null,
+  writerClient: { clientId: string; clientType: 'desktop' | 'android' | 'web' | 'unknown'; generation: number; claimedAt: string } | null = null,
 ): TaskSnapshotResponse {
   const request = pendingRequests.find((row) => readTaskRequestThreadId(row) === threadId)
   const activeRequest = request
@@ -6118,7 +6125,12 @@ export function buildTaskSnapshotResponse(
     currentActivity,
     queueDepth,
     activeRequest,
-    writerClient: null,
+    writerClient: writerClient
+      ? {
+        ...writerClient,
+        label: writerClient.clientType === 'android' ? 'Android' : writerClient.clientType === 'desktop' ? 'Desktop' : 'Web',
+      }
+      : null,
     startedAt,
     finishedAt,
     timeline,
@@ -8684,6 +8696,16 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
         let rpcResult: unknown
         try {
+          const rawClientId = Array.isArray(req.headers['x-codex-client-id'])
+            ? req.headers['x-codex-client-id'][0]
+            : req.headers['x-codex-client-id']
+          const rawClientType = Array.isArray(req.headers['x-codex-client-type'])
+            ? req.headers['x-codex-client-type'][0]
+            : req.headers['x-codex-client-type']
+          const clientId = typeof rawClientId === 'string' && rawClientId.trim() ? rawClientId.trim() : 'unknown-client'
+          const clientType = rawClientType === 'android' || rawClientType === 'desktop' || rawClientType === 'web'
+            ? rawClientType
+            : 'unknown' as const
           const rpcParams = body.params ?? null
           const rpcThreadId = readNonEmptyString(asRecord(rpcParams)?.threadId)
           if (rpcThreadId && body.method === 'turn/start') {
@@ -8705,6 +8727,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 resumeThread: ensureThreadWriter,
               }),
             )
+            threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
           } else if (rpcThreadId && body.method === 'thread/resume' && threadBroker.isWriterReady(rpcThreadId)) {
             // A second browser opening an already materialized thread should
             // receive its read-only state instead of attempting to acquire a
@@ -8718,6 +8741,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 }
                 const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
                 threadBroker.markWriterReady(rpcThreadId)
+                threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
                 return result
               })
             } catch (error) {
@@ -8733,7 +8757,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 await threadBroker.ensureWriterReady(rpcThreadId, async () => {
                   await appServer.rpc('thread/resume', { threadId: rpcThreadId })
                 })
-                return await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+                const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+                threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
+                return result
               },
             )
           } else {
@@ -8980,6 +9006,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               appServer.getStreamEvents(threadId, 40),
               appServer.getStreamCursor(),
               sessionActivity,
+              threadBroker.getWriter(threadId),
             )
             setJson(res, 200, { ...cachedRecord, ...taskSnapshot })
             return
@@ -9029,6 +9056,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             appServer.getStreamEvents(threadId, 40),
             appServer.getStreamCursor(),
             sessionActivity,
+            threadBroker.getWriter(threadId),
           )
 
           const responseData = {

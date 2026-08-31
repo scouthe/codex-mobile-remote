@@ -7,6 +7,12 @@
 export class ThreadSessionBroker {
   private readonly chains = new Map<string, Promise<void>>()
   private readonly writerReady = new Map<string, number>()
+  private readonly writers = new Map<string, {
+    clientId: string
+    clientType: 'desktop' | 'android' | 'web' | 'unknown'
+    generation: number
+    claimedAt: string
+  }>()
 
   constructor(private readonly getGeneration: () => number = () => 0) {}
 
@@ -69,7 +75,38 @@ export class ThreadSessionBroker {
     if (normalizedThreadId) this.writerReady.set(normalizedThreadId, this.getGeneration())
   }
 
+  claimWriter(threadId: string, identity: { clientId: string; clientType: 'desktop' | 'android' | 'web' | 'unknown' }): void {
+    const normalizedThreadId = threadId.trim()
+    const clientId = identity.clientId.trim()
+    if (!normalizedThreadId || !clientId) return
+    const generation = this.getGeneration()
+    const current = this.writers.get(normalizedThreadId)
+    if (current?.generation === generation && current.clientId === clientId) return
+    this.writers.set(normalizedThreadId, {
+      clientId,
+      clientType: identity.clientType,
+      generation,
+      claimedAt: new Date().toISOString(),
+    })
+  }
+
+  getWriter(threadId: string): {
+    clientId: string
+    clientType: 'desktop' | 'android' | 'web' | 'unknown'
+    generation: number
+    claimedAt: string
+  } | null {
+    const normalizedThreadId = threadId.trim()
+    const current = this.writers.get(normalizedThreadId)
+    if (!current || current.generation !== this.getGeneration()) {
+      if (current) this.writers.delete(normalizedThreadId)
+      return null
+    }
+    return { ...current }
+  }
+
   clearWriterState(): void {
     this.writerReady.clear()
+    this.writers.clear()
   }
 }
