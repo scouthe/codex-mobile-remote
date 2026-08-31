@@ -88,6 +88,8 @@ export type TaskSnapshot = {
   timeline: TaskTimelineEvent[]
   error: string | null
   revision: string
+  /** The selected thread is served from a bounded observer projection. */
+  fullHydrationDeferred?: boolean
 }
 
 export type TaskObservation = {
@@ -106,6 +108,8 @@ export type TaskObservation = {
   terminalState?: 'completed' | 'failed' | 'canceled' | ''
   terminalError?: string
   revision?: string
+  /** Preserve the bounded observer hint across state updates. */
+  fullHydrationDeferred?: boolean
 }
 
 export type TaskStateTransition = {

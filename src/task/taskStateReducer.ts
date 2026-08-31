@@ -190,6 +190,7 @@ export function createTaskSnapshot(threadId: string, initial: Partial<TaskSnapsh
     timeline: initial.timeline ?? [],
     error: initial.error ?? null,
     revision: initial.revision ?? '',
+    ...(initial.fullHydrationDeferred !== undefined ? { fullHydrationDeferred: initial.fullHydrationDeferred } : {}),
   }
 }
 
@@ -211,6 +212,9 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
   let error = observation.error === undefined ? snapshot.error : observation.error
   let timeline = snapshot.timeline
   let queueDepth = observation.queue?.depth ?? snapshot.queueDepth
+  const fullHydrationDeferred = observation.fullHydrationDeferred === undefined
+    ? snapshot.fullHydrationDeferred
+    : observation.fullHydrationDeferred
   let queueTimelineAppended = false
   let lastStateEventAtMs: number | null = null
 
@@ -551,6 +555,7 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
     timeline,
     error,
     revision: observation.revision ?? snapshot.revision,
+    ...(fullHydrationDeferred !== undefined ? { fullHydrationDeferred } : {}),
   }
 }
 
