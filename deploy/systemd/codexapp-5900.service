@@ -1,0 +1,18 @@
+[Unit]
+Description=Codexapp web interface on port 5900
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/common/codex-mobile-remote
+Environment=HOME=%h
+Environment=CODEX_HOME=%h/.codex
+Environment=PATH=%h/.nvm/versions/node/v22.22.1/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env node %h/common/codex-mobile-remote/dist-cli/index.js --no-login --no-tunnel --no-open --no-password --port 5900 --app-server-socket %h/.codex/app-server-control/app-server-control.sock
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

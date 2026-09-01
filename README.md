@@ -90,6 +90,28 @@ The response reports `mode: "shared-proxy"` when the Desktop-owned server is
 being used. Do not change the Windows Desktop connection or its app-server
 startup command.
 
+### Keep the web service running (Linux)
+
+To keep port 5900 available after the terminal that started codexapp closes,
+install the included user-level systemd unit:
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 deploy/systemd/codexapp-5900.service \
+  ~/.config/systemd/user/codexapp-5900.service
+systemctl --user daemon-reload
+systemctl --user enable --now codexapp-5900.service
+```
+
+The unit expects this checkout at `~/common/codex-mobile-remote` and Node.js
+22.22.1 under `~/.nvm`; adjust `WorkingDirectory`, `ExecStart`, and `PATH` if
+your local paths differ. Check or restart it with:
+
+```bash
+systemctl --user status codexapp-5900.service
+systemctl --user restart codexapp-5900.service
+```
+
 ### Linux 🐧
 ```bash
 node -v   # should be 18+
