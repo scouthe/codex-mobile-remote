@@ -213,37 +213,167 @@ and the native bridge contract, see [`android/README.md`](./android/README.md).
 
 ---
 
-## iPhone / iPad via Tailscale Serve
+## Tailscale Serve deployment (private remote access)
 
-If you want to use codexUI from iPhone or iPad Safari, serving it over HTTPS is recommended.
+Tailscale Serve is the recommended way to reach `codexapp` from a phone or
+another computer without opening port `5900` to the public Internet. It creates
+an HTTPS endpoint that is available only to devices in your tailnet. The same
+endpoint works in a mobile browser, iPhone/iPad Safari, or the native Android
+Remote APK.
 
-A practical private setup is to run codexUI locally and publish it inside your tailnet with Tailscale Serve:
-
-```powershell
-npx codexapp --no-tunnel --port 5900
-tailscale serve --bg 5900
-```
-
-Then open:
+The connection path is:
 
 ```text
-https://<your-machine>.<your-tailnet>.ts.net
+Android / browser
+        │ HTTPS (Tailscale Serve, tailnet only)
+        ▼
+Ubuntu: codexapp :5900
+        │ official app-server proxy + Unix socket
+        ▼
+Ubuntu: official Codex app-server
+        ▲
+        │ SSH
+Windows Codex Desktop
 ```
 
-This setup worked well in practice for:
+### 1. Prepare the computer that runs Codex
 
-- iPhone Safari access
-- Add to Home Screen
-- the built-in dictation / transcription feature in the app
-- viewing the same projects and conversations from the Windows host
+Install and authenticate Tailscale on the same computer that owns the Codex
+CLI and this checkout. Verify that the daemon is connected:
 
-Notes:
+```bash
+tailscale version
+tailscale status
+tailscale ip -4
+```
 
-- Tailscale Serve keeps access private to your tailnet
-- on iOS, HTTPS / secure context appears to be important for mobile browser access and dictation
-- some minor mobile Safari CSS issues may still exist, but they do not prevent normal use
-- depending on proxying details, authentication behavior may differ from direct remote access
-- if conversations created in the web UI do not immediately appear in the Windows app, restarting the Windows app may refresh them
+On a new Linux installation, start the daemon and authenticate it using the
+normal Tailscale flow:
+
+```bash
+sudo systemctl enable --now tailscaled
+sudo tailscale up
+```
+
+Do not paste an auth key, API key, or password into the repository or into a
+public issue.
+
+### 2. Build and keep `codexapp` running
+
+From this repository, use the `main` branch and build the web bridge:
+
+```bash
+git switch main
+pnpm install
+pnpm run build
+```
+
+For a persistent Linux service, install the included user-level systemd unit
+and start it:
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 deploy/systemd/codexapp-5900.service \
+  ~/.config/systemd/user/codexapp-5900.service
+systemctl --user daemon-reload
+systemctl --user enable --now codexapp-5900.service
+systemctl --user status codexapp-5900.service --no-pager
+```
+
+Confirm that the bridge is attached to the official shared app-server:
+
+```bash
+curl -fsS http://127.0.0.1:5900/codex-api/app-server/status
+```
+
+The response should report `mode: "shared-proxy"` and a usable configured
+socket. If the official app-server is not running, codexapp can bootstrap the
+official process when the first request arrives; it never starts a separate
+standalone replacement server.
+
+### 3. Publish port 5900 inside the tailnet
+
+Inspect any existing Serve configuration first, especially if this machine
+already publishes another service:
+
+```bash
+tailscale serve status
+```
+
+Add the local bridge at the root of the machine's HTTPS hostname:
+
+```bash
+tailscale serve --bg 5900
+tailscale serve status
+```
+
+Tailscale prints a URL similar to:
+
+```text
+https://scouthe.<your-tailnet>.ts.net
+```
+
+The command is persistent in Tailscale's configuration and does not expose a
+new public Internet port. Do not run `tailscale serve reset` on a host that
+also serves other applications unless you intend to remove their routes.
+
+For a short-lived foreground test, omit `--bg` and stop it with `Ctrl-C` when
+finished. Use `tailscale funnel` only if you deliberately want public Internet
+exposure; it is not needed for this private remote client.
+
+### 4. Connect from a browser or the Android APK
+
+On the phone or client computer:
+
+1. Install Tailscale and sign in to the same tailnet.
+2. Verify that the Ubuntu device is reachable in the Tailscale app.
+3. Open the HTTPS hostname printed by `tailscale serve status`.
+
+For the native Android client, build and install the APK if needed:
+
+```bash
+cd android
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+Open **Codex Remote**, enter the complete `https://...ts.net` URL, and tap
+**Connect**. The APK stores the endpoint and optional codexapp password for
+future launches, reconnects after Wi-Fi/Tailscale changes, and keeps Codex
+execution on the computer. It does not install Codex CLI or another
+app-server on Android.
+
+If the server was started with `--no-password` (as in the included private
+systemd unit), leave the password field empty. That option is appropriate only
+when the Tailscale tailnet is trusted; never combine it with a public Funnel or
+an unauthenticated public reverse proxy.
+
+### 5. iPhone / iPad Safari
+
+Open the same Tailscale HTTPS URL in Safari. HTTPS provides the secure context
+needed by mobile browser features such as dictation and **Add to Home Screen**.
+The browser and Android APK both see the same projects, conversation history,
+task progress, queue, approvals, and user-input requests through `codexapp`.
+
+### Troubleshooting Tailscale connections
+
+```bash
+# Tailscale routing and Serve configuration
+tailscale status
+tailscale serve status
+
+# Local bridge and official app-server health
+curl -fsS http://127.0.0.1:5900/codex-api/app-server/status
+curl -fsS https://<machine>.<your-tailnet>.ts.net/codex-api/app-server/status
+```
+
+- If the local URL works but the HTTPS URL does not, check that both devices
+  are signed in to the same tailnet and that Tailscale ACLs allow access.
+- If the page loads but Codex requests fail, check the local status response,
+  the official socket path, and `journalctl --user -u codexapp-5900.service`.
+- If Android asks for a password, that is the codexapp authentication layer,
+  not a Tailscale password. Supply the server password or use the documented
+  trusted-tailnet configuration.
 
 ---
 
