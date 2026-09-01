@@ -21,7 +21,6 @@ import {
   APP_SERVER_SOCKET_ENV_KEY,
   parseApprovalPolicy,
   parseSandboxMode,
-  requireSharedAppServerSocket,
 } from '../server/appServerRuntimeConfig.js'
 import { createServer as createApp } from '../server/httpServer.js'
 import { generatePassword } from '../server/password.js'
@@ -534,10 +533,10 @@ async function startServer(options: {
       delete process.env[APP_SERVER_SOCKET_ENV_KEY]
     }
   }
-  // This remote bridge is intentionally shared-only. Fail before binding the
-  // web port when no official Codex app-server socket was configured, rather
-  // than exposing a page that could never execute a request.
-  requireSharedAppServerSocket()
+  // The bridge uses the official shared socket. If the official app-server is
+  // not running yet, the first RPC bootstraps it and waits for the socket;
+  // keeping web startup independent lets the status page explain a failed
+  // bootstrap instead of making the whole 5900 service unavailable.
   if (options.login && !hasCodexAuth()) {
     console.log('\nCodex is not logged in. You can log in later via settings or run `codexui login`.\n')
   }

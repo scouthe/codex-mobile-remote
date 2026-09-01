@@ -69,8 +69,10 @@ conversation state, and task events:
 npx codexapp --no-tunnel --port 5900
 ```
 
-The socket must already exist and be readable by the user running codexapp.
-You can use the equivalent CLI option:
+The official app-server socket is used directly. If it is not running yet,
+codexapp starts the official `codex app-server --listen unix://` process,
+waits for the standard socket, and then connects through the official proxy.
+You can use the equivalent CLI option to point at a non-default socket:
 
 ```bash
 npx codexapp --app-server-socket "$HOME/.codex/app-server-control/app-server-control.sock"
@@ -79,11 +81,11 @@ npx codexapp --app-server-socket "$HOME/.codex/app-server-control/app-server-con
 By default codexapp uses `$CODEX_HOME/app-server-control/app-server-control.sock`
 (`~/.codex/app-server-control/app-server-control.sock` when `CODEX_HOME` is not
 set). Override it with `CODEXUI_APP_SERVER_SOCKET` or
-`--app-server-socket` when the official socket lives elsewhere. If the socket
-is unavailable, the web service remains available for diagnostics, but
-app-server requests fail closed; codexapp never starts a standalone
-replacement. Once the official socket is available again, retry the request
-and codexapp reconnects through the proxy. Check the active mode with:
+`--app-server-socket` when the official socket lives elsewhere. If startup
+fails, the web service remains available for diagnostics and reports the
+official app-server error; codexapp never starts a separate replacement
+bridge. Once the official socket is available, retry the request and
+codexapp reconnects through the proxy. Check the active mode with:
 
 ```bash
 curl http://127.0.0.1:5900/codex-api/app-server/status
@@ -115,7 +117,8 @@ systemctl --user restart codexapp-5900.service
 ```
 
 All launch examples below use the official app-server socket described above.
-This fork does not support standalone app-server startup.
+The only automatic child process is the official Codex app-server itself; the
+web bridge always connects through `codex app-server proxy`.
 
 ### Linux 🐧
 ```bash

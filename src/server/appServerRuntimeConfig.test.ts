@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   APP_SERVER_SOCKET_ENV_KEY,
   buildAppServerArgs,
+  buildOfficialAppServerArgs,
   buildAppServerProxyArgs,
   requireSharedAppServerSocket,
   resolveSharedAppServerSocket,
@@ -78,5 +79,21 @@ describe('app-server runtime config', () => {
       if (originalCodexHome === undefined) delete process.env.CODEX_HOME
       else process.env.CODEX_HOME = originalCodexHome
     }
+  })
+
+  it('builds the official Unix app-server bootstrap command', () => {
+    expect(buildOfficialAppServerArgs('/tmp/codex-official.sock')).toEqual([
+      'app-server',
+      '--listen',
+      'unix:///tmp/codex-official.sock',
+    ])
+  })
+
+  it('uses the standard Unix transport when no socket override is available', () => {
+    expect(buildOfficialAppServerArgs(null)).toEqual([
+      'app-server',
+      '--listen',
+      'unix://',
+    ])
   })
 })
