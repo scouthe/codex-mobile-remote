@@ -11,8 +11,14 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
 import { writeFile } from 'node:fs/promises'
+import { Duplex } from 'node:stream'
+import WebSocket from 'ws'
 import { handleAccountRoutes } from './accountRoutes.js'
-import { buildAppServerArgs } from './appServerRuntimeConfig.js'
+import {
+  buildAppServerArgs,
+  buildAppServerProxyArgs,
+  resolveSharedAppServerSocket,
+} from './appServerRuntimeConfig.js'
 import { callRpcWithRateLimitDecodeRecovery } from './rateLimitDecodeRecovery.js'
 import { handleReviewRoutes } from './reviewGit.js'
 import { handleSkillsRoutes, initializeSkillsSyncOnStartup } from './skillsRoutes.js'
@@ -7597,6 +7603,58 @@ const MERGEABLE_ITEM_TYPES = new Set([
 // interrupting an active turn.
 const IDLE_WRITER_RELEASE_DELAY_MS = 1200
 
+type AppServerLaunchMode = 'standalone' | 'shared-proxy'
+
+function isUsableAppServerSocket(socketPath: string): boolean {
+  try {
+    return statSync(socketPath).isSocket()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The official `codex app-server proxy` forwards bytes, while the Unix
+ * control socket speaks WebSocket.  Wrap the proxy's stdio in a Duplex so the
+ * normal ws client can perform the official handshake and framing without
+ * changing Desktop's process or protocol.
+ */
+function createProxyProcessDuplex(child: ChildProcessWithoutNullStreams): Duplex {
+  const duplex = new Duplex({
+    read() {
+      child.stdout.resume()
+    },
+    write(chunk, encoding, callback) {
+      if (child.stdin.destroyed || !child.stdin.writable) {
+        callback(new Error('codex app-server proxy stdin is closed'))
+        return
+      }
+      child.stdin.write(chunk, encoding, callback)
+    },
+    final(callback) {
+      child.stdin.end(callback)
+    },
+    destroy(error, callback) {
+      if (!child.killed) {
+        try {
+          child.kill('SIGTERM')
+        } catch {
+          // The process-exit handler performs the final cleanup.
+        }
+      }
+      callback(error)
+    },
+  })
+
+  child.stdout.on('data', (chunk: Buffer) => {
+    if (!duplex.destroyed) duplex.push(chunk)
+  })
+  child.stdout.once('end', () => duplex.push(null))
+  child.stdout.once('error', (error) => duplex.destroy(error))
+  child.stdin.once('error', (error) => duplex.destroy(error))
+  return duplex
+}
+
 export class AppServerProcess {
   private process: ChildProcessWithoutNullStreams | null = null
   private processGeneration = 0
@@ -7626,8 +7684,12 @@ export class AppServerProcess {
   private readonly sessionActivityReader = new ThreadSessionActivityReader()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
   private activeConfigSignature = ''
+  private activeLaunchMode: AppServerLaunchMode = 'standalone'
   private readonly activeTurnThreadIds = new Set<string>()
   private idleWriterReleaseTimer: ReturnType<typeof setTimeout> | null = null
+  private lastSharedSocketWarning = ''
+  private sharedWebSocket: WebSocket | null = null
+  private sharedTransportReadyPromise: Promise<void> | null = null
 
 
   private getCodexCommand(): string {
@@ -7638,7 +7700,40 @@ export class AppServerProcess {
     return codexCommand
   }
 
-  private buildAppServerConfig(): { args: string[]; env: Record<string, string> } {
+  private buildAppServerConfig(): {
+    args: string[]
+    env: Record<string, string>
+    launchMode: AppServerLaunchMode
+    sharedSocketPath: string | null
+  } {
+    const configuredSocketPath = resolveSharedAppServerSocket()
+    if (configuredSocketPath) {
+      if (isUsableAppServerSocket(configuredSocketPath)) {
+        const proxyArgs = buildAppServerProxyArgs(configuredSocketPath)
+        if (proxyArgs) {
+          return {
+            args: proxyArgs,
+            env: {},
+            launchMode: 'shared-proxy',
+            sharedSocketPath: configuredSocketPath,
+          }
+        }
+      }
+
+      // A missing/stale socket should not make the web UI unusable.  Keep the
+      // existing self-managed app-server path as a compatibility fallback;
+      // when Desktop comes back and recreates the socket, the config signature
+      // changes and the next request reconnects through the official proxy.
+      const warningKey = configuredSocketPath
+      if (this.lastSharedSocketWarning !== warningKey) {
+        this.lastSharedSocketWarning = warningKey
+        console.warn(
+          `[app-server] Shared socket is unavailable: ${configuredSocketPath}. `
+          + 'Falling back to a codexapp-managed app-server.',
+        )
+      }
+    }
+
     const args = buildAppServerArgs()
     let extraEnv: Record<string, string> = {}
     const serverPort = parseInt(process.env.CODEXUI_SERVER_PORT ?? '', 10) || undefined
@@ -7653,15 +7748,27 @@ export class AppServerProcess {
     } catch {
       // No free-mode state or invalid — use defaults
     }
-    return { args, env: extraEnv }
+    return {
+      args,
+      env: extraEnv,
+      launchMode: 'standalone',
+      sharedSocketPath: null,
+    }
   }
 
-  private getAppServerConfigSignature(config: { args: string[]; env: Record<string, string> }): string {
+  private getAppServerConfigSignature(config: {
+    args: string[]
+    env: Record<string, string>
+    launchMode: AppServerLaunchMode
+    sharedSocketPath: string | null
+  }): string {
     return JSON.stringify({
       args: config.args,
       env: Object.keys(config.env)
         .sort()
         .map((key) => [key, config.env[key]]),
+      launchMode: config.launchMode,
+      sharedSocketPath: config.sharedSocketPath,
     })
   }
 
@@ -7696,29 +7803,37 @@ export class AppServerProcess {
     this.liveStateCache.clear()
     const config = this.buildAppServerConfig()
     this.activeConfigSignature = this.getAppServerConfigSignature(config)
+    this.activeLaunchMode = config.launchMode
     const invocation = getSpawnInvocation(this.getCodexCommand(), config.args)
+    if (config.launchMode === 'shared-proxy') {
+      console.info(`[app-server] Using Desktop-owned app-server via ${config.sharedSocketPath}`)
+    }
     const spawnEnv = Object.keys(config.env).length > 0
       ? { ...process.env, ...config.env }
       : undefined
     const proc = spawn(invocation.command, invocation.args, { stdio: ['pipe', 'pipe', 'pipe'], ...(spawnEnv ? { env: spawnEnv } : {}) })
     this.process = proc
 
-    proc.stdout.setEncoding('utf8')
-    proc.stdout.on('data', (chunk: string) => {
-      this.readBuffer += chunk
+    if (config.launchMode === 'shared-proxy' && config.sharedSocketPath) {
+      this.connectSharedProxy(proc)
+    } else {
+      proc.stdout.setEncoding('utf8')
+      proc.stdout.on('data', (chunk: string) => {
+        this.readBuffer += chunk
 
-      let lineEnd = this.readBuffer.indexOf('\n')
-      while (lineEnd !== -1) {
-        const line = this.readBuffer.slice(0, lineEnd).trim()
-        this.readBuffer = this.readBuffer.slice(lineEnd + 1)
+        let lineEnd = this.readBuffer.indexOf('\n')
+        while (lineEnd !== -1) {
+          const line = this.readBuffer.slice(0, lineEnd).trim()
+          this.readBuffer = this.readBuffer.slice(lineEnd + 1)
 
-        if (line.length > 0) {
-          this.handleLine(line)
+          if (line.length > 0) {
+            this.handleLine(line)
+          }
+
+          lineEnd = this.readBuffer.indexOf('\n')
         }
-
-        lineEnd = this.readBuffer.indexOf('\n')
-      }
-    })
+      })
+    }
 
     proc.stderr.setEncoding('utf8')
     proc.stderr.on('data', () => {
@@ -7738,6 +7853,8 @@ export class AppServerProcess {
       this.pending.clear()
       this.pendingServerRequests.clear()
       this.process = null
+      this.sharedWebSocket = null
+      this.sharedTransportReadyPromise = null
       // Invalidate broker writer ownership immediately when the child exits;
       // the next mutation must perform a fresh thread/resume.
       this.processGeneration += 1
@@ -7747,9 +7864,71 @@ export class AppServerProcess {
     })
   }
 
+  private connectSharedProxy(proc: ChildProcessWithoutNullStreams): void {
+    const proxyDuplex = createProxyProcessDuplex(proc)
+    const socket = new WebSocket('ws://codexapp-shared-app-server.invalid/', {
+      // Codex's Unix transport intentionally does not negotiate per-message
+      // deflate.  Leaving ws' default enabled makes the server reject the
+      // handshake with "incorrect sec-websocket-extensions".
+      perMessageDeflate: false,
+      handshakeTimeout: 10_000,
+      createConnection: () => proxyDuplex,
+    })
+    this.sharedWebSocket = socket
+    this.sharedTransportReadyPromise = new Promise<void>((resolve, reject) => {
+      let settled = false
+      socket.once('open', () => {
+        settled = true
+        resolve()
+      })
+      socket.once('error', (error: Error) => {
+        if (settled) return
+        settled = true
+        reject(error)
+      })
+    })
+
+    socket.on('message', (data: WebSocket.RawData) => {
+      const line = Buffer.isBuffer(data)
+        ? data.toString('utf8')
+        : Array.isArray(data)
+          ? Buffer.concat(data).toString('utf8')
+          : Buffer.from(data as ArrayBuffer).toString('utf8')
+      if (line.trim().length > 0) this.handleLine(line)
+    })
+    socket.on('error', (error: Error) => {
+      if (this.process !== proc || this.stopping) return
+      // A handshake or transport error must not leave a permanently pending
+      // promise while the proxy child remains alive.  Terminating the child
+      // lets the common exit path reject in-flight RPCs and clear the state.
+      console.warn(`[app-server] Shared app-server proxy failed: ${error.message}`)
+      try {
+        proc.kill('SIGTERM')
+      } catch {
+        // The exit handler below still handles a child that is already gone.
+      }
+    })
+    socket.on('close', () => {
+      if (this.process !== proc || this.stopping) return
+      try {
+        proc.kill('SIGTERM')
+      } catch {
+        // The process may already have exited.
+      }
+    })
+  }
+
   private sendLine(payload: Record<string, unknown>): void {
     if (!this.process) {
       throw new Error('codex app-server is not running')
+    }
+
+    if (this.activeLaunchMode === 'shared-proxy') {
+      if (!this.sharedWebSocket || this.sharedWebSocket.readyState !== WebSocket.OPEN) {
+        throw new Error('shared codex app-server proxy is not connected')
+      }
+      this.sharedWebSocket.send(JSON.stringify(payload))
+      return
     }
 
     this.process.stdin.write(`${JSON.stringify(payload)}\n`)
@@ -8155,6 +8334,9 @@ export class AppServerProcess {
 
   private async call(method: string, params: unknown): Promise<unknown> {
     this.start()
+    if (this.sharedTransportReadyPromise) {
+      await this.sharedTransportReadyPromise
+    }
     const id = this.nextId++
 
     return new Promise((resolve, reject) => {
@@ -8243,6 +8425,29 @@ export class AppServerProcess {
     return this.processGeneration
   }
 
+  getConnectionStatus(): {
+    mode: AppServerLaunchMode
+    running: boolean
+    configuredSocketPath: string | null
+    socketAvailable: boolean
+  } {
+    const configuredSocketPath = resolveSharedAppServerSocket()
+    const socketAvailable = configuredSocketPath ? isUsableAppServerSocket(configuredSocketPath) : false
+    return {
+      // Before the first RPC the bridge has not spawned a transport yet, but
+      // reporting the selected launch mode makes the status endpoint useful
+      // for startup diagnostics as well.
+      mode: this.process
+        ? this.activeLaunchMode
+        : socketAvailable
+          ? 'shared-proxy'
+          : 'standalone',
+      running: this.process !== null,
+      configuredSocketPath,
+      socketAvailable,
+    }
+  }
+
   private rememberThreadSummaries(result: unknown): void {
     const record = asRecord(result)
     const rows = Array.isArray(record?.data)
@@ -8306,13 +8511,21 @@ export class AppServerProcess {
     if (!this.process) return
 
     const proc = this.process
+    const sharedWebSocket = this.sharedWebSocket
     this.stopping = true
     this.process = null
+    this.sharedWebSocket = null
+    this.sharedTransportReadyPromise = null
     this.processGeneration += 1
     this.initialized = false
     this.initializePromise = null
     this.activeConfigSignature = ''
+    this.activeLaunchMode = 'standalone'
     this.readBuffer = ''
+
+    if (sharedWebSocket && sharedWebSocket.readyState !== WebSocket.CLOSED) {
+      sharedWebSocket.terminate()
+    }
 
     const failure = new Error('codex app-server stopped')
     for (const request of this.pending.values()) {
@@ -9382,6 +9595,14 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
       if (req.method === 'POST' && url.pathname === '/codex-api/upload-file') {
         handleFileUpload(req, res)
+        return
+      }
+
+      if (req.method === 'GET' && url.pathname === '/codex-api/app-server/status') {
+        setJson(res, 200, {
+          data: appServer.getConnectionStatus(),
+          generation: appServer.getProcessGeneration(),
+        })
         return
       }
 
