@@ -654,7 +654,7 @@ program
   .option('--no-memories', 'disable Codex memories for spawned app-server processes')
   .option('--sandbox-mode <mode>', 'Codex sandbox mode: read-only, workspace-write, danger-full-access')
   .option('--approval-policy <policy>', 'Codex approval policy: untrusted, on-failure, on-request, never')
-  .option('--app-server-socket <path>', 'required: connect through the official Codex app-server Unix socket')
+  .option('--app-server-socket <path>', 'override the official Codex app-server Unix socket path')
   .action(async (
     projectPath: string | undefined,
     opts: {

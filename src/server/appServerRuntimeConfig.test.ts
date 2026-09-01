@@ -46,16 +46,37 @@ describe('app-server runtime config', () => {
     }
   })
 
-  it('leaves proxy args unset when no shared socket is configured', () => {
+  it('uses the official socket path derived from CODEX_HOME by default', () => {
+    const originalCodexHome = process.env.CODEX_HOME
     delete process.env[APP_SERVER_SOCKET_ENV_KEY]
-    expect(resolveSharedAppServerSocket()).toBeNull()
-    expect(buildAppServerProxyArgs()).toBeNull()
+    process.env.CODEX_HOME = '/tmp/codex-default-home'
+    try {
+      expect(resolveSharedAppServerSocket()).toBe(
+        '/tmp/codex-default-home/app-server-control/app-server-control.sock',
+      )
+      expect(buildAppServerProxyArgs()).toEqual([
+        'app-server',
+        'proxy',
+        '--sock',
+        '/tmp/codex-default-home/app-server-control/app-server-control.sock',
+      ])
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+    }
   })
 
-  it('requires a shared socket for the main Codex bridge', () => {
+  it('resolves the default official socket for the main Codex bridge', () => {
+    const originalCodexHome = process.env.CODEX_HOME
     delete process.env[APP_SERVER_SOCKET_ENV_KEY]
-    expect(() => requireSharedAppServerSocket()).toThrow(
-      /Shared Codex app-server socket is not configured/u,
-    )
+    process.env.CODEX_HOME = '/tmp/codex-missing-default-home'
+    try {
+      expect(requireSharedAppServerSocket()).toBe(
+        '/tmp/codex-missing-default-home/app-server-control/app-server-control.sock',
+      )
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = originalCodexHome
+    }
   })
 })
