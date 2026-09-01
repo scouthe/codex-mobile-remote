@@ -1,3 +1,6 @@
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
 const SANDBOX_MODES = new Set([
   'read-only',
   'workspace-write',
@@ -28,6 +31,10 @@ type AppServerRuntimeConfig = {
  * local sandbox/provider overrides to the Codex process.
  */
 export const APP_SERVER_SOCKET_ENV_KEY = 'CODEXUI_APP_SERVER_SOCKET'
+const DEFAULT_SHARED_APP_SERVER_SOCKET_RELATIVE_PATH = join(
+  'app-server-control',
+  'app-server-control.sock',
+)
 
 const DEFAULT_RUNTIME_CONFIG: AppServerRuntimeConfig = {
   sandboxMode: 'danger-full-access',
@@ -75,8 +82,11 @@ export function resolveAppServerRuntimeConfig(): AppServerRuntimeConfig {
 }
 
 export function resolveSharedAppServerSocket(): string | null {
-  const socketPath = process.env[APP_SERVER_SOCKET_ENV_KEY]?.trim() ?? ''
-  return socketPath.length > 0 ? socketPath : null
+  const configuredSocketPath = process.env[APP_SERVER_SOCKET_ENV_KEY]?.trim() ?? ''
+  if (configuredSocketPath.length > 0) return configuredSocketPath
+
+  const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
+  return join(codexHome, DEFAULT_SHARED_APP_SERVER_SOCKET_RELATIVE_PATH)
 }
 
 export function requireSharedAppServerSocket(): string {

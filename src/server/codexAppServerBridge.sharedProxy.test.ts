@@ -15,10 +15,13 @@ const buildConfig = (appServer: AppServerProcess): {
 ).buildAppServerConfig()
 
 const originalSocketPath = process.env[APP_SERVER_SOCKET_ENV_KEY]
+const originalCodexHome = process.env.CODEX_HOME
 
 afterEach(() => {
   if (originalSocketPath === undefined) delete process.env[APP_SERVER_SOCKET_ENV_KEY]
   else process.env[APP_SERVER_SOCKET_ENV_KEY] = originalSocketPath
+  if (originalCodexHome === undefined) delete process.env.CODEX_HOME
+  else process.env.CODEX_HOME = originalCodexHome
 })
 
 describe('shared app-server launch guard', () => {
@@ -36,12 +39,13 @@ describe('shared app-server launch guard', () => {
     )
   })
 
-  it('requires the shared socket instead of starting a standalone app-server', () => {
+  it('uses the default socket instead of starting a standalone app-server', () => {
     delete process.env[APP_SERVER_SOCKET_ENV_KEY]
+    process.env.CODEX_HOME = `/tmp/codex-default-missing-${Date.now()}`
     const appServer = new AppServerProcess()
 
     expect(() => buildConfig(appServer)).toThrow(
-      /Shared Codex app-server socket is not configured/u,
+      /Shared Codex app-server socket is unavailable/u,
     )
   })
 })
