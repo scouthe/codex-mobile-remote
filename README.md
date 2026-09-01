@@ -11,6 +11,38 @@
 >  
 > **Yes, that is your Codex desktop app experience exposed over web UI. Yes, it runs cross-platform.**
 
+## 本分支相对原仓库的修改与优化
+
+本仓库是在上游 `codex-mobile` 基础上维护的 Codex 专用远程显示与交互分支，
+重点是让浏览器（手机、桌面端）和同一台机器上的官方 Codex 客户端共享真实的
+Codex 会话，而不是把项目变成另一个独立的多模型平台。
+
+- **官方 app-server 共享连接**：默认连接
+  `$CODEX_HOME/app-server-control/app-server-control.sock`，通过官方
+  `codex app-server proxy` 转发，不修改 Desktop 配置，不注入新的 provider、模型或权限策略。
+- **官方服务自动引导**：标准 socket 尚未启动时，自动启动官方
+  `codex app-server --listen unix://`，等待 socket 就绪后再连接；不会启动旧版
+  standalone 替代服务，也不会创建第二套 Codex 会话状态。
+- **跨客户端同步**：网页端与官方 Codex 客户端共享项目、历史对话、运行状态、审批/输入请求和任务事件；
+  支持 Desktop/手机同时观察同一任务。
+- **任务与发送稳定性**：统一排队、发送、引导（steer）、停止（interrupt）路由，处理重复提交、
+  服务重启恢复、writer 冲突和空闲会话误入队列等情况。
+- **历史记录与切换性能**：项目/线程分页、快速状态投影、延迟加载大型历史对话，减少切换会话时的卡顿和状态回退。
+- **移动端体验**：任务活动时间线、运行中状态展示、审批和用户输入卡片、侧栏状态同步，以及输入框安全区域优化。
+- **兼容原有功能**：保留上游的项目管理、Skills、文件浏览、导入导出、Telegram 和隧道能力；
+  账号刷新所需的临时隔离 app-server 仍然保留。
+
+### 推荐的源码启动方式
+
+```bash
+pnpm install
+pnpm run build
+node dist-cli/index.js --no-tunnel --port 5900
+```
+
+默认情况下不需要手动查找或填写 app-server socket。只要官方 Codex CLI 和登录配置正常，
+首次请求会自动连接现有官方服务，或按需启动它。
+
 ```text
  ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗██╗   ██╗██╗
 ██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝██║   ██║██║
@@ -295,11 +327,16 @@ Outgoing assistant messages are sent with Telegram `parse_mode=HTML` for formatt
 │         codexapp            │
 │  (Express + Vue UI bridge)  │
 └──────────────┬──────────────┘
-               │ RPC/Bridge calls
+               │ official `codex app-server proxy`
+               │ Unix control socket
 ┌──────────────▼──────────────┐
-│      Codex App Server       │
+│   Official Codex App Server  │
+│  auto-started when missing   │
 └─────────────────────────────┘
 ```
+
+The Windows Codex Desktop client and codexapp can use the same official app-server
+on the Ubuntu host. codexapp does not replace or reconfigure the Desktop client.
 
 ---
 
