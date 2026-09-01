@@ -4930,9 +4930,10 @@ export function useDesktopState() {
       return
     }
 
-    if (threadListBackgroundTimer !== null) {
-      window.clearTimeout(threadListBackgroundTimer)
-    }
+    // A forced first-page refresh runs frequently while a task is active.
+    // Keep the already scheduled low-priority page load instead of pushing it
+    // out on every refresh; otherwise the timer can be perpetually starved.
+    if (threadListBackgroundTimer !== null) return
 
     threadListBackgroundTimer = window.setTimeout(() => {
       threadListBackgroundTimer = null
