@@ -80,6 +80,20 @@ export function resolveSharedAppServerSocket(): string | null {
   return socketPath.length > 0 ? socketPath : null
 }
 
+/**
+ * A configured Desktop socket is an architectural requirement, not a hint.
+ * Falling back to a second app-server would split thread state and bring back
+ * the writer-lock failures that shared mode is meant to prevent.
+ */
+export function assertSharedAppServerSocketAvailable(socketPath: string, available: boolean): void {
+  const normalizedSocketPath = socketPath.trim()
+  if (!normalizedSocketPath || available) return
+  throw new Error(
+    `Shared Codex app-server socket is unavailable: ${normalizedSocketPath}. `
+      + 'Start or reconnect Codex Desktop, then retry the request.',
+  )
+}
+
 export function buildAppServerProxyArgs(socketPath = resolveSharedAppServerSocket()): string[] | null {
   const normalizedSocketPath = socketPath?.trim() ?? ''
   if (!normalizedSocketPath) return null

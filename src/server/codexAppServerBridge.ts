@@ -15,6 +15,7 @@ import { Duplex } from 'node:stream'
 import WebSocket from 'ws'
 import { handleAccountRoutes } from './accountRoutes.js'
 import {
+  assertSharedAppServerSocketAvailable,
   buildAppServerArgs,
   buildAppServerProxyArgs,
   resolveSharedAppServerSocket,
@@ -7752,7 +7753,6 @@ export class AppServerProcess {
   private activeLaunchMode: AppServerLaunchMode = 'standalone'
   private readonly activeTurnThreadIds = new Set<string>()
   private idleWriterReleaseTimer: ReturnType<typeof setTimeout> | null = null
-  private lastSharedSocketWarning = ''
   private sharedWebSocket: WebSocket | null = null
   private sharedTransportReadyPromise: Promise<void> | null = null
 
@@ -7773,7 +7773,8 @@ export class AppServerProcess {
   } {
     const configuredSocketPath = resolveSharedAppServerSocket()
     if (configuredSocketPath) {
-      if (isUsableAppServerSocket(configuredSocketPath)) {
+      const socketAvailable = isUsableAppServerSocket(configuredSocketPath)
+      if (socketAvailable) {
         const proxyArgs = buildAppServerProxyArgs(configuredSocketPath)
         if (proxyArgs) {
           return {
@@ -7785,18 +7786,12 @@ export class AppServerProcess {
         }
       }
 
-      // A missing/stale socket should not make the web UI unusable.  Keep the
-      // existing self-managed app-server path as a compatibility fallback;
-      // when Desktop comes back and recreates the socket, the config signature
-      // changes and the next request reconnects through the official proxy.
-      const warningKey = configuredSocketPath
-      if (this.lastSharedSocketWarning !== warningKey) {
-        this.lastSharedSocketWarning = warningKey
-        console.warn(
-          `[app-server] Shared socket is unavailable: ${configuredSocketPath}. `
-          + 'Falling back to a codexapp-managed app-server.',
-        )
-      }
+      // A configured shared socket is an invariant.  Do not silently create
+      // a second app-server while Desktop is restarting: that would split the
+      // thread state and reintroduce writer-lock conflicts.  The web server
+      // remains available, and the next request retries this check after the
+      // Desktop socket is recreated.
+      assertSharedAppServerSocketAvailable(configuredSocketPath, socketAvailable)
     }
 
     const args = buildAppServerArgs()
@@ -8500,11 +8495,11 @@ export class AppServerProcess {
     const socketAvailable = configuredSocketPath ? isUsableAppServerSocket(configuredSocketPath) : false
     return {
       // Before the first RPC the bridge has not spawned a transport yet, but
-      // reporting the selected launch mode makes the status endpoint useful
-      // for startup diagnostics as well.
+      // report the configured launch mode so a missing shared socket is not
+      // mistaken for an intentional standalone fallback.
       mode: this.process
         ? this.activeLaunchMode
-        : socketAvailable
+        : configuredSocketPath
           ? 'shared-proxy'
           : 'standalone',
       running: this.process !== null,
