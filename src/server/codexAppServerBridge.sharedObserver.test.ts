@@ -12,6 +12,7 @@ type RpcCall = { method: string; params: unknown }
 function installFakeSharedBridge(options: {
   blockResume?: boolean
   failFirstTurnStart?: boolean
+  rejectResumeWithNoRollout?: boolean
   failThreadRead?: boolean
   rejectDuplicateResume?: boolean
   rejectResumeWithActiveWriter?: boolean
@@ -34,6 +35,9 @@ function installFakeSharedBridge(options: {
     async rpc(method: string, params: unknown): Promise<unknown> {
       calls.push({ method, params })
       if (method === 'thread/resume') {
+        if (options.rejectResumeWithNoRollout) {
+          throw new Error('no rollout found for thread id shared-thread')
+        }
         if (options.rejectResumeWithActiveWriter) {
           throw new Error('thread already has an active writer')
         }
@@ -669,6 +673,90 @@ describe('shared thread observer HTTP path', () => {
       expect(response.status).toBe(200)
       expect(fake.turnStartCalls).toBe(2)
       expect(fake.calls.filter((call) => call.method === 'thread/resume')).toHaveLength(1)
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+    }
+  })
+
+  it('starts a turn on a newly-created thread when resume has no rollout yet', async () => {
+    const fake = installFakeSharedBridge({
+      blockResume: false,
+      rejectResumeWithNoRollout: true,
+      threadReadResults: [{
+        thread: {
+          id: 'shared-thread',
+          turns: [],
+          path: '/tmp/codex-unmaterialized-thread.jsonl',
+          canAcceptDirectInput: true,
+          status: { type: 'idle' },
+        },
+      }],
+    })
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/rpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          method: 'turn/start',
+          params: { threadId: 'shared-thread', input: [{ type: 'text', text: 'hello' }] },
+        }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(fake.calls.map((call) => call.method)).toEqual(['thread/resume', 'thread/read', 'turn/start'])
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+    }
+  })
+
+  it('returns metadata when an observer resumes a newly-created thread without a rollout', async () => {
+    const fake = installFakeSharedBridge({
+      blockResume: false,
+      rejectResumeWithNoRollout: true,
+      threadReadResults: [{
+        thread: {
+          id: 'shared-thread',
+          turns: [],
+          path: '/tmp/codex-unmaterialized-thread.jsonl',
+          canAcceptDirectInput: true,
+          status: { type: 'idle' },
+        },
+      }],
+    })
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/rpc`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          method: 'thread/resume',
+          params: { threadId: 'shared-thread' },
+        }),
+      })
+
+      expect(response.status).toBe(200)
+      expect(fake.calls.map((call) => call.method)).toEqual(['thread/resume', 'thread/read'])
+      const payload = await response.json() as { result?: { thread?: { id?: string } } }
+      expect(payload.result?.thread?.id).toBe('shared-thread')
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
       instance.dispose()

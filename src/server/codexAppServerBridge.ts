@@ -974,6 +974,71 @@ export function isThreadNotFoundError(error: unknown): boolean {
 }
 
 /**
+ * A thread can be visible to another client immediately after `thread/start`
+ * but before its first user turn has materialized a rollout file.  The
+ * app-server quite correctly rejects `thread/resume` for that state because
+ * resume is a disk-backed operation.  Mutations from the creating client can
+ * still use `turn/start` directly, so probe the cheap metadata projection and
+ * distinguish this state from a genuinely missing or corrupted thread.
+ */
+async function readUnmaterializedThreadMetadata(
+  appServer: RpcExecutor,
+  threadId: string,
+): Promise<unknown | null> {
+  let metadata: unknown
+  try {
+    metadata = await appServer.rpc('thread/read', {
+      threadId,
+      includeTurns: false,
+    })
+  } catch {
+    return null
+  }
+
+  const record = asRecord(metadata)
+  const thread = asRecord(record?.thread)
+  if (!thread || readNonEmptyString(thread.id) !== threadId) return null
+
+  const turns = Array.isArray(thread.turns) ? thread.turns : []
+  if (turns.length > 0 || thread.canAcceptDirectInput === false) return null
+
+  const status = asRecord(thread.status)
+  const statusType = readNonEmptyString(status?.type)
+  if (statusType && !['idle', 'inProgress', 'running', 'active'].includes(statusType)) return null
+
+  const sessionPath = readNonEmptyString(thread.path)
+  if (!sessionPath) return metadata
+  if (!isAbsolute(sessionPath)) return null
+
+  try {
+    const sessionStat = await stat(sessionPath)
+    // A non-empty rollout should be resumed normally.  Empty files are
+    // treated like an unmaterialized thread because the first turn has not
+    // written any durable history yet.
+    return sessionStat.isFile() && sessionStat.size > 0 ? null : metadata
+  } catch (error) {
+    // Missing rollout paths are the expected signature of a just-started
+    // thread.  Permission and other filesystem failures must remain errors.
+    return getErrorCode(error) === 'ENOENT' ? metadata : null
+  }
+}
+
+async function ensureThreadReadyForMutation(
+  appServer: RpcExecutor,
+  threadId: string,
+): Promise<void> {
+  try {
+    await appServer.rpc('thread/resume', { threadId })
+    return
+  } catch (error) {
+    if (!isThreadNotFoundError(error)) throw error
+    const metadata = await readUnmaterializedThreadMetadata(appServer, threadId)
+    if (!metadata) throw error
+    console.info(`[app-server] Thread ${threadId} has no rollout yet; starting the turn without resume`)
+  }
+}
+
+/**
  * Codex app-server uses these messages when another process already owns the
  * local thread writer.  A resume request from a second browser is only trying
  * to materialize the conversation for display, so it can safely downgrade to
@@ -8667,7 +8732,7 @@ export class BackendQueueProcessor {
         })
         try {
           await this.threadBroker.ensureWriterReady(threadId, async () => {
-            await this.appServer.rpc('thread/resume', { threadId })
+            await ensureThreadReadyForMutation(this.appServer, threadId)
           })
           await this.startQueuedTurn(next)
           if (await this.hasQueuedTurns(threadId)) {
@@ -9646,15 +9711,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           if (rpcThreadId && body.method === 'turn/start') {
             const ensureThreadWriter = (threadId: string) => threadBroker.ensureWriterReady(
               threadId,
-              async () => {
-                await appServer.rpc('thread/resume', { threadId })
-              },
+              async () => ensureThreadReadyForMutation(appServer, threadId),
             )
             rpcResult = await threadBroker.runTurn(
               rpcThreadId,
-              async () => {
-                await appServer.rpc('thread/resume', { threadId: rpcThreadId })
-              },
+              async () => ensureThreadReadyForMutation(appServer, rpcThreadId),
               async () => callRpcWithArchiveRecovery(appServer, body.method, rpcParams, {
                 // Recovery runs inside the same broker lock.  Reuse the
                 // generation-aware writer state instead of issuing a second
@@ -9680,17 +9741,29 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 return result
               })
             } catch (error) {
-              if (!isActiveThreadWriterError(error)) throw error
-              // A different app-server process owns this thread.  Preserve the
-              // observer contract by returning the current read-only snapshot.
-              rpcResult = await readThreadSnapshotForObserver(appServer, rpcThreadId)
+              if (isActiveThreadWriterError(error)) {
+                // A different app-server process owns this thread.  Preserve the
+                // observer contract by returning the current read-only snapshot.
+                rpcResult = await readThreadSnapshotForObserver(appServer, rpcThreadId)
+              } else if (isThreadNotFoundError(error)) {
+                // A newly-created thread has metadata in memory but no rollout
+                // file yet.  Resume cannot materialize it; return the metadata
+                // projection so the next turn can call turn/start directly.
+                const metadata = await readUnmaterializedThreadMetadata(appServer, rpcThreadId)
+                if (!metadata) throw error
+                rpcResult = metadata
+                threadBroker.markWriterReady(rpcThreadId)
+                threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
+              } else {
+                throw error
+              }
             }
           } else if (rpcThreadId && ['turn/steer', 'turn/interrupt', 'thread/rollback'].includes(body.method)) {
             rpcResult = await threadBroker.runExclusive(
               rpcThreadId,
               async () => {
                 await threadBroker.ensureWriterReady(rpcThreadId, async () => {
-                  await appServer.rpc('thread/resume', { threadId: rpcThreadId })
+                  await ensureThreadReadyForMutation(appServer, rpcThreadId)
                 })
                 const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
                 threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
