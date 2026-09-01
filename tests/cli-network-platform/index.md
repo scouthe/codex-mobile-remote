@@ -26,3 +26,4 @@ Return to the [manual test index](../../tests.md).
 | [Feature: CLI auto-stars friuns2/codexui on startup (best-effort)](cli-auto-stars-friuns2-codexui-on-startup-best-effort.md) |
 | [Startup welcome log uses repository GitHub URL](startup-welcome-log-uses-repository-github-url.md) |
 | [Home route no longer crashes on dev startup](home-route-no-longer-crashes-on-dev-startup.md) |
+| [Shared app-server socket fails closed during Desktop reconnect](shared-app-server-socket-fails-closed.md) |

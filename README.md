@@ -78,9 +78,12 @@ You can use the equivalent CLI option:
 npx codexapp --app-server-socket "$HOME/.codex/app-server-control/app-server-control.sock"
 ```
 
-If the socket is unavailable, codexapp falls back to its existing standalone
-app-server launch path and logs a warning. Once Desktop recreates the socket,
-the next request reconnects through the proxy. Check the active mode with:
+When a shared socket is configured but unavailable, codexapp fails closed for
+app-server requests instead of starting a second standalone app-server. This
+prevents split thread state and writer-lock conflicts while Desktop is
+restarting. The web service remains available; once Desktop recreates the
+socket, retry the request and codexapp reconnects through the proxy. Check the
+active mode with:
 
 ```bash
 curl http://127.0.0.1:5900/codex-api/app-server/status
