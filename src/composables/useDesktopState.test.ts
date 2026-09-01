@@ -522,6 +522,53 @@ describe('startup request deduplication', () => {
       .toEqual(['older-thread'])
   })
 
+  it('does not starve older pages when active-task refreshes repeat', async () => {
+    installTestWindow()
+    const scheduledCallbacks: Array<() => void> = []
+    vi.mocked(window.setTimeout).mockImplementation(((callback: TimerHandler) => {
+      if (typeof callback === 'function') scheduledCallbacks.push(callback as () => void)
+      return scheduledCallbacks.length
+    }) as typeof window.setTimeout)
+    gatewayMocks.getWorkspaceRootsState.mockResolvedValue({
+      order: ['/home/heheheh/common', '/home/heheheh/Documents/coding/Sim2Glia-CL'],
+      labels: {},
+      active: ['/home/heheheh/common', '/home/heheheh/Documents/coding/Sim2Glia-CL'],
+      projectOrder: ['/home/heheheh/common', '/home/heheheh/Documents/coding/Sim2Glia-CL'],
+      remoteProjects: [],
+    })
+    const firstPage = {
+      groups: [{
+        projectName: 'common',
+        threads: [{ ...thread('active-thread', '/home/heheheh/common'), inProgress: true }],
+      }],
+      nextCursor: 'older-page',
+    }
+    gatewayMocks.getThreadGroupsPage.mockImplementation(async (cursor?: string | null) => cursor ? {
+      groups: [{
+        projectName: 'Sim2Glia-CL',
+        threads: [thread('older-thread', '/home/heheheh/Documents/coding/Sim2Glia-CL')],
+      }],
+      nextCursor: null,
+    } : firstPage)
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    expect(scheduledCallbacks).toHaveLength(1)
+
+    // The status poll uses force=true and reaches the same scheduling path.
+    // It must not replace the existing timer on every pass.
+    await state.refreshAll({ includeSelectedThreadMessages: false, forceThreadRefresh: true, awaitAncillaryRefreshes: true })
+    expect(scheduledCallbacks).toHaveLength(1)
+
+    scheduledCallbacks[0]?.()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenLastCalledWith('older-page', 100)
+    expect(state.projectGroups.value.find((group) => group.projectName === 'Sim2Glia-CL')?.threads.map((row) => row.id))
+      .toEqual(['older-thread'])
+  })
+
   it('reloads cached thread titles on forced thread refresh', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({
