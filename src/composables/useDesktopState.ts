@@ -2702,7 +2702,7 @@ export function useDesktopState() {
       clearInterruptPersistenceGate(threadId)
     }
     applyThreadFlags()
-    if (!nextInProgress && !hasActiveInProgressThreads() && threadListNextCursor) {
+    if (!nextInProgress && threadListNextCursor) {
       scheduleRemainingThreadPages()
     }
   }
@@ -4920,12 +4920,8 @@ export function useDesktopState() {
       })
   }
 
-  function hasActiveInProgressThreads(): boolean {
-    return Object.values(inProgressById.value).some((value) => value === true)
-  }
-
   function scheduleRemainingThreadPages(rootsState: WorkspaceRootsState | null = loadedThreadListRootsState): void {
-    if (!threadListNextCursor || isLoadingRemainingThreadPages || hasActiveInProgressThreads()) return
+    if (!threadListNextCursor || isLoadingRemainingThreadPages) return
 
     loadedThreadListRootsState = rootsState
 
@@ -4940,13 +4936,13 @@ export function useDesktopState() {
 
     threadListBackgroundTimer = window.setTimeout(() => {
       threadListBackgroundTimer = null
-      if (!threadListNextCursor || hasActiveInProgressThreads()) return
+      if (!threadListNextCursor) return
       void loadRemainingThreadPages(loadedThreadListRootsState)
     }, BACKGROUND_THREAD_PAGINATION_DELAY_MS)
   }
 
   async function loadRemainingThreadPages(rootsState: WorkspaceRootsState | null): Promise<void> {
-    if (isLoadingRemainingThreadPages || !threadListNextCursor || hasActiveInProgressThreads()) return
+    if (isLoadingRemainingThreadPages || !threadListNextCursor) return
     isLoadingRemainingThreadPages = true
 
     try {
@@ -4960,7 +4956,7 @@ export function useDesktopState() {
       // Keep the first page usable; a later refresh can retry remaining pages.
     } finally {
       isLoadingRemainingThreadPages = false
-      if (threadListNextCursor && !hasActiveInProgressThreads()) {
+      if (threadListNextCursor) {
         scheduleRemainingThreadPages(rootsState)
       }
     }
