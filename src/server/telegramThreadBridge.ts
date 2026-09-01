@@ -33,6 +33,9 @@ type AppServerLike = {
 
 type TelegramThreadBridgeOptions = {
   onChatSeen?: (chatId: number) => void
+  threadBroker?: {
+    runTurn<T>(threadId: string, resume: () => Promise<void>, start: () => Promise<T>): Promise<T>
+  }
 }
 
 export type TelegramBridgeStatus = {
@@ -210,6 +213,7 @@ export class TelegramThreadBridge {
   private nextUpdateOffset = 0
   private lastError = ''
   private readonly onChatSeen?: (chatId: number) => void
+  private readonly threadBroker?: TelegramThreadBridgeOptions['threadBroker']
 
   constructor(appServer: AppServerLike, options: TelegramThreadBridgeOptions = {}) {
     this.appServer = appServer
@@ -222,6 +226,7 @@ export class TelegramThreadBridge {
         .filter(Boolean),
     )
     this.onChatSeen = options.onChatSeen
+    this.threadBroker = options.threadBroker
   }
 
   start(): void {
@@ -507,10 +512,19 @@ export class TelegramThreadBridge {
 
     const threadId = await this.ensureThreadForChat(chatId)
     try {
-      await this.appServer.rpc('turn/start', {
-        threadId,
-        input: [{ type: 'text', text }],
-      })
+      const start = () => this.appServer.rpc('turn/start', {
+          threadId,
+          input: [{ type: 'text', text }],
+        })
+      if (this.threadBroker) {
+        await this.threadBroker.runTurn(
+          threadId,
+          () => this.appServer.rpc('thread/resume', { threadId }).then(() => undefined),
+          start,
+        )
+      } else {
+        await start()
+      }
     } catch (error) {
       const message = getErrorMessage(error, 'Failed to forward message to thread')
       await this.sendTelegramMessage(chatId, `Forward failed: ${message}`)

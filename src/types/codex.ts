@@ -71,6 +71,20 @@ export type UiThread = {
   preview: string
   unread: boolean
   inProgress: boolean
+  /**
+   * Revision of the on-disk session observed by the bridge.  This is
+   * optional because older app-server responses do not include a session
+   * activity marker.
+   */
+  sessionRevision?: string
+  /** True when `inProgress` came from a session activity marker. */
+  sessionActivityKnown?: boolean
+  /** Unified task-center state when the bridge can project it for a list row. */
+  taskState?: 'queued' | 'starting' | 'running' | 'waiting_approval' | 'waiting_user_input' | 'steering' | 'completed' | 'failed' | 'canceled'
+  /** Most recently terminal turn, used to reject delayed stream events. */
+  terminalTurnId?: string
+  /** Terminal task error projected from the shared session marker. */
+  taskError?: string
   pendingRequestState?: UiPendingRequestState | null
 }
 
@@ -313,6 +327,10 @@ export type UiAccountEntry = {
   quotaError: string | null
   unavailableReason: UiAccountUnavailableReason | null
   isActive: boolean
+  /** `codex-provider` is a read-only view of the provider configured in Codex.
+   * It is not a switchable ChatGPT account and has no quota endpoint. */
+  accountKind?: 'chatgpt' | 'codex-provider'
+  providerId?: string | null
 }
 
 export type ChatMessage = {

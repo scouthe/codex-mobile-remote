@@ -1314,6 +1314,8 @@ const props = defineProps<{
   activeThreadId: string
   cwd: string
   hasMorePersistedAbove?: boolean
+  /** Large observer sessions should load older pages only on explicit action. */
+  deferAutoLoadPersistedAbove?: boolean
   isLoadingPersistedAbove?: boolean
   loadEarlierMessages?: (threadId: string) => Promise<void>
 }>()
@@ -4426,7 +4428,12 @@ function onConversationScroll(): void {
   const container = conversationListRef.value
   if (!container || props.isLoading) return
   autoFollowOutput.value = isAtBottom(container)
-  if (hasMoreAbove.value && !isLoadingMore.value && container.scrollTop < LOAD_MORE_SCROLL_THRESHOLD_PX) {
+  if (
+    !props.deferAutoLoadPersistedAbove
+    && hasMoreAbove.value
+    && !isLoadingMore.value
+    && container.scrollTop < LOAD_MORE_SCROLL_THRESHOLD_PX
+  ) {
     void loadMoreAbove()
   }
 }
@@ -4486,7 +4493,7 @@ onBeforeUnmount(() => {
 @reference "tailwindcss";
 
 .conversation-root {
-  @apply relative h-full min-h-0 min-w-0 p-0 flex flex-col overflow-y-hidden overflow-x-hidden bg-transparent border-none rounded-none;
+  @apply relative flex-1 min-h-0 min-w-0 p-0 flex flex-col overflow-y-hidden overflow-x-hidden bg-transparent border-none rounded-none;
 }
 
 .conversation-loading {

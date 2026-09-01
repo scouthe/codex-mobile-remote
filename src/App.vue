@@ -197,6 +197,7 @@
                     </div>
                     <div class="sidebar-settings-account-actions">
                       <button
+                        v-if="account.accountKind !== 'codex-provider'"
                         class="sidebar-settings-account-switch"
                         type="button"
                         :disabled="isAccountActionDisabled(account) || account.isActive || isAccountUnavailable(account)"
@@ -205,6 +206,7 @@
                         {{ getAccountSwitchLabel(account) }}
                       </button>
                       <button
+                        v-if="account.accountKind !== 'codex-provider'"
                         class="sidebar-settings-account-remove"
                         :class="{
                           'is-visible': isRemoveVisible(account),
@@ -521,7 +523,12 @@
         :style="contentStyle"
       >
         <span v-if="isVirtualKeyboardOpen" class="content-keyboard-spacer" aria-hidden="true" />
-        <ContentHeader :title="contentTitle" :accent="isSkillsRoute || isAutomationsRoute">
+        <ContentHeader
+          :title="contentTitle"
+          :accent="isSkillsRoute || isAutomationsRoute"
+          :status="isMobile && isSelectedThreadInProgress ? 'working' : undefined"
+          :status-label="t('Working')"
+        >
           <template #leading>
             <SidebarThreadControls
               v-if="isSidebarCollapsed || isMobile"
@@ -978,11 +985,13 @@
 
               <template v-else>
                 <div class="content-thread">
+                  <ThreadTaskTimeline :snapshot="selectedTaskSnapshot" />
                   <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
                     :live-overlay="liveOverlay"
                     :pending-requests="selectedThreadServerRequests"
                     :has-more-persisted-above="hasMoreOlderMessages"
+                    :defer-auto-load-persisted-above="deferAutoLoadPersistedAbove"
                     :is-loading-persisted-above="isLoadingOlderMessages"
                     :load-earlier-messages="loadOlderMessages"
                     @fork-thread="onForkThreadFromMessage"
@@ -1233,6 +1242,7 @@ import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathFor
 import { copyTextToClipboard } from './utils/clipboard'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
+const ThreadTaskTimeline = defineAsyncComponent(() => import('./components/content/ThreadTaskTimeline.vue'))
 const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
 const ReviewPane = defineAsyncComponent(() => import('./components/content/ReviewPane.vue'))
 const DirectoryHub = defineAsyncComponent(() => import('./components/content/DirectoryHub.vue'))
@@ -1413,6 +1423,7 @@ const {
   selectedThreadTokenUsage,
   selectedThreadTerminalOpen,
   selectedThreadServerRequests,
+  selectedTaskSnapshot,
   selectedLiveOverlay,
   codexQuota,
   selectedThreadId,
@@ -1427,6 +1438,7 @@ const {
   accountRateLimitSnapshots,
   messages,
   hasMoreOlderMessages,
+  deferAutoLoadPersistedAbove,
   isLoadingThreads,
   isThreadListFullyLoaded,
   isLoadingMessages,
@@ -1448,6 +1460,8 @@ const {
   renameThreadById,
   forkThreadFromTurn,
   sendMessageToSelectedThread,
+  sendTaskMessage,
+  steerTaskMessage,
   sendMessageToNewThread,
   interruptSelectedThreadTurn,
   selectedThreadQueuedMessages,
@@ -1800,7 +1814,14 @@ const isTerminalKeyboardLayoutActive = computed(() => (
   (isComposerTerminalOpen.value && isTerminalKeyboardFocusFallbackActive.value)
 ))
 const directoryCwd = computed(() => selectedThread.value?.cwd?.trim() ?? newThreadCwd.value.trim())
-const isSelectedThreadInProgress = computed(() => !isHomeRoute.value && selectedThread.value?.inProgress === true)
+const isSelectedThreadInProgress = computed(() => {
+  if (isHomeRoute.value) return false
+  const taskState = selectedTaskSnapshot.value?.state
+  if (taskState) {
+    return ['starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'].includes(taskState)
+  }
+  return selectedThread.value?.inProgress === true
+})
 const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>
   isSendingMessage.value ||
@@ -2459,6 +2480,9 @@ function shortAccountId(accountId: string): string {
 }
 
 function formatAccountMeta(account: UiAccountEntry): string {
+  if (account.accountKind === 'codex-provider') {
+    return `Codex provider · ${account.providerId || account.planType || 'configured'}`
+  }
   const segments = [account.planType || t('unknown')]
   if (account.authMode) {
     segments.unshift(account.authMode)
@@ -2540,6 +2564,9 @@ function formatResetDateCompact(resetsAt: number | null): string {
 }
 
 function formatAccountQuota(account: UiAccountEntry): string {
+  if (account.accountKind === 'codex-provider') {
+    return 'Quota is managed by the configured Codex provider'
+  }
   if (isAccountUnavailable(account)) {
     return account.quotaError || t('402 Payment Required')
   }
@@ -3427,7 +3454,11 @@ function onSubmitThreadMessage(payload: { text: string; imageUrls: string[]; fil
     void submitFirstMessageForNewThread(text, payload.imageUrls, payload.skills, payload.fileAttachments)
     return
   }
-  void sendMessageToSelectedThread(text, payload.imageUrls, payload.skills, payload.mode, payload.fileAttachments, queueInsertIndex)
+  if (payload.mode === 'steer') {
+    void steerTaskMessage(text, payload.imageUrls, payload.skills, payload.fileAttachments)
+  } else {
+    void sendTaskMessage(text, payload.imageUrls, payload.skills, payload.fileAttachments, queueInsertIndex)
+  }
 }
 
 function onEditQueuedMessage(messageId: string): void {
@@ -5139,7 +5170,7 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 }
 
 .content-thread {
-  @apply flex-1 min-h-0;
+  @apply flex flex-1 min-h-0 flex-col overflow-hidden;
 }
 
 .composer-with-queue {

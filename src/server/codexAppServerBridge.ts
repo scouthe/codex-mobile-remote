@@ -1,18 +1,26 @@
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes, open } from 'node:fs/promises'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import { homedir } from 'node:os'
-import { tmpdir } from 'node:os'
+import { createConnection as createNetConnection } from 'node:net'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
 import { writeFile } from 'node:fs/promises'
+import { Duplex } from 'node:stream'
+import WebSocket from 'ws'
 import { handleAccountRoutes } from './accountRoutes.js'
-import { buildAppServerArgs } from './appServerRuntimeConfig.js'
+import {
+  assertSharedAppServerSocketAvailable,
+  buildAppServerProxyArgs,
+  buildOfficialAppServerArgs,
+  requireSharedAppServerSocket,
+  resolveSharedAppServerSocket,
+} from './appServerRuntimeConfig.js'
 import { callRpcWithRateLimitDecodeRecovery } from './rateLimitDecodeRecovery.js'
 import { handleReviewRoutes } from './reviewGit.js'
 import { handleSkillsRoutes, initializeSkillsSyncOnStartup } from './skillsRoutes.js'
@@ -29,9 +37,6 @@ import {
   OPENCODE_ZEN_PROVIDER_ID,
   createDefaultOpenCodeZenFreeModeState,
   filterOpenCodeZenModelsForAuthState,
-  getFreeModeConfigArgs,
-  getFreeModeEnvVars,
-  getProviderCompatibilityConfigArgs,
   shouldMarkOpenRouterKeyAsCustom,
   shouldCreateDefaultFreeModeStateForMissingAuth,
   shouldSuppressCommunityFreeModeForCodexAuth,
@@ -41,6 +46,8 @@ import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { handleZenProxyRequest } from './zenProxy.js'
 import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
 import { ThreadTerminalManager } from './terminalManager.js'
+import { ThreadSessionBroker } from './threadSessionBroker.js'
+import { ThreadSessionActivityReader, type ThreadSessionActivity } from './threadSessionActivity.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
@@ -228,7 +235,22 @@ const COMPOSIO_CONNECTORS_PAGE_LIMIT_MAX = 1000
 const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 
 const THREAD_RESPONSE_TURN_LIMIT = 10
+// The app-server's thread/read materializes the complete rollout before the
+// bridge can trim it.  A session file can contain tens or hundreds of MB of
+// prompts/tool output, so the task switch path uses a bounded tail projection
+// first and hydrates the full turn history in the background.
+const FAST_THREAD_SESSION_TAIL_BYTES = 4 * 1024 * 1024
+// Observer requests must not ask app-server to materialize a very large
+// rollout just to discover the latest task state.  The session JSONL is the
+// shared source of truth for this path; large files are projected from their
+// bounded tail instead.  Small sessions retain the existing full projection
+// so command/file details and exact turn pagination remain unchanged.
+const OBSERVER_FULL_READ_MAX_BYTES = 8 * 1024 * 1024
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
+// A desktop app-server can append the terminal session marker before its
+// thread/read projection is flushed.  Give that projection a short,
+// read-only grace period before serving/caching an idle snapshot.
+const THREAD_LIVE_STATE_PROJECTION_RETRY_DELAYS_MS = [120, 240, 480] as const
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
 const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
 const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
@@ -950,6 +972,85 @@ export function isThreadNotFoundError(error: unknown): boolean {
   return message.includes('thread not found') || message.includes('no rollout found for thread id')
 }
 
+/**
+ * A thread can be visible to another client immediately after `thread/start`
+ * but before its first user turn has materialized a rollout file.  The
+ * app-server quite correctly rejects `thread/resume` for that state because
+ * resume is a disk-backed operation.  Mutations from the creating client can
+ * still use `turn/start` directly, so probe the cheap metadata projection and
+ * distinguish this state from a genuinely missing or corrupted thread.
+ */
+async function readUnmaterializedThreadMetadata(
+  appServer: RpcExecutor,
+  threadId: string,
+): Promise<unknown | null> {
+  let metadata: unknown
+  try {
+    metadata = await appServer.rpc('thread/read', {
+      threadId,
+      includeTurns: false,
+    })
+  } catch {
+    return null
+  }
+
+  const record = asRecord(metadata)
+  const thread = asRecord(record?.thread)
+  if (!thread || readNonEmptyString(thread.id) !== threadId) return null
+
+  const turns = Array.isArray(thread.turns) ? thread.turns : []
+  if (turns.length > 0 || thread.canAcceptDirectInput === false) return null
+
+  const status = asRecord(thread.status)
+  const statusType = readNonEmptyString(status?.type)
+  if (statusType && !['idle', 'inProgress', 'running', 'active'].includes(statusType)) return null
+
+  const sessionPath = readNonEmptyString(thread.path)
+  if (!sessionPath) return metadata
+  if (!isAbsolute(sessionPath)) return null
+
+  try {
+    const sessionStat = await stat(sessionPath)
+    // A non-empty rollout should be resumed normally.  Empty files are
+    // treated like an unmaterialized thread because the first turn has not
+    // written any durable history yet.
+    return sessionStat.isFile() && sessionStat.size > 0 ? null : metadata
+  } catch (error) {
+    // Missing rollout paths are the expected signature of a just-started
+    // thread.  Permission and other filesystem failures must remain errors.
+    return getErrorCode(error) === 'ENOENT' ? metadata : null
+  }
+}
+
+async function ensureThreadReadyForMutation(
+  appServer: RpcExecutor,
+  threadId: string,
+): Promise<void> {
+  try {
+    await appServer.rpc('thread/resume', { threadId })
+    return
+  } catch (error) {
+    if (!isThreadNotFoundError(error)) throw error
+    const metadata = await readUnmaterializedThreadMetadata(appServer, threadId)
+    if (!metadata) throw error
+    console.info(`[app-server] Thread ${threadId} has no rollout yet; starting the turn without resume`)
+  }
+}
+
+/**
+ * Codex app-server uses these messages when another process already owns the
+ * local thread writer.  A resume request from a second browser is only trying
+ * to materialize the conversation for display, so it can safely downgrade to
+ * a read instead of surfacing a misleading HTTP 502.
+ */
+function isActiveThreadWriterError(error: unknown): boolean {
+  const message = getErrorMessage(error, '').toLowerCase()
+  return message.includes('already has an active writer')
+    || message.includes('already has a live local writer')
+    || message.includes('failed to acquire thread writer lock')
+    || message.includes('failed to acquire thread writer coordination lock')
+}
+
 function readStreamTurnId(params: Record<string, unknown>): string {
   const directTurnId = readNonEmptyString(params.turnId) || readNonEmptyString(params.turn_id)
   if (directTurnId) return directTurnId
@@ -1022,6 +1123,72 @@ function mergeStreamTurnErrorsIntoThreadResult(appServer: AppServerProcess, resu
   }
 }
 
+/**
+ * Read a thread for an observer endpoint without returning the entire
+ * rollout.  The public /codex-api/rpc thread/read path applies the same
+ * recent-turn limit, but this helper is also used by /thread-live-state,
+ * whose internal app-server call otherwise bypasses that limit and can
+ * produce tens of megabytes for a long-running session.
+ */
+async function readThreadSnapshotForObserver(
+  appServer: AppServerProcess,
+  threadId: string,
+): Promise<unknown> {
+  // `thread/read(includeTurns:false)` is a cheap metadata lookup and does not
+  // force app-server to deserialize the complete rollout.  Prefer the bridge
+  // summary when available, then use the metadata response to obtain the
+  // canonical session path for a thread opened outside this process.
+  let metadataResult = appServer.getThreadSummarySnapshot(threadId)
+  let metadataRecord = asRecord(metadataResult)
+  let metadataThread = asRecord(metadataRecord?.thread)
+  let sessionPath = readNonEmptyString(metadataThread?.path)
+
+  if (!sessionPath || !isAbsolute(sessionPath)) {
+    metadataResult = await appServer.rpc('thread/read', {
+      threadId,
+      includeTurns: false,
+    })
+    metadataRecord = asRecord(metadataResult)
+    metadataThread = asRecord(metadataRecord?.thread)
+    sessionPath = readNonEmptyString(metadataThread?.path)
+  }
+
+  if (sessionPath && isAbsolute(sessionPath)) {
+    try {
+      const sessionStat = await stat(sessionPath)
+      if (sessionStat.isFile() && sessionStat.size > OBSERVER_FULL_READ_MAX_BYTES) {
+        const sessionTail = await readSessionTailForFastThread(sessionPath)
+        const turns = buildFastSessionTurns(sessionTail.raw)
+        const result = metadataRecord && metadataThread
+          ? {
+            ...metadataRecord,
+            thread: {
+              ...metadataThread,
+              turns,
+            },
+            // The fast projection is intentionally bounded.  Consumers use
+            // this marker to keep older-turn pagination available without
+            // asking app-server for the full rollout on the hot path.
+            threadTurnStartIndex: turns.length > 0 ? 1 : 0,
+            partial: true,
+          }
+          : metadataResult
+        return mergeStreamTurnErrorsIntoThreadResult(appServer, result)
+      }
+    } catch {
+      // Fall through to the authoritative app-server projection when the
+      // session cannot be stat'ed/read.
+    }
+  }
+
+  const rawResult = await appServer.rpc('thread/read', {
+    threadId,
+    includeTurns: true,
+  })
+  const trimmedResult = trimThreadTurnsInRpcResult('thread/read', rawResult)
+  return mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
+}
+
 const warnedCodexAuthReadFailures = new Set<string>()
 
 function getErrorCode(error: unknown): string | null {
@@ -1050,6 +1217,21 @@ export async function hasUsableCodexAuth(): Promise<boolean> {
     const raw = await readFile(authPath, 'utf8')
     const auth = JSON.parse(raw) as CodexAuth
     return Boolean(auth.tokens?.access_token?.trim() || auth.tokens?.refresh_token?.trim())
+  } catch (error) {
+    if (getErrorCode(error) !== 'ENOENT') {
+      warnCodexAuthReadFailure(authPath, error)
+    }
+    return false
+  }
+}
+
+/** Official ChatGPT OAuth is the only mode with account/rate-limit metadata. */
+export async function hasChatgptAccountAuth(): Promise<boolean> {
+  const authPath = getCodexAuthPath()
+  try {
+    const raw = await readFile(authPath, 'utf8')
+    const auth = JSON.parse(raw) as CodexAuth
+    return Boolean(auth.tokens?.access_token?.trim() && auth.tokens?.account_id?.trim())
   } catch (error) {
     if (getErrorCode(error) !== 'ENOENT') {
       warnCodexAuthReadFailure(authPath, error)
@@ -1840,6 +2022,583 @@ function mergeImportedThreadsIntoThreadListResult(result: unknown): unknown {
   }
 }
 
+async function mergeSessionActivityIntoThreadListResult(
+  result: unknown,
+  activityReader: ThreadSessionActivityReader,
+): Promise<unknown> {
+  const record = asRecord(result)
+  const data = Array.isArray(record?.data) ? record.data : null
+  if (!record || !data || data.length === 0) return result
+
+  // Keep filesystem work bounded.  A thread list page can contain 100 rows,
+  // and each session tail may be several megabytes while a task is producing
+  // tool output.  Duplicate paths are read only once per request.
+  const activityByPath = new Map<string, ThreadSessionActivity>()
+  const paths = Array.from(new Set(data
+    .map((item) => readNonEmptyString(asRecord(item)?.path))
+    .filter((path): path is string => Boolean(path && isAbsolute(path)))))
+  const batchSize = 8
+  for (let index = 0; index < paths.length; index += batchSize) {
+    const batch = paths.slice(index, index + batchSize)
+    const activities = await Promise.all(batch.map((path) => activityReader.read(path)))
+    batch.forEach((path, batchIndex) => activityByPath.set(path, activities[batchIndex]))
+  }
+
+  let changed = false
+  const mergedData = data.map((item) => {
+    const itemRecord = asRecord(item)
+    if (!itemRecord) return item
+    const path = readNonEmptyString(itemRecord.path)
+    const activity = path ? activityByPath.get(path) : undefined
+    if (!activity?.known) return item
+
+    const currentStatus = asRecord(itemRecord.status)
+    const currentStatusType = readNonEmptyString(currentStatus?.type)
+    const nextStatusType = activity.inProgress ? 'inProgress' : 'idle'
+    const taskState = activity.inProgress
+      ? 'running'
+      : activity.terminalState === 'failed'
+        ? 'failed'
+        : activity.terminalState === 'canceled'
+          ? 'canceled'
+          : 'completed'
+    const taskError = activity.terminalError?.trim() ?? ''
+    const alreadyMatches = currentStatusType === nextStatusType
+      && itemRecord.inProgress === activity.inProgress
+      && itemRecord.sessionRevision === activity.revision
+      && itemRecord.sessionActivityKnown === true
+      && itemRecord.taskState === taskState
+      && (itemRecord.taskError ?? '') === taskError
+      && (itemRecord.terminalTurnId ?? '') === (activity.terminalTurnId ?? '')
+    if (alreadyMatches) return item
+    changed = true
+    return {
+      ...itemRecord,
+      inProgress: activity.inProgress,
+      status: { ...currentStatus, type: nextStatusType },
+      sessionActivityKnown: true,
+      sessionRevision: activity.revision,
+      taskState,
+      taskError,
+      terminalTurnId: activity.terminalTurnId ?? '',
+    }
+  })
+
+  return changed ? { ...record, data: mergedData } : result
+}
+
+async function mergeSessionActivityIntoThreadResult(
+  result: unknown,
+  activityReader: ThreadSessionActivityReader,
+  activityOverride?: ThreadSessionActivity,
+): Promise<unknown> {
+  const record = asRecord(result)
+  const thread = asRecord(record?.thread)
+  const path = readNonEmptyString(thread?.path)
+  if (!record || !thread || !path || !isAbsolute(path)) return result
+
+  const activity = activityOverride ?? await activityReader.read(path)
+  if (!activity.known) return result
+
+  const currentStatus = asRecord(thread.status)
+  const currentStatusType = readNonEmptyString(currentStatus?.type)
+  const nextStatusType = activity.inProgress ? 'inProgress' : 'idle'
+  const taskState = activity.inProgress
+    ? 'running'
+    : activity.terminalState === 'failed'
+      ? 'failed'
+      : activity.terminalState === 'canceled'
+        ? 'canceled'
+        : 'completed'
+  const taskError = activity.terminalError?.trim() ?? ''
+  const alreadyMatches = currentStatusType === nextStatusType
+    && thread.inProgress === activity.inProgress
+    && thread.sessionRevision === activity.revision
+    && thread.sessionActivityKnown === true
+    && record.sessionRevision === activity.revision
+    && thread.taskState === taskState
+    && (thread.taskError ?? '') === taskError
+    && (thread.terminalTurnId ?? '') === (activity.terminalTurnId ?? '')
+  if (alreadyMatches) return result
+  return {
+    ...record,
+    sessionActivityKnown: true,
+    sessionRevision: activity.revision,
+    activeTurnId: activity.inProgress ? activity.turnId : '',
+    terminalTurnId: activity.terminalTurnId ?? '',
+    thread: {
+      ...thread,
+      inProgress: activity.inProgress,
+      status: { ...currentStatus, type: nextStatusType },
+      sessionActivityKnown: true,
+      sessionRevision: activity.revision,
+      taskState,
+      taskError,
+      terminalState: activity.terminalState ?? '',
+      terminalError: activity.terminalError ?? '',
+      terminalTurnId: activity.terminalTurnId ?? '',
+    },
+  }
+}
+
+type SessionProjectionFallback = {
+  turnId: string
+  items: Record<string, unknown>[]
+  status: 'completed' | 'failed' | 'canceled'
+  error: string
+}
+
+function readThreadTurns(result: unknown): unknown[] {
+  const record = asRecord(result)
+  const thread = asRecord(record?.thread)
+  return Array.isArray(thread?.turns) ? thread.turns : []
+}
+
+function readTurnStatusType(turn: unknown): string {
+  const turnRecord = asRecord(turn)
+  if (!turnRecord) return ''
+  if (typeof turnRecord.status === 'string') return turnRecord.status.trim()
+  return readNonEmptyString(asRecord(turnRecord.status)?.type)
+}
+
+function isProjectedTurnComplete(turn: unknown): boolean {
+  const status = readTurnStatusType(turn).toLowerCase()
+  return status.length > 0 && !['inprogress', 'running', 'active', 'in_progress'].includes(status)
+}
+
+function hasProjectedTerminalTurn(
+  result: unknown,
+  activity: ThreadSessionActivity,
+  baselineResult: unknown,
+): boolean {
+  const turns = readThreadTurns(result)
+  const baselineTurns = readThreadTurns(baselineResult)
+
+  if (activity.terminalTurnId) {
+    const terminalTurn = turns.find((turn) => readNonEmptyString(asRecord(turn)?.id) === activity.terminalTurnId)
+    // The app-server may expose a turn before assigning a status.  Treat a
+    // status-less turn as pending so we do not freeze an idle cache over it.
+    return Boolean(terminalTurn && isProjectedTurnComplete(terminalTurn))
+  }
+
+  // Older session formats do not include turn_id on terminal markers.  In
+  // that case, a projection is considered caught up once it has advanced
+  // beyond the initial snapshot or its previously active turn is complete.
+  if (turns.length > baselineTurns.length) return true
+  const baselineLast = baselineTurns.at(-1)
+  const currentLast = turns.at(-1)
+  const baselineWasActive = ['inprogress', 'running', 'active', 'in_progress'].includes(readTurnStatusType(baselineLast).toLowerCase())
+  return baselineWasActive && isProjectedTurnComplete(currentLast)
+}
+
+function extractSessionMessageText(content: unknown, fallbackText = ''): string {
+  const blocks = Array.isArray(content) ? content : []
+  const text = blocks
+    .map((block) => {
+      const blockRecord = asRecord(block)
+      if (!blockRecord) return ''
+      const type = readNonEmptyString(blockRecord.type)
+      if (type !== 'output_text' && type !== 'text' && type !== 'input_text') return ''
+      return typeof blockRecord.text === 'string' ? blockRecord.text : ''
+    })
+    .filter((value) => value.length > 0)
+    .join('\n')
+    .trim()
+  return text || fallbackText.trim()
+}
+
+function normalizeSessionUserContent(content: unknown): unknown[] {
+  if (!Array.isArray(content)) return []
+  return content.map((block) => {
+    const blockRecord = asRecord(block)
+    if (!blockRecord) return block
+    // Session logs use `input_text`; thread/read DTOs use `text` for the same
+    // user-visible block.  Normalize only this discriminator and preserve all
+    // other fields so attachments/metadata remain available to the client.
+    if (blockRecord.type === 'input_text') return { ...blockRecord, type: 'text' }
+    return block
+  })
+}
+
+function buildSessionProjectionFallback(
+  sessionLogRaw: string,
+  activity: ThreadSessionActivity,
+): SessionProjectionFallback | null {
+  let currentTurnId = ''
+  let latestTurnId = ''
+  const itemsByTurnId = new Map<string, Record<string, unknown>[]>()
+  const seenIdsByTurnId = new Map<string, Set<string>>()
+  const seenAssistantTextByTurnId = new Map<string, Set<string>>()
+
+  const addItem = (turnId: string, item: Record<string, unknown>, assistantText = '') => {
+    if (!turnId) return
+    const items = itemsByTurnId.get(turnId) ?? []
+    const ids = seenIdsByTurnId.get(turnId) ?? new Set<string>()
+    const itemId = readNonEmptyString(item.id)
+    if (itemId && ids.has(itemId)) return
+    if (itemId) ids.add(itemId)
+    if (assistantText) {
+      const texts = seenAssistantTextByTurnId.get(turnId) ?? new Set<string>()
+      if (texts.has(assistantText)) return
+      texts.add(assistantText)
+      seenAssistantTextByTurnId.set(turnId, texts)
+    }
+    items.push(item)
+    itemsByTurnId.set(turnId, items)
+    seenIdsByTurnId.set(turnId, ids)
+  }
+
+  for (const line of sessionLogRaw.split(/\r?\n/u)) {
+    if (!line.trim()) continue
+    let row: Record<string, unknown>
+    try {
+      const parsed = JSON.parse(line) as unknown
+      const record = asRecord(parsed)
+      if (!record) continue
+      row = record
+    } catch {
+      continue
+    }
+
+    const payload = asRecord(row.payload)
+    if (!payload) continue
+
+    if (row.type === 'turn_context') {
+      currentTurnId = readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId) || currentTurnId
+      if (currentTurnId) latestTurnId = currentTurnId
+      continue
+    }
+
+    if (row.type === 'event_msg') {
+      const eventType = readNonEmptyString(payload.type)
+      if (eventType === 'task_started' || eventType === 'turn_started') {
+        currentTurnId = readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId) || currentTurnId
+        if (currentTurnId) latestTurnId = currentTurnId
+      } else if (eventType === 'agent_message') {
+        const text = readNonEmptyString(payload.message)
+        if (text && currentTurnId) {
+          const suffix = `event-${itemsByTurnId.get(currentTurnId)?.length ?? 0}`
+          addItem(currentTurnId, {
+            id: readNonEmptyString(payload.id) || `${currentTurnId}-session-agent-${suffix}`,
+            type: 'agentMessage',
+            text,
+          }, text)
+        }
+      }
+      continue
+    }
+
+    if (row.type !== 'response_item' || !currentTurnId) continue
+    latestTurnId = currentTurnId
+    const itemType = readNonEmptyString(payload.type)
+    if (itemType !== 'message') continue
+    const role = readNonEmptyString(payload.role)
+    const payloadId = readNonEmptyString(payload.id)
+    const content = payload.content
+    if (role === 'assistant') {
+      const text = extractSessionMessageText(content, readNonEmptyString(payload.text))
+      if (!text) continue
+      const suffix = `message-${itemsByTurnId.get(currentTurnId)?.length ?? 0}`
+      addItem(currentTurnId, {
+        id: payloadId || `${currentTurnId}-session-agent-${suffix}`,
+        type: 'agentMessage',
+        text,
+      }, text)
+      continue
+    }
+    if (role === 'user') {
+      const normalizedContent = normalizeSessionUserContent(content)
+      if (normalizedContent.length === 0) continue
+      addItem(currentTurnId, {
+        id: payloadId || `${currentTurnId}-session-user-${itemsByTurnId.get(currentTurnId)?.length ?? 0}`,
+        type: 'userMessage',
+        content: normalizedContent,
+      })
+    }
+  }
+
+  const targetTurnId = activity.terminalTurnId || latestTurnId
+  if (!targetTurnId) return null
+  const items = itemsByTurnId.get(targetTurnId)
+  if (!items || items.length === 0) return null
+  return {
+    turnId: targetTurnId,
+    items,
+    status: activity.terminalState === 'failed'
+      ? 'failed'
+      : activity.terminalState === 'canceled'
+        ? 'canceled'
+        : 'completed',
+    error: activity.terminalError ?? '',
+  }
+}
+
+type FastSessionTurn = {
+  id: string
+  status: 'inProgress' | 'completed' | 'failed' | 'interrupted'
+  items: Record<string, unknown>[]
+}
+
+/**
+ * Read only the tail of a session JSONL and project the recent conversational
+ * messages.  This deliberately omits command/tool payloads; the normal
+ * thread/read hydration that follows fills those in without blocking the
+ * first paint after a task switch.
+ */
+async function readSessionTailForFastThread(path: string): Promise<{ raw: string; size: number }> {
+  const metadata = await stat(path)
+  if (!metadata.isFile() || metadata.size <= 0) return { raw: '', size: 0 }
+  const start = Math.max(0, metadata.size - FAST_THREAD_SESSION_TAIL_BYTES)
+  const file = await open(path, 'r')
+  try {
+    const length = metadata.size - start
+    const buffer = Buffer.allocUnsafe(length)
+    const { bytesRead } = await file.read(buffer, 0, length, start)
+    return { raw: buffer.subarray(0, bytesRead).toString('utf8'), size: metadata.size }
+  } finally {
+    await file.close()
+  }
+}
+
+function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TURN_LIMIT): FastSessionTurn[] {
+  const turnsById = new Map<string, FastSessionTurn>()
+  const turnOrder: string[] = []
+  let currentTurnId = ''
+
+  const ensureTurn = (turnId: string, status: FastSessionTurn['status'] = 'inProgress'): FastSessionTurn | null => {
+    const normalizedId = turnId.trim()
+    if (!normalizedId) return null
+    const existing = turnsById.get(normalizedId)
+    if (existing) {
+      if (status !== 'inProgress') existing.status = status
+      return existing
+    }
+    const turn: FastSessionTurn = { id: normalizedId, status, items: [] }
+    turnsById.set(normalizedId, turn)
+    turnOrder.push(normalizedId)
+    return turn
+  }
+
+  const addItem = (turn: FastSessionTurn, item: Record<string, unknown>): void => {
+    const itemId = readNonEmptyString(item.id)
+    if (itemId && turn.items.some((candidate) => readNonEmptyString(candidate.id) === itemId)) return
+    const assistantText = item.type === 'agentMessage' ? readNonEmptyString(item.text) : ''
+    if (assistantText && turn.items.some((candidate) => candidate.type === 'agentMessage' && readNonEmptyString(candidate.text) === assistantText)) return
+    if (item.type === 'userMessage') {
+      const content = Array.isArray(item.content) ? item.content : []
+      const userText = content
+        .map((block) => readNonEmptyString(asRecord(block)?.text))
+        .filter(Boolean)
+        .join('\n')
+      if (userText && turn.items.some((candidate) => {
+        if (candidate.type !== 'userMessage') return false
+        const candidateContent = Array.isArray(candidate.content) ? candidate.content : []
+        return candidateContent
+          .map((block) => readNonEmptyString(asRecord(block)?.text))
+          .filter(Boolean)
+          .join('\n') === userText
+      })) return
+    }
+    turn.items.push(item)
+  }
+
+  for (const line of sessionLogRaw.split(/\r?\n/u)) {
+    if (!line.trim()) continue
+    let row: Record<string, unknown>
+    try {
+      const parsed = JSON.parse(line) as unknown
+      const record = asRecord(parsed)
+      if (!record) continue
+      row = record
+    } catch {
+      // The first line can be a partial JSONL record when the tail starts in
+      // the middle of a large item.  Later complete records are sufficient.
+      continue
+    }
+
+    const payload = asRecord(row.payload)
+    if (!payload) continue
+
+    if (row.type === 'turn_context') {
+      currentTurnId = readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId) || currentTurnId
+      ensureTurn(currentTurnId)
+      continue
+    }
+
+    if (row.type === 'event_msg') {
+      const eventType = readNonEmptyString(payload.type)
+      const eventTurnId = readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId)
+      if (eventType === 'task_started' || eventType === 'turn_started') {
+        currentTurnId = eventTurnId || currentTurnId
+        ensureTurn(currentTurnId, 'inProgress')
+      } else if (eventType === 'task_complete' || eventType === 'task_completed' || eventType === 'turn_complete' || eventType === 'turn_completed' || eventType === 'turn_aborted' || eventType === 'task_failed') {
+        const completedTurnId = eventTurnId || currentTurnId
+        const terminalStatus: FastSessionTurn['status'] = eventType === 'task_failed'
+          ? 'failed'
+          : eventType === 'turn_aborted'
+            ? 'interrupted'
+            : 'completed'
+        const turn = ensureTurn(completedTurnId, terminalStatus)
+        if (turn) turn.status = terminalStatus
+        if (completedTurnId === currentTurnId) currentTurnId = ''
+      } else if (eventType === 'agent_message') {
+        const text = readNonEmptyString(payload.message)
+        const turn = ensureTurn(eventTurnId || currentTurnId)
+        if (turn && text) {
+          addItem(turn, {
+            id: readNonEmptyString(payload.id) || `${turn.id}-session-agent-${turn.items.length}`,
+            type: 'agentMessage',
+            text,
+          })
+        }
+      } else if (eventType === 'user_message') {
+        const text = readNonEmptyString(payload.message)
+        const turn = ensureTurn(eventTurnId || currentTurnId)
+        if (turn && text) {
+          addItem(turn, {
+            id: readNonEmptyString(payload.id) || `${turn.id}-session-user-${turn.items.length}`,
+            type: 'userMessage',
+            content: [{ type: 'text', text }],
+          })
+        }
+      }
+      continue
+    }
+
+    if (row.type !== 'response_item') continue
+    const rowTurnId = readNonEmptyString(row.turn_id) || readNonEmptyString(row.turnId) || readNonEmptyString(payload.turn_id) || readNonEmptyString(payload.turnId)
+    if (rowTurnId) currentTurnId = rowTurnId
+    const turn = ensureTurn(currentTurnId)
+    if (!turn || readNonEmptyString(payload.type) !== 'message') continue
+    const role = readNonEmptyString(payload.role)
+    const payloadId = readNonEmptyString(payload.id)
+    if (role === 'assistant') {
+      const text = extractSessionMessageText(payload.content, readNonEmptyString(payload.text))
+      if (text) {
+        addItem(turn, {
+          id: payloadId || `${turn.id}-session-agent-${turn.items.length}`,
+          type: 'agentMessage',
+          text,
+        })
+      }
+    } else if (role === 'user') {
+      const content = normalizeSessionUserContent(payload.content)
+      if (content.length > 0) {
+        addItem(turn, {
+          id: payloadId || `${turn.id}-session-user-${turn.items.length}`,
+          type: 'userMessage',
+          content,
+        })
+      }
+    }
+  }
+
+  return turnOrder
+    .slice(-Math.max(1, limit))
+    .map((turnId) => turnsById.get(turnId))
+    .filter((turn): turn is FastSessionTurn => Boolean(turn))
+}
+
+function mergeSessionProjectionFallbackIntoTurns(
+  turns: unknown[],
+  fallback: SessionProjectionFallback,
+  markComplete: boolean,
+): { turns: unknown[]; changed: boolean } {
+  const targetIndex = turns.findIndex((turn) => readNonEmptyString(asRecord(turn)?.id) === fallback.turnId)
+  if (targetIndex < 0) {
+    return {
+      turns: [
+        ...turns,
+        {
+          id: fallback.turnId,
+          status: markComplete
+            ? fallback.status === 'canceled' ? 'interrupted' : fallback.status
+            : 'inProgress',
+          items: fallback.items,
+          ...(markComplete && fallback.status === 'failed' && fallback.error
+            ? { error: { message: fallback.error } }
+            : {}),
+        },
+      ],
+      changed: true,
+    }
+  }
+
+  const existingTurn = asRecord(turns[targetIndex])
+  if (!existingTurn) return { turns, changed: false }
+  const existingItems = Array.isArray(existingTurn.items) ? (existingTurn.items as unknown[]) : []
+  const existingIds = new Set(existingItems
+    .map((item) => readNonEmptyString(asRecord(item)?.id))
+    .filter(Boolean))
+  const existingAssistantTexts = new Set(existingItems
+    .map((item) => {
+      const itemRecord = asRecord(item)
+      return itemRecord?.type === 'agentMessage' ? readNonEmptyString(itemRecord.text) : ''
+    })
+    .filter(Boolean))
+  const missingItems = fallback.items.filter((item) => {
+    const itemId = readNonEmptyString(item.id)
+    if (itemId && existingIds.has(itemId)) return false
+    const text = item.type === 'agentMessage' ? readNonEmptyString(item.text) : ''
+    if (text && existingAssistantTexts.has(text)) return false
+    return true
+  })
+  const nextStatus = markComplete ? fallback.status === 'canceled' ? 'interrupted' : fallback.status : existingTurn.status
+  const statusChanged = markComplete && readTurnStatusType(existingTurn) !== nextStatus
+  if (missingItems.length === 0 && !statusChanged) return { turns, changed: false }
+  const nextTurns = [...turns]
+  nextTurns[targetIndex] = {
+    ...existingTurn,
+    ...(markComplete ? { status: nextStatus } : {}),
+    ...(markComplete && fallback.status === 'failed' && fallback.error
+      ? { error: { message: fallback.error } }
+      : {}),
+    ...(missingItems.length > 0 ? { items: [...existingItems, ...missingItems] } : {}),
+  }
+  return { turns: nextTurns, changed: true }
+}
+
+async function waitForThreadProjectionRetry(delayMs: number): Promise<void> {
+  if (delayMs <= 0) return
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+}
+
+async function readThreadWithProjectionRetry(
+  appServer: AppServerProcess,
+  threadId: string,
+  initialResult: unknown,
+  initialActivity: ThreadSessionActivity | null,
+  sessionPath: string,
+): Promise<{ result: unknown; activity: ThreadSessionActivity | null; projectionCaughtUp: boolean }> {
+  if (!initialActivity?.known || initialActivity.inProgress || !sessionPath || !isAbsolute(sessionPath)) {
+    return { result: initialResult, activity: initialActivity, projectionCaughtUp: true }
+  }
+  if (hasProjectedTerminalTurn(initialResult, initialActivity, initialResult)) {
+    return { result: initialResult, activity: initialActivity, projectionCaughtUp: true }
+  }
+
+  let result = initialResult
+  let activity = initialActivity
+  for (const delayMs of THREAD_LIVE_STATE_PROJECTION_RETRY_DELAYS_MS) {
+    await waitForThreadProjectionRetry(delayMs)
+    try {
+      // This path intentionally performs only thread/read.  In particular,
+      // an observer must never call thread/resume while another process owns
+      // the writer lock.
+      result = await readThreadSnapshotForObserver(appServer, threadId)
+    } catch {
+      continue
+    }
+    const nextActivity = await appServer.getSessionActivityReader().read(sessionPath)
+    if (nextActivity.known) activity = nextActivity
+    if (hasProjectedTerminalTurn(result, activity, initialResult)) {
+      return { result, activity, projectionCaughtUp: true }
+    }
+  }
+
+  return { result, activity, projectionCaughtUp: false }
+}
+
 async function collectProjectChatZipEntries(projectRoot: string): Promise<ProjectZipVirtualEntry[]> {
   const canonicalProjectRoot = await realpath(projectRoot)
   const codexHome = getCodexHomeDir()
@@ -2507,6 +3266,7 @@ export async function callRpcWithArchiveRecovery(
   appServer: RpcExecutor,
   method: string,
   params: unknown,
+  options: { resumeThread?: (threadId: string) => Promise<void> } = {},
 ): Promise<unknown> {
   try {
     const result = await callRpcWithRateLimitDecodeRecovery(appServer, method, params)
@@ -2518,7 +3278,11 @@ export async function callRpcWithArchiveRecovery(
     const threadId = readNonEmptyString(paramsRecord?.threadId)
 
     if (method === 'turn/start' && threadId && isThreadNotFoundError(error)) {
-      await appServer.rpc('thread/resume', { threadId })
+      if (options.resumeThread) {
+        await options.resumeThread(threadId)
+      } else {
+        await appServer.rpc('thread/resume', { threadId })
+      }
       return appServer.rpc(method, params ?? null)
     }
 
@@ -4619,6 +5383,9 @@ export async function refreshChatgptAuthTokensForExternalAuth(
   const authPath = getCodexAuthPath()
   const raw = await readFile(authPath, 'utf8')
   const auth = JSON.parse(raw) as CodexAuth
+  if (!auth.tokens?.account_id?.trim()) {
+    throw new Error('ChatGPT OAuth account metadata is unavailable for the configured Codex provider.')
+  }
   const currentRefreshToken = auth.tokens?.refresh_token?.trim() ?? ''
   if (!currentRefreshToken) {
     throw new Error('No ChatGPT refresh token is available. Please sign in again.')
@@ -4707,6 +5474,16 @@ function hasUsableCodexAuthSync(): boolean {
     const raw = readFileSync(getCodexAuthPath(), 'utf8')
     const auth = JSON.parse(raw) as CodexAuth
     return Boolean(auth.tokens?.access_token?.trim())
+  } catch {
+    return false
+  }
+}
+
+function hasChatgptAccountAuthSync(): boolean {
+  try {
+    const raw = readFileSync(getCodexAuthPath(), 'utf8')
+    const auth = JSON.parse(raw) as CodexAuth
+    return Boolean(auth.tokens?.access_token?.trim() && auth.tokens?.account_id?.trim())
   } catch {
     return false
   }
@@ -5532,9 +6309,468 @@ type StoredQueuedMessage = {
   skills: Array<{ name: string; path: string }>
   fileAttachments: Array<{ label: string; path: string; fsPath: string }>
   collaborationMode: 'default' | 'plan'
+  createdAtIso: string
+  sourceClientId: string
+  status: 'queued' | 'processing' | 'failed'
+  attempts: number
+  lastError: string
 }
 
 type ThreadQueueState = Record<string, StoredQueuedMessage[]>
+
+type TaskSnapshotResponse = {
+  taskState: 'queued' | 'starting' | 'running' | 'waiting_approval' | 'waiting_user_input' | 'steering' | 'completed' | 'failed' | 'canceled'
+  activeTurnId: string
+  terminalTurnId: string
+  currentActivity: { kind: string; label: string; details: string[] }
+  queueDepth: number
+  activeRequest: { id: number; kind: 'approval' | 'user_input' | 'other'; method: string; receivedAtIso: string } | null
+  writerClient: {
+    clientId: string
+    clientType: 'desktop' | 'android' | 'web' | 'unknown'
+    generation: number
+    label: string
+    claimedAt: string
+  } | null
+  startedAt: string | null
+  finishedAt: string | null
+  error: string | null
+  timeline: Array<{
+    id: string
+    type: string
+    atIso: string
+    label: string
+    details: string[]
+    turnId: string
+    itemId?: string
+    status?: string
+  }>
+}
+
+function classifyTaskRequest(method: string): 'approval' | 'user_input' | 'other' {
+  const normalized = method.toLowerCase()
+  if (normalized.includes('approval') || normalized.includes('permission')) return 'approval'
+  if (normalized.includes('input') || normalized.includes('requestuserinput')) return 'user_input'
+  return 'other'
+}
+
+function readTaskRequestThreadIdValue(value: unknown, depth = 0): string {
+  if (depth > 3) return ''
+  const params = asRecord(value)
+  if (!params) return ''
+  return readNonEmptyString(params.threadId)
+    || readNonEmptyString(params.thread_id)
+    || readNonEmptyString(params.conversationId)
+    || readNonEmptyString(params.conversation_id)
+    || readTaskRequestThreadIdValue(params.params, depth + 1)
+    || readTaskRequestThreadIdValue(params.request, depth + 1)
+}
+
+function readTaskRequestThreadId(request: PendingServerRequest): string {
+  return readTaskRequestThreadIdValue(request.params)
+}
+
+export function buildTaskSnapshotResponse(
+  threadId: string,
+  isInProgress: boolean,
+  queueDepth: number,
+  pendingRequests: PendingServerRequest[],
+  streamEvents: Array<{ seq: number; method: string; params: unknown; atIso: string }>,
+  streamCursor: { streamEpoch: string; latestSeq: number; oldestSeq: number | null },
+  sessionActivity: {
+    known: boolean
+    inProgress: boolean
+    lastEventAt: number | null
+    turnId: string
+    terminalTurnId?: string
+    terminalState?: 'completed' | 'failed' | 'canceled' | ''
+    terminalError?: string
+  } | null,
+  writerClient: { clientId: string; clientType: 'desktop' | 'android' | 'web' | 'unknown'; generation: number; claimedAt: string } | null = null,
+): TaskSnapshotResponse {
+  // A pending request belongs to an active turn.  Once the shared session
+  // marker says the turn is idle, an app-server-local request can be stale
+  // (for example after a desktop process interrupted the task); it must not
+  // resurrect a waiting card on another client.
+  const request = sessionActivity?.known && !sessionActivity.inProgress
+    ? undefined
+    : pendingRequests.find((row) => readTaskRequestThreadId(row) === threadId)
+  let activeRequest = request
+    ? {
+      id: request.id,
+      kind: classifyTaskRequest(request.method),
+      method: request.method,
+      receivedAtIso: request.receivedAtIso,
+    }
+    : null
+  const relevantEvents = streamEvents.slice(-40)
+  const initialTaskState: TaskSnapshotResponse['taskState'] = isInProgress
+    ? 'running'
+    : queueDepth > 0
+      ? 'queued'
+      : 'completed'
+  let currentActivity: TaskSnapshotResponse['currentActivity'] = {
+    kind: isInProgress ? 'thinking' : queueDepth > 0 ? 'queue' : 'idle',
+    label: isInProgress ? 'Thinking' : queueDepth > 0 ? 'Queued' : 'Completed',
+    details: queueDepth > 0 ? [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] : [],
+  }
+  let state: TaskSnapshotResponse['taskState'] = initialTaskState
+  let activeTurnId = ''
+  let terminalTurnId = sessionActivity?.terminalTurnId ?? ''
+  let startedAt: string | null = null
+  let finishedAt: string | null = null
+  let error: string | null = null
+  let lastStateEventAtMs: number | null = null
+  const timeline: TaskSnapshotResponse['timeline'] = []
+
+  for (const event of relevantEvents) {
+    const params = asRecord(event.params)
+    const item = asRecord(params?.item)
+    const itemType = readNonEmptyString(item?.type).toLowerCase()
+    const turn = asRecord(params?.turn)
+    const turnId = readNonEmptyString(turn?.id)
+      || readNonEmptyString(params?.turnId)
+      || readNonEmptyString(params?.turn_id)
+      || readNonEmptyString(item?.turnId)
+      || readNonEmptyString(item?.turn_id)
+    const isLateTerminalTurnEvent = Boolean(
+      turnId
+      && terminalTurnId
+      && turnId === terminalTurnId
+      && !activeTurnId
+      && ['queued', 'completed', 'failed', 'canceled'].includes(state),
+    )
+    const isForeignActiveTurnEvent = Boolean(
+      turnId
+      && activeTurnId
+      && turnId !== activeTurnId
+      && event.method !== 'turn/started'
+      && !event.method.startsWith('queue/'),
+    )
+    if (isLateTerminalTurnEvent || isForeignActiveTurnEvent) continue
+    let label = ''
+    let kind = 'activity'
+    const details: string[] = []
+    if (event.method === 'turn/started') {
+      state = 'starting'
+      activeTurnId = turnId
+      startedAt = startedAt ?? event.atIso
+      error = null
+      const eventAtMs = Date.parse(event.atIso)
+      lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
+      label = 'Task started'
+      kind = 'task_started'
+      currentActivity = { kind: 'thinking', label: 'Thinking', details: [] }
+    } else if (event.method === 'turn/completed') {
+      // The stream can contain a late completion for a previous turn while a
+      // newer turn is already active.  Do not let that historical frame
+      // terminate the current task snapshot.
+      if (activeTurnId && turnId && turnId !== activeTurnId) continue
+      const turnStatus = readNonEmptyString(turn?.status) || readNonEmptyString(params?.status)
+      const completionError = getErrorMessage(turn?.error, '') || getErrorMessage(params?.error, '') || readNonEmptyString(params?.message)
+      const failed = turnStatus.toLowerCase() === 'failed' || Boolean(completionError)
+      state = failed ? 'failed' : 'completed'
+      activeTurnId = ''
+      terminalTurnId = turnId || terminalTurnId
+      finishedAt = event.atIso
+      const eventAtMs = Date.parse(event.atIso)
+      lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
+      if (failed) {
+        error = completionError || 'Task failed'
+        if (completionError) details.push(completionError)
+        label = 'Task failed'
+        kind = 'error'
+        currentActivity = { kind: 'error', label, details: [error] }
+      } else {
+        error = null
+        label = 'Task completed'
+        kind = 'task_completed'
+        currentActivity = { kind: 'idle', label: 'Completed', details: [] }
+      }
+      if (queueDepth > 0) {
+        state = 'queued'
+        error = null
+        currentActivity = { kind: 'queue', label: 'Queued', details: [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] }
+      }
+    } else if (event.method === 'error') {
+      if (activeTurnId && turnId && turnId !== activeTurnId) continue
+      const retryable = params?.willRetry === true
+      state = retryable
+        ? ['starting', 'running', 'steering', 'waiting_approval', 'waiting_user_input'].includes(state)
+          ? state
+          : isInProgress ? 'running' : state
+        : 'failed'
+      label = retryable ? 'Retrying task' : 'Task failed'
+      kind = 'error'
+      const message = getErrorMessage(params?.error, '') || readNonEmptyString(params?.message)
+      if (message) details.push(message)
+      error = message || 'Task failed'
+      if (!retryable) {
+        finishedAt = event.atIso
+        terminalTurnId = turnId || terminalTurnId
+      }
+      const eventAtMs = Date.parse(event.atIso)
+      lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
+      currentActivity = { kind: 'error', label, details }
+    } else if (event.method === 'turn/interrupt') {
+      if (activeTurnId && turnId && turnId !== activeTurnId) continue
+      state = 'canceled'
+      activeTurnId = ''
+      terminalTurnId = turnId || terminalTurnId
+      finishedAt = event.atIso
+      error = null
+      label = 'Task canceled'
+      kind = 'task_canceled'
+      currentActivity = { kind: 'idle', label: 'Canceled', details: [] }
+      const eventAtMs = Date.parse(event.atIso)
+      lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
+    } else if (event.method === 'queue/enqueued' || event.method === 'queue/updated') {
+      const queueStatus = readNonEmptyString(params?.status).toLowerCase()
+      const eventQueueDepth = typeof params?.queueDepth === 'number' && Number.isFinite(params.queueDepth)
+        ? Math.max(0, Math.trunc(params.queueDepth))
+        : queueDepth
+      queueDepth = eventQueueDepth
+      if (queueStatus === 'processing') {
+        state = 'starting'
+        startedAt = startedAt ?? event.atIso
+        finishedAt = null
+        error = null
+        label = 'Thinking'
+        kind = 'activity'
+        currentActivity = { kind: 'thinking', label, details: [] }
+        const eventAtMs = Date.parse(event.atIso)
+        lastStateEventAtMs = Number.isFinite(eventAtMs) ? eventAtMs : null
+      } else if (queueStatus === 'failed' && eventQueueDepth > 0) {
+        state = 'queued'
+        activeTurnId = ''
+        finishedAt = null
+        error = null
+        label = 'Queued'
+        kind = 'queued'
+        currentActivity = { kind: 'queue', label, details: [`${eventQueueDepth} message${eventQueueDepth === 1 ? '' : 's'}`] }
+      } else if (eventQueueDepth === 0 && state === 'queued') {
+        state = 'completed'
+        activeTurnId = ''
+        finishedAt = event.atIso
+        error = null
+        label = 'Task completed'
+        kind = 'task_completed'
+        currentActivity = { kind: 'idle', label: 'Completed', details: [] }
+      } else if (eventQueueDepth > 0 && !['starting', 'running', 'steering', 'waiting_approval', 'waiting_user_input'].includes(state)) {
+        state = 'queued'
+        label = 'Queued'
+        kind = 'queued'
+        currentActivity = { kind: 'queue', label, details: [`${eventQueueDepth} message${eventQueueDepth === 1 ? '' : 's'}`] }
+      } else {
+        continue
+      }
+    } else if (event.method === 'server/request') {
+      const requestRecord = asRecord(params)
+      const requestMethod = readNonEmptyString(requestRecord?.method)
+      const requestKind = classifyTaskRequest(requestMethod)
+      if (requestKind === 'approval' || requestKind === 'user_input') {
+        label = requestKind === 'approval' ? 'Approval required' : 'Input required'
+        kind = requestKind === 'approval' ? 'approval_request' : 'user_input_request'
+        currentActivity = requestKind === 'approval'
+          ? { kind: 'approval', label, details: [] }
+          : { kind: 'user_input', label, details: [] }
+        state = requestKind === 'approval' ? 'waiting_approval' : 'waiting_user_input'
+      } else {
+        continue
+      }
+    } else if (event.method === 'server/request/resolved') {
+      const resolvedId = typeof params?.id === 'number' && Number.isInteger(params.id) ? params.id : null
+      if (resolvedId !== null && activeRequest && activeRequest.id !== resolvedId) continue
+
+      // A resolved notification can be observed after the bridge-local
+      // pending-request map has already been cleared (or while it still
+      // contains the resolved row).  Re-select another pending request for
+      // this thread when one exists; otherwise leave the waiting state.
+      const nextRequest = pendingRequests.find((row) => (
+        readTaskRequestThreadId(row) === threadId && (resolvedId === null || row.id !== resolvedId)
+      ))
+      activeRequest = nextRequest
+        ? {
+          id: nextRequest.id,
+          kind: classifyTaskRequest(nextRequest.method),
+          method: nextRequest.method,
+          receivedAtIso: nextRequest.receivedAtIso,
+        }
+        : null
+      if (activeRequest?.kind === 'approval') {
+        state = 'waiting_approval'
+        label = 'Approval required'
+        kind = 'approval_request'
+        currentActivity = { kind: 'approval', label, details: [] }
+      } else if (activeRequest?.kind === 'user_input') {
+        state = 'waiting_user_input'
+        label = 'Input required'
+        kind = 'user_input_request'
+        currentActivity = { kind: 'user_input', label, details: [] }
+      } else {
+        if (state === 'waiting_approval' || state === 'waiting_user_input') {
+          state = sessionActivity?.known && sessionActivity.inProgress
+            ? 'running'
+            : queueDepth > 0 ? 'queued' : 'completed'
+        }
+        label = 'Thinking'
+        kind = 'activity'
+        currentActivity = state === 'running'
+          ? { kind: 'thinking', label, details: [] }
+          : queueDepth > 0
+            ? { kind: 'queue', label: 'Queued', details: [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] }
+            : { kind: 'idle', label: 'Completed', details: [] }
+      }
+    } else if (event.method === 'item/started' && itemType === 'commandexecution') {
+      state = state === 'starting' ? 'running' : state
+      kind = 'command'
+      label = 'Running command'
+      const command = readNonEmptyString(item?.command)
+      if (command) details.push(command)
+      currentActivity = { kind, label, details }
+    } else if (event.method === 'item/started' && itemType === 'filechange') {
+      state = state === 'starting' ? 'running' : state
+      kind = 'file_change'
+      label = 'Applying changes'
+      currentActivity = { kind, label, details }
+    } else if (event.method === 'item/started' && itemType === 'agentmessage') {
+      state = state === 'starting' ? 'running' : state
+      kind = 'response'
+      label = 'Writing response'
+      currentActivity = { kind, label, details }
+    } else if (event.method === 'item/commandExecution/outputDelta') {
+      state = state === 'starting' ? 'running' : state
+      label = 'Running command'
+      currentActivity = { kind: 'command', label, details }
+    } else {
+      continue
+    }
+    timeline.push({
+      id: `${threadId}:${event.seq}:${event.method}`,
+      type: kind,
+      atIso: event.atIso,
+      label,
+      details,
+      turnId,
+      status: kind === 'approval_request' || kind === 'user_input_request'
+        ? 'pending'
+        : kind === 'task_completed'
+          ? 'completed'
+        : state === 'completed'
+        ? 'completed'
+        : state === 'failed'
+          ? 'failed'
+          : state === 'canceled'
+            ? 'canceled'
+            : state === 'queued'
+              ? 'pending'
+              : 'active',
+    })
+  }
+
+  if (activeRequest?.kind === 'approval') {
+    state = 'waiting_approval'
+    currentActivity = { kind: 'approval', label: 'Approval required', details: [] }
+  } else if (activeRequest?.kind === 'user_input') {
+    state = 'waiting_user_input'
+    currentActivity = { kind: 'user_input', label: 'Input required', details: [] }
+  }
+
+  // The shared session marker is authoritative over the bridge's local event
+  // buffer.  The buffer may still contain a stale turn/started or command
+  // event after a desktop writer has completed the same session.
+  if (sessionActivity?.known) {
+    if (sessionActivity.inProgress) {
+      activeTurnId = sessionActivity.turnId || activeTurnId
+      if (!activeRequest) {
+        if (state === 'completed' || state === 'failed' || state === 'queued') {
+          state = 'running'
+        }
+        if (currentActivity.kind === 'idle') {
+          currentActivity = { kind: 'thinking', label: 'Thinking', details: [] }
+        }
+      }
+    } else if (!activeRequest && queueDepth > 0) {
+      // A completed/failed turn can leave messages waiting for the next
+      // queue drain.  The queue is the next actionable state and should not
+      // be hidden by the previous terminal outcome.
+      activeTurnId = ''
+      state = 'queued'
+      error = null
+      currentActivity = { kind: 'queue', label: 'Queued', details: [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] }
+    } else if (!activeRequest && sessionActivity.terminalState === 'failed') {
+      // The desktop Codex process may have written the terminal marker
+      // without sending this bridge's turn/completed notification.  Preserve
+      // that outcome instead of inferring `completed` from an idle marker.
+      activeTurnId = ''
+      state = 'failed'
+      error = sessionActivity.terminalError?.trim() || error || 'Task failed'
+      currentActivity = { kind: 'error', label: 'Task failed', details: [error] }
+    } else if (!activeRequest && sessionActivity.terminalState === 'canceled') {
+      activeTurnId = ''
+      state = 'canceled'
+      error = null
+      currentActivity = { kind: 'idle', label: 'Canceled', details: [] }
+    } else if (!activeRequest && !(
+      (state === 'failed' && error && lastStateEventAtMs !== null && (sessionActivity.lastEventAt === null || lastStateEventAtMs >= sessionActivity.lastEventAt))
+      || (state === 'starting' && lastStateEventAtMs !== null && sessionActivity.lastEventAt !== null && lastStateEventAtMs >= sessionActivity.lastEventAt)
+      || (state === 'canceled' && lastStateEventAtMs !== null && (sessionActivity.lastEventAt === null || lastStateEventAtMs >= sessionActivity.lastEventAt))
+    )) {
+      activeTurnId = ''
+      state = queueDepth > 0 ? 'queued' : 'completed'
+      error = null
+      currentActivity = queueDepth > 0
+        ? { kind: 'queue', label: 'Queued', details: [`${queueDepth} message${queueDepth === 1 ? '' : 's'}`] }
+        : { kind: 'idle', label: 'Completed', details: [] }
+    }
+  }
+  if (sessionActivity?.known && sessionActivity.lastEventAt) {
+    const markerIso = new Date(sessionActivity.lastEventAt).toISOString()
+    if (sessionActivity.inProgress) startedAt = markerIso
+    else finishedAt = markerIso
+  }
+
+  return {
+    taskState: state,
+    activeTurnId,
+    terminalTurnId,
+    currentActivity,
+    queueDepth,
+    activeRequest,
+    writerClient: writerClient
+      ? {
+        ...writerClient,
+        label: writerClient.clientType === 'android' ? 'Android' : writerClient.clientType === 'desktop' ? 'Desktop' : 'Web',
+      }
+      : null,
+    startedAt,
+    finishedAt,
+    error,
+    timeline,
+  }
+}
+
+function resolveTaskWriterClient(
+  threadId: string,
+  sessionActivity: { known: boolean; inProgress: boolean; lastEventAt?: number | null } | null,
+  appServer: AppServerProcess,
+  threadBroker: ThreadSessionBroker,
+): { clientId: string; clientType: 'desktop' | 'android' | 'web' | 'unknown'; generation: number; claimedAt: string } | null {
+  const knownWriter = threadBroker.getWriter(threadId)
+  if (knownWriter) return knownWriter
+  // A Codex desktop process can own the JSONL session without going through
+  // this bridge.  The shared session activity marker is the authoritative
+  // signal in that case, so expose a stable desktop observer label.
+  if (sessionActivity?.known && sessionActivity.inProgress) {
+    return {
+      clientId: 'desktop-session',
+      clientType: 'desktop',
+      generation: appServer.getProcessGeneration(),
+      claimedAt: new Date(sessionActivity.lastEventAt ?? Date.now()).toISOString(),
+    }
+  }
+  return null
+}
 
 type BackendQueuedTurn = {
   threadId: string
@@ -5588,6 +6824,11 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     skills: normalizeNamedPathItems(record.skills),
     fileAttachments: normalizeFileAttachments(record.fileAttachments),
     collaborationMode: record.collaborationMode === 'plan' ? 'plan' : 'default',
+    createdAtIso: readNonEmptyString(record.createdAtIso) || new Date().toISOString(),
+    sourceClientId: readNonEmptyString(record.sourceClientId),
+    status: record.status === 'failed' ? 'failed' : record.status === 'processing' ? 'processing' : 'queued',
+    attempts: typeof record.attempts === 'number' && Number.isFinite(record.attempts) ? Math.max(0, Math.trunc(record.attempts)) : 0,
+    lastError: readNonEmptyString(record.lastError),
   }
 }
 
@@ -5673,6 +6914,28 @@ async function appendThreadQueuedMessage(threadId: string, message: StoredQueued
   }))
 }
 
+async function enqueueThreadQueuedMessage(
+  threadId: string,
+  message: StoredQueuedMessage,
+  beforeMessageId = '',
+): Promise<{ state: ThreadQueueState; inserted: boolean }> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) throw new Error('threadId is required')
+  return await withThreadQueueStateUpdate<{ state: ThreadQueueState; inserted: boolean }>((state) => {
+    const queue = state[normalizedThreadId] ?? []
+    if (queue.some((entry) => entry.id === message.id)) {
+      return { nextState: state, result: { state, inserted: false } }
+    }
+    const insertionIndex = beforeMessageId
+      ? Math.max(0, queue.findIndex((entry) => entry.id === beforeMessageId))
+      : queue.length
+    const nextQueue = [...queue]
+    nextQueue.splice(insertionIndex < 0 ? nextQueue.length : insertionIndex, 0, message)
+    const nextState = { ...state, [normalizedThreadId]: nextQueue }
+    return { nextState, result: { state: nextState, inserted: true } }
+  })
+}
+
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
   const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
   return typeof value === 'string' && allowed.includes(value as ReasoningEffort)
@@ -5726,6 +6989,11 @@ ${escapeHeartbeatXmlText(automation.prompt)}
     skills: [],
     fileAttachments: [],
     collaborationMode: 'default',
+    createdAtIso: new Date().toISOString(),
+    sourceClientId: 'automation',
+    status: 'queued',
+    attempts: 0,
+    lastError: '',
   }
 }
 
@@ -5744,6 +7012,14 @@ function extractThreadIdFromNotificationParams(params: unknown): string {
     (typeof record.conversationId === 'string' ? record.conversationId : '') ||
     (typeof record.conversation_id === 'string' ? record.conversation_id : '')
   if (threadId) return threadId
+  // Server-initiated requests are wrapped as `{ id, method, params }`.
+  // Resolve the thread from that nested payload so approval/input events are
+  // retained in the per-thread stream and every observer sees the same task.
+  const nestedParams = asRecord(record.params)
+  if (nestedParams) {
+    const nestedThreadId = extractThreadIdFromNotificationParams(nestedParams)
+    if (nestedThreadId) return nestedThreadId
+  }
   const thread = asRecord(record.thread)
   if (thread && typeof thread.id === 'string') return thread.id
   const turn = asRecord(record.turn)
@@ -6350,11 +7626,24 @@ async function fetchConnectorLogo(rawUrl: string): Promise<{ contentType: string
 }
 
 const STREAM_EVENT_BUFFER_LIMIT = 400
+const STREAM_EVENT_HISTORY_LIMIT = 2000
 
 type StreamEventFrame = {
+  seq: number
+  streamEpoch: string
+  threadId: string
   method: string
   params: unknown
   atIso: string
+}
+
+type AppServerNotification = {
+  method: string
+  params: unknown
+  seq?: number
+  streamEpoch?: string
+  threadId?: string
+  atIso?: string
 }
 
 type CapturedItem = {
@@ -6370,24 +7659,138 @@ const MERGEABLE_ITEM_TYPES = new Set([
   'fileChange',
 ])
 
-class AppServerProcess {
+// Codex app-server keeps a thread-writer lock for the lifetime of the
+// resumed app-server session, even after the turn itself has completed.  A
+// second Codex Desktop window then sees "already opened in another app" until
+// the web bridge process exits.  Keep a short grace period for follow-up
+// requests, then recycle an idle child so its locks are released without
+// interrupting an active turn.
+const IDLE_WRITER_RELEASE_DELAY_MS = 1200
+
+type AppServerLaunchMode = 'shared-proxy'
+
+const OFFICIAL_APP_SERVER_STARTUP_TIMEOUT_MS = 15_000
+const OFFICIAL_APP_SERVER_STARTUP_POLL_INTERVAL_MS = 100
+
+function isUsableAppServerSocket(socketPath: string): boolean {
+  try {
+    return statSync(socketPath).isSocket()
+  } catch {
+    return false
+  }
+}
+
+function isRunningChild(child: ChildProcess | null): child is ChildProcess {
+  return child !== null && child.exitCode === null && child.signalCode === null
+}
+
+/**
+ * A Unix socket file can outlive an app-server that was killed abruptly.  A
+ * cheap connect probe distinguishes that stale path from a listening
+ * official service before we decide that no bootstrap is needed.
+ */
+async function isReachableAppServerSocket(socketPath: string): Promise<boolean> {
+  if (!isUsableAppServerSocket(socketPath)) return false
+
+  return await new Promise<boolean>((resolve) => {
+    let settled = false
+    const socket = createNetConnection({ path: socketPath })
+    const finish = (reachable: boolean) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(reachable)
+    }
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+    socket.setTimeout(500, () => finish(false))
+  })
+}
+
+/**
+ * The official `codex app-server proxy` forwards bytes, while the Unix
+ * control socket speaks WebSocket.  Wrap the proxy's stdio in a Duplex so the
+ * normal ws client can perform the official handshake and framing without
+ * changing Desktop's process or protocol.
+ */
+function createProxyProcessDuplex(child: ChildProcessWithoutNullStreams): Duplex {
+  const duplex = new Duplex({
+    read() {
+      child.stdout.resume()
+    },
+    write(chunk, encoding, callback) {
+      if (child.stdin.destroyed || !child.stdin.writable) {
+        callback(new Error('codex app-server proxy stdin is closed'))
+        return
+      }
+      child.stdin.write(chunk, encoding, callback)
+    },
+    final(callback) {
+      child.stdin.end(callback)
+    },
+    destroy(error, callback) {
+      if (!child.killed) {
+        try {
+          child.kill('SIGTERM')
+        } catch {
+          // The process-exit handler performs the final cleanup.
+        }
+      }
+      callback(error)
+    },
+  })
+
+  child.stdout.on('data', (chunk: Buffer) => {
+    if (!duplex.destroyed) duplex.push(chunk)
+  })
+  child.stdout.once('end', () => duplex.push(null))
+  child.stdout.once('error', (error) => duplex.destroy(error))
+  child.stdin.once('error', (error) => duplex.destroy(error))
+  return duplex
+}
+
+export class AppServerProcess {
   private process: ChildProcessWithoutNullStreams | null = null
+  /**
+   * The official server is deliberately separate from the proxy child.  It
+   * is a long-lived shared service and must survive a codexapp restart so
+   * Desktop and other official clients keep their session and writer state.
+   */
+  private officialAppServerProcess: ChildProcess | null = null
+  private officialAppServerStartPromise: Promise<void> | null = null
+  private officialAppServerSocketProbePromise: Promise<boolean> | null = null
+  private officialAppServerLaunchError: Error | null = null
+  private processGeneration = 0
   private initialized = false
   private initializePromise: Promise<void> | null = null
-  private readBuffer = ''
   private nextId = 1
   private stopping = false
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>()
-  private readonly notificationListeners = new Set<(value: { method: string; params: unknown }) => void>()
+  private readonly notificationListeners = new Set<(value: AppServerNotification) => void>()
   private readonly pendingServerRequests = new Map<number, PendingServerRequest>()
   private readonly streamEventsByThreadId = new Map<string, StreamEventFrame[]>()
+  private readonly streamEventHistory: StreamEventFrame[] = []
+  private streamEpoch = randomUUID()
+  private nextStreamSeq = 0
+  private readonly threadSummaryById = new Map<string, Record<string, unknown>>()
   private readonly lastThreadReadSnapshotByThreadId = new Map<string, unknown>()
   private readonly threadTurnPageReadCacheByThreadId = new Map<string, { result: unknown; expiresAt: number }>()
   private readonly threadTurnPageReadPromiseByThreadId = new Map<string, Promise<unknown>>()
   private readonly capturedItemsByThreadId = new Map<string, Map<string, CapturedItem>>()
-  private readonly liveStateCache = new Map<string, { data: unknown; turnCount: number; sessionSize: number }>()
+  private readonly liveStateCache = new Map<string, {
+    data: unknown
+    turnCount: number
+    sessionSize: number
+    sessionRevision: string
+  }>()
+  private readonly sessionActivityReader = new ThreadSessionActivityReader()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
   private activeConfigSignature = ''
+  private activeLaunchMode: AppServerLaunchMode = 'shared-proxy'
+  private readonly activeTurnThreadIds = new Set<string>()
+  private idleWriterReleaseTimer: ReturnType<typeof setTimeout> | null = null
+  private sharedWebSocket: WebSocket | null = null
+  private sharedTransportReadyPromise: Promise<void> | null = null
 
 
   private getCodexCommand(): string {
@@ -6398,30 +7801,170 @@ class AppServerProcess {
     return codexCommand
   }
 
-  private buildAppServerConfig(): { args: string[]; env: Record<string, string> } {
-    const args = buildAppServerArgs()
-    let extraEnv: Record<string, string> = {}
-    const serverPort = parseInt(process.env.CODEXUI_SERVER_PORT ?? '', 10) || undefined
-    args.push(...getProviderCompatibilityConfigArgs(serverPort))
-    const statePath = join(getCodexHomeDir(), FREE_MODE_STATE_FILE)
-    try {
-      const state = ensureDefaultFreeModeStateForMissingAuthSync(statePath)
-      if (state) {
-        args.push(...getFreeModeConfigArgs(state, serverPort))
-        extraEnv = getFreeModeEnvVars(state)
-      }
-    } catch {
-      // No free-mode state or invalid — use defaults
+  private buildAppServerConfig(): {
+    args: string[]
+    env: Record<string, string>
+    launchMode: AppServerLaunchMode
+    sharedSocketPath: string | null
+  } {
+    const configuredSocketPath = requireSharedAppServerSocket()
+    const socketAvailable = isUsableAppServerSocket(configuredSocketPath)
+    // A configured shared socket is an invariant.  Do not silently create a
+    // second app-server while the official service is restarting.
+    assertSharedAppServerSocketAvailable(configuredSocketPath, socketAvailable)
+    const proxyArgs = buildAppServerProxyArgs(configuredSocketPath)
+    if (!proxyArgs) {
+      throw new Error(`Could not build Codex app-server proxy command for ${configuredSocketPath}.`)
     }
-    return { args, env: extraEnv }
+    return {
+      args: proxyArgs,
+      env: {},
+      launchMode: 'shared-proxy',
+      sharedSocketPath: configuredSocketPath,
+    }
   }
 
-  private getAppServerConfigSignature(config: { args: string[]; env: Record<string, string> }): string {
+  private async ensureOfficialAppServer(): Promise<void> {
+    const socketPath = requireSharedAppServerSocket()
+    // Once this bridge has a live proxy, or we own a running official child,
+    // the socket was already validated.  Avoid opening an extra Unix probe on
+    // every thread/list poll; a broken proxy will be noticed by its close
+    // handler and the next request will re-enter bootstrap detection.
+    if (isUsableAppServerSocket(socketPath) && (
+      isRunningChild(this.process)
+      || isRunningChild(this.officialAppServerProcess)
+    )) return
+
+    const socketReachable = await this.probeOfficialAppServerSocket(socketPath)
+    if (socketReachable) return
+
+    if (this.officialAppServerStartPromise) {
+      await this.officialAppServerStartPromise
+      return
+    }
+
+    const existingProcess = this.officialAppServerProcess
+    if (isRunningChild(existingProcess)) {
+      await this.waitForOfficialAppServerSocket(socketPath, existingProcess)
+      return
+    }
+
+    const startup = this.startOfficialAppServer(socketPath)
+      .finally(() => {
+        if (this.officialAppServerStartPromise === startup) {
+          this.officialAppServerStartPromise = null
+        }
+      })
+    this.officialAppServerStartPromise = startup
+    await startup
+  }
+
+  private async probeOfficialAppServerSocket(socketPath: string): Promise<boolean> {
+    if (!this.officialAppServerSocketProbePromise) {
+      const probe = isReachableAppServerSocket(socketPath).finally(() => {
+        if (this.officialAppServerSocketProbePromise === probe) {
+          this.officialAppServerSocketProbePromise = null
+        }
+      })
+      this.officialAppServerSocketProbePromise = probe
+    }
+    return await this.officialAppServerSocketProbePromise
+  }
+
+  private async startOfficialAppServer(socketPath: string): Promise<void> {
+    // A second request can observe the missing socket between the first
+    // check and this call.  Re-check immediately before spawning to avoid
+    // racing an already-starting Desktop/daemon process.
+    if (await isReachableAppServerSocket(socketPath)) return
+
+    const invocation = getSpawnInvocation(
+      this.getCodexCommand(),
+      buildOfficialAppServerArgs(socketPath),
+    )
+    console.info(`[app-server] Official socket unavailable; starting Codex app-server via ${socketPath}`)
+
+    const child = spawn(invocation.command, invocation.args, {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: process.env,
+    })
+    this.officialAppServerProcess = child
+    this.officialAppServerLaunchError = null
+
+    let stderrTail = ''
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', (chunk: string) => {
+      stderrTail = `${stderrTail}${chunk}`.slice(-4_000)
+    })
+    child.once('error', (error) => {
+      if (this.officialAppServerProcess === child) {
+        this.officialAppServerLaunchError = error instanceof Error ? error : new Error(String(error))
+      }
+    })
+    child.once('exit', () => {
+      if (this.officialAppServerProcess !== child) return
+      this.officialAppServerProcess = null
+    })
+
+    try {
+      await this.waitForOfficialAppServerSocket(socketPath, child, () => stderrTail)
+    } catch (error) {
+      // Do not leave a failed bootstrap process behind.  A successful
+      // bootstrap is intentionally not terminated by `dispose()`.
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill('SIGTERM')
+        } catch {
+          // The child may have exited between the state check and kill.
+        }
+      }
+      throw error
+    }
+  }
+
+  private async waitForOfficialAppServerSocket(
+    socketPath: string,
+    child: ChildProcess,
+    readStderr?: () => string,
+  ): Promise<void> {
+    const deadline = Date.now() + OFFICIAL_APP_SERVER_STARTUP_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      if (await isReachableAppServerSocket(socketPath)) return
+
+      if (this.officialAppServerLaunchError) {
+        throw new Error(`Failed to start the official Codex app-server: ${this.officialAppServerLaunchError.message}`)
+      }
+
+      if (child.exitCode !== null || child.signalCode !== null) {
+        const details = readStderr?.().trim()
+        throw new Error(
+          `The official Codex app-server exited before creating ${socketPath}`
+            + (details ? `: ${details}` : '.'),
+        )
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, OFFICIAL_APP_SERVER_STARTUP_POLL_INTERVAL_MS))
+    }
+
+    const details = readStderr?.().trim()
+    throw new Error(
+      `Timed out waiting for the official Codex app-server socket ${socketPath}`
+        + (details ? `: ${details}` : '.'),
+    )
+  }
+
+  private getAppServerConfigSignature(config: {
+    args: string[]
+    env: Record<string, string>
+    launchMode: AppServerLaunchMode
+    sharedSocketPath: string | null
+  }): string {
     return JSON.stringify({
       args: config.args,
       env: Object.keys(config.env)
         .sort()
         .map((key) => [key, config.env[key]]),
+      launchMode: config.launchMode,
+      sharedSocketPath: config.sharedSocketPath,
     })
   }
 
@@ -6437,31 +7980,35 @@ class AppServerProcess {
     if (this.process) return
 
     this.stopping = false
+    this.processGeneration += 1
+    // A restarted child process starts a new event timeline.  Consumers can
+    // use the epoch to discard stale cursors and request a fresh snapshot.
+    this.streamEpoch = randomUUID()
+    this.nextStreamSeq = 0
+    this.streamEventsByThreadId.clear()
+    this.streamEventHistory.length = 0
+    // All projections below are tied to the previous app-server generation.
+    // Keeping them after a restart can resurrect an old turn, command item,
+    // or failed read on the first observer request before the new process has
+    // emitted any events.
+    this.lastThreadReadSnapshotByThreadId.clear()
+    this.threadSummaryById.clear()
+    this.threadTurnPageReadCacheByThreadId.clear()
+    this.threadTurnPageReadPromiseByThreadId.clear()
+    this.capturedItemsByThreadId.clear()
+    this.liveStateCache.clear()
     const config = this.buildAppServerConfig()
     this.activeConfigSignature = this.getAppServerConfigSignature(config)
+    this.activeLaunchMode = config.launchMode
     const invocation = getSpawnInvocation(this.getCodexCommand(), config.args)
+    console.info(`[app-server] Using official Codex app-server via ${config.sharedSocketPath}`)
     const spawnEnv = Object.keys(config.env).length > 0
       ? { ...process.env, ...config.env }
       : undefined
     const proc = spawn(invocation.command, invocation.args, { stdio: ['pipe', 'pipe', 'pipe'], ...(spawnEnv ? { env: spawnEnv } : {}) })
     this.process = proc
 
-    proc.stdout.setEncoding('utf8')
-    proc.stdout.on('data', (chunk: string) => {
-      this.readBuffer += chunk
-
-      let lineEnd = this.readBuffer.indexOf('\n')
-      while (lineEnd !== -1) {
-        const line = this.readBuffer.slice(0, lineEnd).trim()
-        this.readBuffer = this.readBuffer.slice(lineEnd + 1)
-
-        if (line.length > 0) {
-          this.handleLine(line)
-        }
-
-        lineEnd = this.readBuffer.indexOf('\n')
-      }
-    })
+    this.connectSharedProxy(proc)
 
     proc.stderr.setEncoding('utf8')
     proc.stderr.on('data', () => {
@@ -6481,9 +8028,67 @@ class AppServerProcess {
       this.pending.clear()
       this.pendingServerRequests.clear()
       this.process = null
+      this.sharedWebSocket = null
+      this.sharedTransportReadyPromise = null
+      // Invalidate broker writer ownership immediately when the child exits;
+      // the next mutation must perform a fresh thread/resume.
+      this.processGeneration += 1
       this.initialized = false
       this.initializePromise = null
-      this.readBuffer = ''
+    })
+  }
+
+  private connectSharedProxy(proc: ChildProcessWithoutNullStreams): void {
+    const proxyDuplex = createProxyProcessDuplex(proc)
+    const socket = new WebSocket('ws://codexapp-shared-app-server.invalid/', {
+      // Codex's Unix transport intentionally does not negotiate per-message
+      // deflate.  Leaving ws' default enabled makes the server reject the
+      // handshake with "incorrect sec-websocket-extensions".
+      perMessageDeflate: false,
+      handshakeTimeout: 10_000,
+      createConnection: () => proxyDuplex,
+    })
+    this.sharedWebSocket = socket
+    this.sharedTransportReadyPromise = new Promise<void>((resolve, reject) => {
+      let settled = false
+      socket.once('open', () => {
+        settled = true
+        resolve()
+      })
+      socket.once('error', (error: Error) => {
+        if (settled) return
+        settled = true
+        reject(error)
+      })
+    })
+
+    socket.on('message', (data: WebSocket.RawData) => {
+      const line = Buffer.isBuffer(data)
+        ? data.toString('utf8')
+        : Array.isArray(data)
+          ? Buffer.concat(data).toString('utf8')
+          : Buffer.from(data as ArrayBuffer).toString('utf8')
+      if (line.trim().length > 0) this.handleLine(line)
+    })
+    socket.on('error', (error: Error) => {
+      if (this.process !== proc || this.stopping) return
+      // A handshake or transport error must not leave a permanently pending
+      // promise while the proxy child remains alive.  Terminating the child
+      // lets the common exit path reject in-flight RPCs and clear the state.
+      console.warn(`[app-server] Shared app-server proxy failed: ${error.message}`)
+      try {
+        proc.kill('SIGTERM')
+      } catch {
+        // The exit handler below still handles a child that is already gone.
+      }
+    })
+    socket.on('close', () => {
+      if (this.process !== proc || this.stopping) return
+      try {
+        proc.kill('SIGTERM')
+      } catch {
+        // The process may already have exited.
+      }
     })
   }
 
@@ -6492,7 +8097,10 @@ class AppServerProcess {
       throw new Error('codex app-server is not running')
     }
 
-    this.process.stdin.write(`${JSON.stringify(payload)}\n`)
+    if (!this.sharedWebSocket || this.sharedWebSocket.readyState !== WebSocket.OPEN) {
+      throw new Error('shared codex app-server proxy is not connected')
+    }
+    this.sharedWebSocket.send(JSON.stringify(payload))
   }
 
   private handleLine(line: string): void {
@@ -6532,15 +8140,32 @@ class AppServerProcess {
   }
 
   private emitNotification(notification: { method: string; params: unknown }): void {
-    this.recordStreamEvent(notification)
+    const frame = this.recordStreamEvent(notification)
     this.captureItemFromNotification(notification)
-    const nThreadId = this.extractThreadIdFromParams(notification.params)
+    const nThreadId = frame.threadId
+    if (nThreadId && notification.method === 'turn/started') {
+      this.activeTurnThreadIds.add(nThreadId)
+      this.cancelIdleWriterRelease()
+    } else if (nThreadId && (
+      notification.method === 'turn/completed'
+      || notification.method === 'turn/interrupt'
+      || (notification.method === 'error' && asRecord(notification.params)?.willRetry !== true)
+    )) {
+      this.activeTurnThreadIds.delete(nThreadId)
+      this.scheduleIdleWriterRelease()
+    }
     if (nThreadId) {
       this.invalidateLiveStateCache(nThreadId)
       this.threadTurnPageReadCacheByThreadId.delete(nThreadId)
     }
     for (const listener of this.notificationListeners) {
-      listener(notification)
+      listener({
+        ...notification,
+        seq: frame.seq,
+        streamEpoch: frame.streamEpoch,
+        threadId: frame.threadId || undefined,
+        atIso: frame.atIso,
+      })
     }
   }
 
@@ -6553,6 +8178,14 @@ class AppServerProcess {
       (typeof record.conversationId === 'string' ? record.conversationId : '') ||
       (typeof record.conversation_id === 'string' ? record.conversation_id : '')
     if (threadId) return threadId
+    // `server/request` notifications carry their actual thread metadata in a
+    // nested `params` object.  Keeping this lookup recursive makes stream
+    // replay and per-thread task timelines consistent with live request rows.
+    const nestedParams = asRecord(record.params)
+    if (nestedParams) {
+      const nestedThreadId = this.extractThreadIdFromParams(nestedParams)
+      if (nestedThreadId) return nestedThreadId
+    }
     const thread = asRecord(record.thread)
     if (thread && typeof thread.id === 'string') return thread.id
     const turn = asRecord(record.turn)
@@ -6565,14 +8198,21 @@ class AppServerProcess {
     return ''
   }
 
-  private recordStreamEvent(notification: { method: string; params: unknown }): void {
+  private recordStreamEvent(notification: { method: string; params: unknown }): StreamEventFrame {
     const threadId = this.extractThreadIdFromParams(notification.params)
-    if (!threadId) return
     const frame: StreamEventFrame = {
+      seq: ++this.nextStreamSeq,
+      streamEpoch: this.streamEpoch,
+      threadId,
       method: notification.method,
       params: notification.params,
       atIso: new Date().toISOString(),
     }
+    this.streamEventHistory.push(frame)
+    if (this.streamEventHistory.length > STREAM_EVENT_HISTORY_LIMIT) {
+      this.streamEventHistory.splice(0, this.streamEventHistory.length - STREAM_EVENT_HISTORY_LIMIT)
+    }
+    if (!threadId) return frame
     let buffer = this.streamEventsByThreadId.get(threadId)
     if (!buffer) {
       buffer = []
@@ -6582,12 +8222,35 @@ class AppServerProcess {
     if (buffer.length > STREAM_EVENT_BUFFER_LIMIT) {
       buffer.splice(0, buffer.length - STREAM_EVENT_BUFFER_LIMIT)
     }
+    return frame
   }
 
   getStreamEvents(threadId: string, limit: number): StreamEventFrame[] {
     const buffer = this.streamEventsByThreadId.get(threadId)
     if (!buffer || buffer.length === 0) return []
     return buffer.slice(-limit)
+  }
+
+  getStreamCursor(): { streamEpoch: string; latestSeq: number; oldestSeq: number | null } {
+    return {
+      streamEpoch: this.streamEpoch,
+      latestSeq: this.nextStreamSeq,
+      oldestSeq: this.streamEventHistory[0]?.seq ?? null,
+    }
+  }
+
+  getStreamEventsSince(afterSeq: number, threadId = ''): { events: StreamEventFrame[]; truncated: boolean } {
+    const normalizedAfterSeq = Number.isFinite(afterSeq) ? Math.max(0, Math.floor(afterSeq)) : 0
+    const oldestSeq = this.streamEventHistory[0]?.seq ?? this.nextStreamSeq + 1
+    const truncated = normalizedAfterSeq > 0 && normalizedAfterSeq < oldestSeq - 1
+    const events = this.streamEventHistory.filter((frame) => (
+      frame.seq > normalizedAfterSeq && (!threadId || frame.threadId === threadId)
+    ))
+    return { events, truncated }
+  }
+
+  getSessionActivityReader(): ThreadSessionActivityReader {
+    return this.sessionActivityReader
   }
 
   storeThreadReadSnapshot(threadId: string, snapshot: unknown): void {
@@ -6625,14 +8288,37 @@ class AppServerProcess {
     return promise
   }
 
-  cacheLiveState(threadId: string, data: unknown, turnCount: number, sessionSize: number): void {
-    this.liveStateCache.set(threadId, { data, turnCount, sessionSize })
+  cacheLiveState(
+    threadId: string,
+    data: unknown,
+    turnCount: number,
+    sessionSize: number,
+    sessionRevision = '',
+  ): void {
+    // A cache entry without a session revision can hide a session written by
+    // another app-server process.  Only cache observations tied to a real
+    // file revision; callers with no readable session must always re-read.
+    if (!sessionRevision) {
+      this.liveStateCache.delete(threadId)
+      return
+    }
+    this.liveStateCache.set(threadId, { data, turnCount, sessionSize, sessionRevision })
   }
 
-  getCachedLiveState(threadId: string, turnCount: number, sessionSize: number): unknown | null {
+  getCachedLiveState(
+    threadId: string,
+    turnCount: number,
+    sessionSize: number,
+    sessionRevision = '',
+  ): unknown | null {
+    if (!sessionRevision) return null
     const cached = this.liveStateCache.get(threadId)
     if (!cached) return null
-    if (cached.turnCount !== turnCount || cached.sessionSize !== sessionSize) return null
+    if (
+      cached.turnCount !== turnCount
+      || cached.sessionSize !== sessionSize
+      || cached.sessionRevision !== sessionRevision
+    ) return null
     return cached.data
   }
 
@@ -6745,11 +8431,7 @@ class AppServerProcess {
     this.pendingServerRequests.delete(requestId)
 
     this.sendServerRequestReply(requestId, reply)
-    const requestParams = asRecord(pendingRequest.params)
-    const threadId =
-      typeof requestParams?.threadId === 'string' && requestParams.threadId.length > 0
-        ? requestParams.threadId
-        : ''
+    const threadId = readTaskRequestThreadIdValue(pendingRequest.params)
     this.emitNotification({
       method: 'server/request/resolved',
       params: {
@@ -6820,7 +8502,11 @@ class AppServerProcess {
   }
 
   private async call(method: string, params: unknown): Promise<unknown> {
+    await this.ensureOfficialAppServer()
     this.start()
+    if (this.sharedTransportReadyPromise) {
+      await this.sharedTransportReadyPromise
+    }
     const id = this.nextId++
 
     return new Promise((resolve, reject) => {
@@ -6864,16 +8550,95 @@ class AppServerProcess {
   }
 
   async rpc(method: string, params: unknown): Promise<unknown> {
+    // Read-only observer polling must not keep a bridge-owned child alive
+    // forever.  In particular, the web UI refreshes thread/list frequently;
+    // canceling the release timer for every poll would leave an idle child
+    // (and its historical writer locks) around for the lifetime of the page.
+    // A mutating request, on the other hand, cancels release so it can share
+    // the current initialized writer session.
+    const isReadOnlyRpc = method === 'thread/list'
+      || method === 'thread/read'
+      || method.endsWith('/read')
+      || method === 'config/read'
+    if (!isReadOnlyRpc) this.cancelIdleWriterRelease()
+    await this.ensureOfficialAppServer()
     this.disposeIfConfigChanged()
     await this.ensureInitialized()
-    return this.call(method, params)
+    const result = await this.call(method, params)
+    if (method === 'thread/list' || (method === 'thread/read' && asRecord(params)?.includeTurns !== true)) {
+      this.rememberThreadSummaries(result)
+    }
+    if (method === 'thread/resume') {
+      // A legacy client may still resume while opening a thread.  If no turn
+      // follows shortly afterwards, recycle the child so a previous resume
+      // does not leave an idle writer lock that blocks Codex Desktop.  The
+      // timer is intentionally left intact while read-only observers poll;
+      // they cannot acquire the writer and must not prolong its lifetime.
+      this.scheduleIdleWriterRelease()
+    }
+    return result
   }
 
-  onNotification(listener: (value: { method: string; params: unknown }) => void): () => void {
+  onNotification(listener: (value: AppServerNotification) => void): () => void {
     this.notificationListeners.add(listener)
     return () => {
       this.notificationListeners.delete(listener)
     }
+  }
+
+  /** Broadcast bridge-owned lifecycle events to every observer client. */
+  publishNotification(method: string, params: unknown): void {
+    if (!method.trim()) return
+    this.emitNotification({ method: method.trim(), params })
+  }
+
+  getProcessGeneration(): number {
+    return this.processGeneration
+  }
+
+  getConnectionStatus(): {
+    mode: AppServerLaunchMode
+    running: boolean
+    configuredSocketPath: string | null
+    socketAvailable: boolean
+    officialServerStarting: boolean
+    officialServerManaged: boolean
+  } {
+    const configuredSocketPath = resolveSharedAppServerSocket()
+    const socketAvailable = configuredSocketPath ? isUsableAppServerSocket(configuredSocketPath) : false
+    return {
+      // The bridge has one launch mode now: the official shared proxy. Keep
+      // socket fields separate so callers can distinguish an unconfigured or
+      // unavailable socket from a healthy connection.
+      mode: this.activeLaunchMode,
+      running: this.process !== null,
+      configuredSocketPath,
+      socketAvailable,
+      officialServerStarting: this.officialAppServerStartPromise !== null,
+      officialServerManaged: this.officialAppServerProcess !== null
+        && isRunningChild(this.officialAppServerProcess),
+    }
+  }
+
+  private rememberThreadSummaries(result: unknown): void {
+    const record = asRecord(result)
+    const rows = Array.isArray(record?.data)
+      ? record.data
+      : record?.thread
+        ? [record.thread]
+        : []
+    for (const row of rows) {
+      const summary = asRecord(row)
+      const threadId = readNonEmptyString(summary?.id)
+      const sessionPath = readNonEmptyString(summary?.path)
+      if (!threadId || !sessionPath || !isAbsolute(sessionPath)) continue
+      this.threadSummaryById.set(threadId, { ...summary, turns: [] })
+    }
+  }
+
+  getThreadSummarySnapshot(threadId: string): unknown | null {
+    const summary = this.threadSummaryById.get(threadId.trim())
+    return summary ? { thread: { ...summary, turns: [] } } : null
   }
 
   async respondToServerRequest(payload: unknown): Promise<void> {
@@ -6913,15 +8678,25 @@ class AppServerProcess {
   }
 
   dispose(): void {
+    this.cancelIdleWriterRelease()
+    this.activeTurnThreadIds.clear()
     if (!this.process) return
 
     const proc = this.process
+    const sharedWebSocket = this.sharedWebSocket
     this.stopping = true
     this.process = null
+    this.sharedWebSocket = null
+    this.sharedTransportReadyPromise = null
+    this.processGeneration += 1
     this.initialized = false
     this.initializePromise = null
     this.activeConfigSignature = ''
-    this.readBuffer = ''
+    this.activeLaunchMode = 'shared-proxy'
+
+    if (sharedWebSocket && sharedWebSocket.readyState !== WebSocket.CLOSED) {
+      sharedWebSocket.terminate()
+    }
 
     const failure = new Error('codex app-server stopped')
     for (const request of this.pending.values()) {
@@ -6953,6 +8728,27 @@ class AppServerProcess {
     }, 1500)
     forceKillTimer.unref()
   }
+
+  private cancelIdleWriterRelease(): void {
+    if (this.idleWriterReleaseTimer === null) return
+    clearTimeout(this.idleWriterReleaseTimer)
+    this.idleWriterReleaseTimer = null
+  }
+
+  private scheduleIdleWriterRelease(): void {
+    if (this.idleWriterReleaseTimer !== null) return
+    if (this.activeTurnThreadIds.size > 0 || this.pending.size > 0 || this.pendingServerRequests.size > 0) return
+
+    this.idleWriterReleaseTimer = setTimeout(() => {
+      this.idleWriterReleaseTimer = null
+      if (this.activeTurnThreadIds.size > 0 || this.pending.size > 0 || this.pendingServerRequests.size > 0) return
+      // dispose() closes stdin and terminates only this bridge-owned child;
+      // the native Codex Desktop app-server is a separate process and keeps
+      // its own active task and event stream untouched.
+      this.dispose()
+    }, IDLE_WRITER_RELEASE_DELAY_MS)
+    this.idleWriterReleaseTimer.unref?.()
+  }
 }
 
 export class BackendQueueProcessor {
@@ -6960,8 +8756,13 @@ export class BackendQueueProcessor {
   private readonly queueDrainTimersByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly queueDrainDueAtByThreadId = new Map<string, number>()
   private readonly unsubscribe: () => void
+  private readonly threadBroker: ThreadSessionBroker
 
-  constructor(private readonly appServer: AppServerProcess) {
+  constructor(
+    private readonly appServer: AppServerProcess,
+    threadBroker?: ThreadSessionBroker,
+  ) {
+    this.threadBroker = threadBroker ?? new ThreadSessionBroker(() => appServer.getProcessGeneration())
     this.unsubscribe = appServer.onNotification((notification) => {
       if (!isTurnCompletedNotification(notification)) return
       const threadId = extractThreadIdFromNotificationParams(notification.params)
@@ -7018,24 +8819,43 @@ export class BackendQueueProcessor {
     if (this.processingThreadIds.has(threadId)) return
     this.processingThreadIds.add(threadId)
     try {
-      const canStart = await this.canStartQueuedTurn(threadId)
-      if (!canStart) {
-        if (await this.hasQueuedTurns(threadId)) {
-          this.scheduleThreadQueueDrain(threadId)
+      await this.threadBroker.runExclusive(threadId, async () => {
+        const canStart = await this.canStartQueuedTurn(threadId)
+        if (!canStart) {
+          if (await this.hasQueuedTurns(threadId)) {
+            this.scheduleThreadQueueDrain(threadId)
+          }
+          return
         }
-        return
-      }
       const next = await this.popNextQueuedTurn(threadId)
-      if (!next) return
-      try {
-        await this.startQueuedTurn(next)
-        if (await this.hasQueuedTurns(threadId)) {
+        if (!next) return
+        this.appServer.publishNotification('queue/updated', {
+          threadId,
+          messageId: next.message.id,
+          queueDepth: (await readThreadQueueState())[threadId]?.length ?? 0,
+          status: 'processing',
+          atIso: new Date().toISOString(),
+        })
+        try {
+          await this.threadBroker.ensureWriterReady(threadId, async () => {
+            await ensureThreadReadyForMutation(this.appServer, threadId)
+          })
+          await this.startQueuedTurn(next)
+          if (await this.hasQueuedTurns(threadId)) {
+            this.scheduleThreadQueueDrain(threadId)
+          }
+        } catch {
+          await this.restoreQueuedTurn(next)
+          this.appServer.publishNotification('queue/updated', {
+            threadId,
+            messageId: next.message.id,
+            queueDepth: (await readThreadQueueState())[threadId]?.length ?? 0,
+            status: 'failed',
+            atIso: new Date().toISOString(),
+          })
           this.scheduleThreadQueueDrain(threadId)
         }
-      } catch {
-        await this.restoreQueuedTurn(next)
-        this.scheduleThreadQueueDrain(threadId)
-      }
+      })
     } catch {
       // Queue processing is best-effort. Keep the bridge alive if app-server is unavailable.
       this.scheduleThreadQueueDrain(threadId)
@@ -7055,6 +8875,21 @@ export class BackendQueueProcessor {
     const thread = asRecord(response?.thread)
     if (!thread) return false
 
+    // A desktop Codex process can append the terminal marker to the shared
+    // session file before this app-server's thread projection catches up.
+    // Prefer that marker when it is available; otherwise a stale
+    // `thread.status=inProgress` would keep the queue in a retry loop forever.
+    const sessionPath = readNonEmptyString(thread.path)
+    if (sessionPath && isAbsolute(sessionPath)) {
+      try {
+        const sessionActivity = await this.appServer.getSessionActivityReader().read(sessionPath)
+        if (sessionActivity.known) return !sessionActivity.inProgress
+      } catch {
+        // Fall back to the app-server projection when the session marker is
+        // temporarily unreadable.
+      }
+    }
+
     const status = asRecord(thread.status)
     const statusType = readNonEmptyString(status?.type)
     if (statusType === 'inProgress' || statusType === 'running' || statusType === 'active') return false
@@ -7071,13 +8906,19 @@ export class BackendQueueProcessor {
       }
 
       const [message, ...rest] = queue
+      const processingMessage: StoredQueuedMessage = {
+        ...message,
+        status: 'processing',
+        attempts: message.attempts + 1,
+        lastError: '',
+      }
       const nextState = { ...state }
       if (rest.length > 0) {
         nextState[threadId] = rest
       } else {
         delete nextState[threadId]
       }
-      return { nextState, result: { threadId, message } }
+      return { nextState, result: { threadId, message: processingMessage } }
     })
   }
 
@@ -7087,7 +8928,11 @@ export class BackendQueueProcessor {
       return {
         nextState: {
           ...state,
-          [turn.threadId]: [turn.message, ...queue],
+          [turn.threadId]: [{
+            ...turn.message,
+            status: 'failed',
+            lastError: 'Queued turn failed to start; will retry automatically.',
+          }, ...queue],
         },
         result: undefined,
       }
@@ -7193,7 +9038,6 @@ export class BackendQueueProcessor {
   }
 
   private async startQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
-    await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
     await this.appServer.rpc('turn/start', await this.buildQueuedTurnParams(turn))
   }
 }
@@ -7313,7 +9157,9 @@ class MethodCatalog {
 
 type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
   dispose: () => void
-  subscribeNotifications: (listener: (value: { method: string; params: unknown; atIso: string }) => void) => () => void
+  subscribeNotifications: (listener: (value: AppServerNotification & { atIso: string }) => void) => () => void
+  getStreamCursor: () => { streamEpoch: string; latestSeq: number; oldestSeq: number | null }
+  getStreamEventsSince: (afterSeq: number, threadId?: string) => { events: StreamEventFrame[]; truncated: boolean }
 }
 
 type SharedBridgeState = {
@@ -7323,10 +9169,11 @@ type SharedBridgeState = {
   methodCatalog: MethodCatalog
   telegramBridge: TelegramThreadBridge
   backendQueueProcessor: BackendQueueProcessor
+  threadBroker: ThreadSessionBroker
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'experimental-api-v2'
+const SHARED_BRIDGE_VERSION = 'experimental-api-v3'
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -7335,7 +9182,7 @@ function getSharedBridgeState(): SharedBridgeState {
 
   const existing = globalScope[SHARED_BRIDGE_KEY]
   if (existing) {
-    if (existing.version === SHARED_BRIDGE_VERSION && existing.terminalManager) {
+    if (existing.version === SHARED_BRIDGE_VERSION && existing.terminalManager && existing.threadBroker) {
       return existing
     }
     existing.appServer.dispose()
@@ -7345,14 +9192,17 @@ function getSharedBridgeState(): SharedBridgeState {
 
   const appServer = new AppServerProcess()
   const terminalManager = new ThreadTerminalManager()
-  const backendQueueProcessor = new BackendQueueProcessor(appServer)
+  const threadBroker = new ThreadSessionBroker(() => appServer.getProcessGeneration())
+  const backendQueueProcessor = new BackendQueueProcessor(appServer, threadBroker)
   const created: SharedBridgeState = {
     version: SHARED_BRIDGE_VERSION,
     appServer,
     terminalManager,
     methodCatalog: new MethodCatalog(),
     backendQueueProcessor,
+    threadBroker,
     telegramBridge: new TelegramThreadBridge(appServer, {
+      threadBroker,
       onChatSeen: (chatId) => {
         void rememberTelegramChatId(chatId).catch(() => {})
       },
@@ -7439,7 +9289,7 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
 }
 
 export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
-  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor } = getSharedBridgeState()
+  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor, threadBroker } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 
@@ -7919,6 +9769,14 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         return
       }
 
+      if (req.method === 'GET' && url.pathname === '/codex-api/app-server/status') {
+        setJson(res, 200, {
+          data: appServer.getConnectionStatus(),
+          generation: appServer.getProcessGeneration(),
+        })
+        return
+      }
+
       if (req.method === 'POST' && url.pathname === '/codex-api/rpc') {
         const payload = await readJsonBody(req)
         const body = asRecord(payload) as RpcProxyRequest | null
@@ -7937,28 +9795,108 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 	          return
 	        }
 
-	        if (body.method === 'account/rateLimits/read' && !(await hasUsableCodexAuth())) {
+        if (body.method === 'account/rateLimits/read' && !(await hasChatgptAccountAuth())) {
 	          setJson(res, 200, { result: null })
 	          return
 	        }
 
         let rpcResult: unknown
         try {
-          rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
+          const rawClientId = Array.isArray(req.headers['x-codex-client-id'])
+            ? req.headers['x-codex-client-id'][0]
+            : req.headers['x-codex-client-id']
+          const rawClientType = Array.isArray(req.headers['x-codex-client-type'])
+            ? req.headers['x-codex-client-type'][0]
+            : req.headers['x-codex-client-type']
+          const clientId = typeof rawClientId === 'string' && rawClientId.trim() ? rawClientId.trim() : 'unknown-client'
+          const clientType = rawClientType === 'android' || rawClientType === 'desktop' || rawClientType === 'web'
+            ? rawClientType
+            : 'unknown' as const
+          const rpcParams = body.params ?? null
+          const rpcThreadId = readNonEmptyString(asRecord(rpcParams)?.threadId)
+          if (rpcThreadId && body.method === 'turn/start') {
+            const ensureThreadWriter = (threadId: string) => threadBroker.ensureWriterReady(
+              threadId,
+              async () => ensureThreadReadyForMutation(appServer, threadId),
+            )
+            rpcResult = await threadBroker.runTurn(
+              rpcThreadId,
+              async () => ensureThreadReadyForMutation(appServer, rpcThreadId),
+              async () => callRpcWithArchiveRecovery(appServer, body.method, rpcParams, {
+                // Recovery runs inside the same broker lock.  Reuse the
+                // generation-aware writer state instead of issuing a second
+                // thread/resume for the same client.
+                resumeThread: ensureThreadWriter,
+              }),
+            )
+            threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
+          } else if (rpcThreadId && body.method === 'thread/resume' && threadBroker.isWriterReady(rpcThreadId)) {
+            // A second browser opening an already materialized thread should
+            // receive its read-only state instead of attempting to acquire a
+            // second Codex writer lock.
+            rpcResult = await readThreadSnapshotForObserver(appServer, rpcThreadId)
+          } else if (rpcThreadId && body.method === 'thread/resume') {
+            try {
+              rpcResult = await threadBroker.runExclusive(rpcThreadId, async () => {
+                if (threadBroker.isWriterReady(rpcThreadId)) {
+                  return await readThreadSnapshotForObserver(appServer, rpcThreadId)
+                }
+                const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+                threadBroker.markWriterReady(rpcThreadId)
+                threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
+                return result
+              })
+            } catch (error) {
+              if (isActiveThreadWriterError(error)) {
+                // A different app-server process owns this thread.  Preserve the
+                // observer contract by returning the current read-only snapshot.
+                rpcResult = await readThreadSnapshotForObserver(appServer, rpcThreadId)
+              } else if (isThreadNotFoundError(error)) {
+                // A newly-created thread has metadata in memory but no rollout
+                // file yet.  Resume cannot materialize it; return the metadata
+                // projection so the next turn can call turn/start directly.
+                const metadata = await readUnmaterializedThreadMetadata(appServer, rpcThreadId)
+                if (!metadata) throw error
+                rpcResult = metadata
+                threadBroker.markWriterReady(rpcThreadId)
+                threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
+              } else {
+                throw error
+              }
+            }
+          } else if (rpcThreadId && ['turn/steer', 'turn/interrupt', 'thread/rollback'].includes(body.method)) {
+            rpcResult = await threadBroker.runExclusive(
+              rpcThreadId,
+              async () => {
+                await threadBroker.ensureWriterReady(rpcThreadId, async () => {
+                  await ensureThreadReadyForMutation(appServer, rpcThreadId)
+                })
+                const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+                threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
+                return result
+              },
+            )
+          } else {
+            rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+          }
         } catch (error) {
 	          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
 	            setJson(res, 200, { result: null })
 	            return
 	          }
-		          if (body.method === 'thread/read' && isEmptyThreadReadError(error)) {
-		            const params = asRecord(body.params)
-		            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
-		            const snapshot = threadId ? appServer.getLastThreadReadSnapshot(threadId) : null
-		            if (snapshot) {
-		              setJson(res, 200, { result: snapshot })
-		              return
-		            }
-		          }
+	          if (body.method === 'thread/read' && isEmptyThreadReadError(error)) {
+	            const params = asRecord(body.params)
+	            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
+	            const snapshot = threadId ? appServer.getLastThreadReadSnapshot(threadId) : null
+	            if (snapshot) {
+	              const mergedSnapshot = await mergeSessionActivityIntoThreadResult(
+                snapshot,
+                appServer.getSessionActivityReader(),
+              )
+	              setJson(res, 200, { result: mergedSnapshot })
+	              return
+	            }
+	          }
           if (body.method === 'thread/read' && isThreadMaterializationPendingError(error)) {
             const params = asRecord(body.params)
             const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
@@ -7982,9 +9920,12 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
           : trimmedResult
         const listMergedResult = body.method === 'thread/list'
-          ? mergeImportedThreadsIntoThreadListResult(errorMergedResult)
+          ? await mergeSessionActivityIntoThreadListResult(mergeImportedThreadsIntoThreadListResult(errorMergedResult), appServer.getSessionActivityReader())
           : errorMergedResult
-        const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, listMergedResult)
+        const activityMergedResult = body.method === 'thread/read' || body.method === 'thread/resume'
+          ? await mergeSessionActivityIntoThreadResult(listMergedResult, appServer.getSessionActivityReader())
+          : listMergedResult
+        const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, activityMergedResult)
         const result = THREAD_METHODS_WITH_TURNS.has(body.method)
           ? await mergeSessionSkillInputsIntoThreadResult(sanitizedResult)
           : sanitizedResult
@@ -8064,6 +10005,84 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         return
       }
 
+      if (req.method === 'GET' && url.pathname === '/codex-api/thread-fast-state') {
+        const threadId = url.searchParams.get('threadId')?.trim() ?? ''
+        if (!threadId) {
+          setJson(res, 400, { error: 'Missing threadId' })
+          return
+        }
+
+        try {
+          // includeTurns:false still gives us the stable session path and
+          // thread metadata, without asking app-server to materialize the
+          // complete rollout.  The path is obtained from Codex itself rather
+          // than accepted from the browser, so this endpoint cannot be used
+          // as an arbitrary local-file reader.
+          const summaryResult = appServer.getThreadSummarySnapshot(threadId)
+            ?? await appServer.rpc('thread/read', {
+              threadId,
+              includeTurns: false,
+            })
+          const summaryRecord = asRecord(summaryResult)
+          const summaryThread = asRecord(summaryRecord?.thread)
+          const sessionPath = readNonEmptyString(summaryThread?.path)
+          if (!summaryRecord || !summaryThread || !sessionPath || !isAbsolute(sessionPath)) {
+            setJson(res, 404, { error: 'Thread session path is unavailable' })
+            return
+          }
+
+          const sessionActivity = await appServer.getSessionActivityReader().read(sessionPath)
+          const sessionTail = await readSessionTailForFastThread(sessionPath)
+          const turns = buildFastSessionTurns(sessionTail.raw)
+          const queueState = await readThreadQueueState()
+          const currentStatus = asRecord(summaryThread.status)
+          const inProgress = sessionActivity.known
+            ? sessionActivity.inProgress
+            : readNonEmptyString(currentStatus?.type) === 'inProgress'
+          const mergedThread = {
+            ...summaryThread,
+            turns,
+            ...(sessionActivity.known
+              ? {
+                inProgress,
+                status: { ...currentStatus, type: inProgress ? 'inProgress' : 'idle' },
+                sessionActivityKnown: true,
+                sessionRevision: sessionActivity.revision,
+              }
+              : {}),
+          }
+          const activitySnapshot = buildTaskSnapshotResponse(
+            threadId,
+            inProgress,
+            queueState[threadId]?.length ?? 0,
+            appServer.listPendingServerRequests(),
+            appServer.getStreamEvents(threadId, 40),
+            appServer.getStreamCursor(),
+            sessionActivity,
+            resolveTaskWriterClient(threadId, sessionActivity, appServer, threadBroker),
+          )
+          setJson(res, 200, {
+            ...summaryRecord,
+            thread: mergedThread,
+            partial: true,
+            // A full app-server hydration of a large rollout is deliberately
+            // deferred.  The client should keep the bounded projection as
+            // the live view instead of immediately issuing a multi-megabyte
+            // thread/read in the background.
+            fullHydrationDeferred: sessionTail.size > OBSERVER_FULL_READ_MAX_BYTES,
+            hasMoreOlder: sessionTail.size > FAST_THREAD_SESSION_TAIL_BYTES || turns.length >= THREAD_RESPONSE_TURN_LIMIT,
+            inProgress,
+            sessionActivityKnown: sessionActivity.known,
+            sessionRevision: sessionActivity.revision,
+            streamCursor: appServer.getStreamCursor(),
+            ...activitySnapshot,
+          })
+        } catch (error) {
+          setJson(res, 502, { error: getErrorMessage(error, 'Failed to load fast thread state') })
+        }
+        return
+      }
+
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-file-change-fallback') {
         const threadId = url.searchParams.get('threadId')?.trim() ?? ''
         if (!threadId) {
@@ -8096,12 +10115,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const threadId = url.searchParams.get('threadId')?.trim() ?? ''
         const limitRaw = url.searchParams.get('limit')?.trim() ?? '80'
         const limit = Math.max(1, Math.min(400, Number.parseInt(limitRaw, 10) || 80))
-        if (!threadId) {
-          setJson(res, 400, { error: 'Missing threadId' })
+        const afterSeqRaw = url.searchParams.get('afterSeq')?.trim() ?? ''
+        const afterSeq = afterSeqRaw ? Number.parseInt(afterSeqRaw, 10) : Number.NaN
+        if (Number.isFinite(afterSeq)) {
+          const replay = appServer.getStreamEventsSince(afterSeq, threadId)
+          setJson(res, 200, {
+            events: replay.events.slice(-limit),
+            truncated: replay.truncated,
+            cursor: appServer.getStreamCursor(),
+          })
           return
         }
         const events = appServer.getStreamEvents(threadId, limit)
-        setJson(res, 200, { events })
+        setJson(res, 200, { events, cursor: appServer.getStreamCursor(), truncated: false })
         return
       }
 
@@ -8113,10 +10139,35 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         }
 
         try {
-          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.rpc('thread/read', {
+          let rawThreadReadResult = await readThreadSnapshotForObserver(appServer, threadId)
+          const rawThreadRecord = asRecord(rawThreadReadResult)
+          const rawThread = asRecord(rawThreadRecord?.thread)
+          const rawSessionPath = readNonEmptyString(rawThread?.path)
+          let sessionActivity = rawSessionPath && isAbsolute(rawSessionPath)
+            ? await appServer.getSessionActivityReader().read(rawSessionPath)
+            : null
+
+          // The desktop writer appends its terminal marker before the
+          // app-server's thread projection catches up.  Retry only the
+          // read-only projection for a short bounded window.  This keeps the
+          // mobile observer from acquiring the writer lock while still giving
+          // it a chance to receive the final turn in the same poll.
+          const projectionRetry = await readThreadWithProjectionRetry(
+            appServer,
             threadId,
-            includeTurns: true,
-          }))
+            rawThreadReadResult,
+            sessionActivity,
+            rawSessionPath,
+          )
+          rawThreadReadResult = projectionRetry.result
+          sessionActivity = projectionRetry.activity
+          let projectionCaughtUp = projectionRetry.projectionCaughtUp
+
+          const threadReadResult = await mergeSessionActivityIntoThreadResult(
+            rawThreadReadResult,
+            appServer.getSessionActivityReader(),
+            sessionActivity ?? undefined,
+          )
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
           appServer.storeThreadReadSnapshot(threadId, sanitized)
 
@@ -8125,6 +10176,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
 
           const sessionPath = readNonEmptyString(thread?.path)
+          const sessionRevision = sessionActivity?.known ? sessionActivity.revision : ''
           let sessionSize = 0
           if (sessionPath && isAbsolute(sessionPath)) {
             try {
@@ -8133,9 +10185,22 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             } catch { /* missing */ }
           }
 
-          const cached = appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
+          const cached = appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize, sessionRevision)
           if (cached) {
-            setJson(res, 200, cached)
+            const cachedRecord = asRecord(cached)
+            const cachedInProgress = cachedRecord?.isInProgress === true || cachedRecord?.inProgress === true
+            const queueState = await readThreadQueueState()
+            const taskSnapshot = buildTaskSnapshotResponse(
+              threadId,
+              cachedInProgress,
+              queueState[threadId]?.length ?? 0,
+              appServer.listPendingServerRequests(),
+              appServer.getStreamEvents(threadId, 40),
+              appServer.getStreamCursor(),
+              sessionActivity,
+              resolveTaskWriterClient(threadId, sessionActivity, appServer, threadBroker),
+            )
+            setJson(res, 200, { ...cachedRecord, ...taskSnapshot })
             return
           }
 
@@ -8143,28 +10208,93 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
           if (sessionPath && isAbsolute(sessionPath) && sessionSize > 0) {
             try {
-              const sessionLogRaw = await readFile(sessionPath, 'utf8')
+              // Large session logs are common for long-running Codex tasks.
+              // Reading the whole JSONL here defeats the observer fast path
+              // and can block both clients while app-server materializes the
+              // same rollout.  The bounded tail still contains the recent
+              // turn/command ordering needed for the live view.
+              const sessionLogRaw = sessionSize > OBSERVER_FULL_READ_MAX_BYTES
+                ? (await readSessionTailForFastThread(sessionPath)).raw
+                : await readFile(sessionPath, 'utf8')
               turns = mergeSessionCommandsIntoTurns(turns, sessionLogRaw)
+
+              // If the projection remained stale after the retry window,
+              // recover the terminal assistant response directly from the
+              // session JSONL.  Only run this for a known idle session; an
+              // in-progress task must never expose a synthetic final turn.
+              if (sessionActivity?.known && !sessionActivity.inProgress && !projectionCaughtUp) {
+                const fallback = buildSessionProjectionFallback(sessionLogRaw, sessionActivity)
+                if (fallback) {
+                  const mergedFallback = mergeSessionProjectionFallbackIntoTurns(turns, fallback, true)
+                  turns = mergedFallback.turns
+                  // Keep the cache conservative: a synthesized turn is a
+                  // useful response for this poll, but the idle cache should
+                  // remain disabled until thread/read itself catches up.
+                  projectionCaughtUp = false
+                }
+              }
             } catch {
               // Session log not available — continue without command recovery
             }
           }
 
           const lastTurn = turns.length > 0 ? asRecord(turns[turns.length - 1]) : null
-          const isInProgress = lastTurn?.status === 'inProgress'
+          const threadStatus = asRecord(thread?.status)
+          const isInProgress = sessionActivity?.known
+            ? sessionActivity.inProgress
+            : lastTurn?.status === 'inProgress' ||
+              thread?.inProgress === true ||
+              ['inProgress', 'running', 'active'].includes(readNonEmptyString(threadStatus?.type))
+
+          const queueState = await readThreadQueueState()
+          const taskSnapshot = buildTaskSnapshotResponse(
+            threadId,
+            isInProgress,
+            queueState[threadId]?.length ?? 0,
+            appServer.listPendingServerRequests(),
+            appServer.getStreamEvents(threadId, 40),
+            appServer.getStreamCursor(),
+            sessionActivity,
+            resolveTaskWriterClient(threadId, sessionActivity, appServer, threadBroker),
+          )
 
           const responseData = {
             threadId,
+            thread: {
+              ...thread,
+              turns,
+            },
             conversationState: {
               turns,
             },
+            // Preserve projection metadata from the read-only observer read.
+            // Without these markers a bounded tail was indistinguishable from
+            // a complete conversation, so a later live refresh could replace
+            // loaded history with only the recent turns.
+            partial: rawThreadRecord?.partial === true || typeof rawThreadRecord?.threadTurnStartIndex === 'number',
+            threadTurnStartIndex: typeof rawThreadRecord?.threadTurnStartIndex === 'number'
+              ? Math.max(0, Math.trunc(rawThreadRecord.threadTurnStartIndex))
+              : 0,
+            hasMoreOlder: (typeof rawThreadRecord?.threadTurnStartIndex === 'number'
+              && Math.trunc(rawThreadRecord.threadTurnStartIndex) > 0)
+              || sessionSize > FAST_THREAD_SESSION_TAIL_BYTES
+              || turns.length >= THREAD_RESPONSE_TURN_LIMIT,
+            fullHydrationDeferred: sessionSize > OBSERVER_FULL_READ_MAX_BYTES,
             ownerClientId: null,
             liveStateError: null,
             isInProgress,
+            streamCursor: appServer.getStreamCursor(),
+            ...taskSnapshot,
+            ...(sessionActivity?.known
+              ? {
+                sessionActivityKnown: true,
+                sessionRevision: sessionActivity.revision,
+              }
+              : {}),
           }
 
-          if (!isInProgress) {
-            appServer.cacheLiveState(threadId, responseData, rawTurns.length, sessionSize)
+          if (!isInProgress && projectionCaughtUp) {
+            appServer.cacheLiveState(threadId, responseData, rawTurns.length, sessionSize, sessionRevision)
           }
 
           setJson(res, 200, responseData)
@@ -8176,38 +10306,86 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               ownerClientId: null,
               liveStateError: null,
               isInProgress: true,
+              streamCursor: appServer.getStreamCursor(),
+              taskState: 'running',
+              currentActivity: { kind: 'thinking', label: 'Thinking', details: [] },
+              queueDepth: 0,
+              activeRequest: null,
+              writerClient: null,
+              startedAt: null,
+              finishedAt: null,
+              error: null,
+              timeline: [],
             })
             return
           }
 
+          // A read failure is a transport/projection problem, not evidence
+          // that the Codex task failed.  Keep the last usable projection (or
+          // summary), re-check the shared session marker when possible, and
+          // expose the read error separately for diagnostics.  This prevents
+          // an observer poll from overwriting a running/completed state with
+          // a synthetic terminal `failed` state.
           const snapshot = appServer.getLastThreadReadSnapshot(threadId)
-          if (snapshot) {
-            const record = asRecord(snapshot)
-            const thread = asRecord(record?.thread)
-            const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-            const turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
-            setJson(res, 200, {
-              threadId,
-              conversationState: { turns },
-              ownerClientId: null,
-              liveStateError: {
-                kind: 'readFailed',
-                message: getErrorMessage(error, 'thread/read failed'),
-              },
-              isInProgress: false,
-            })
-          } else {
-            setJson(res, 200, {
-              threadId,
-              conversationState: null,
-              ownerClientId: null,
-              liveStateError: {
-                kind: 'readFailed',
-                message: getErrorMessage(error, 'thread/read failed'),
-              },
-              isInProgress: false,
-            })
+            ?? appServer.getThreadSummarySnapshot(threadId)
+          const snapshotRecord = asRecord(snapshot)
+          const snapshotThread = asRecord(snapshotRecord?.thread)
+          const rawTurns = Array.isArray(snapshotThread?.turns) ? snapshotThread.turns : []
+          const turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
+          let sessionActivity: ThreadSessionActivity | null = null
+          const sessionPath = readNonEmptyString(snapshotThread?.path)
+          if (sessionPath && isAbsolute(sessionPath)) {
+            try {
+              sessionActivity = await appServer.getSessionActivityReader().read(sessionPath)
+            } catch {
+              sessionActivity = null
+            }
           }
+
+          const status = asRecord(snapshotThread?.status)
+          const statusType = readNonEmptyString(status?.type).toLowerCase()
+          const projectionInProgress = snapshotThread?.inProgress === true
+            || ['inprogress', 'running', 'active'].includes(statusType)
+            || turns.some((turn) => readNonEmptyString(asRecord(turn)?.status).toLowerCase() === 'inprogress')
+          const isInProgress = sessionActivity?.known
+            ? sessionActivity.inProgress
+            : projectionInProgress
+          const queueState = await readThreadQueueState()
+          const queueDepth = queueState[threadId]?.length ?? 0
+          const taskSnapshot = buildTaskSnapshotResponse(
+            threadId,
+            isInProgress,
+            queueDepth,
+            appServer.listPendingServerRequests(),
+            appServer.getStreamEvents(threadId, 40),
+            appServer.getStreamCursor(),
+            sessionActivity,
+            resolveTaskWriterClient(threadId, sessionActivity, appServer, threadBroker),
+          )
+          const readError = getErrorMessage(error, 'thread/read failed')
+          setJson(res, 200, {
+            threadId,
+            ...(snapshotThread
+              ? {
+                thread: { ...snapshotThread, turns },
+                conversationState: { turns },
+              }
+              : { conversationState: null }),
+            ownerClientId: null,
+            liveStateError: {
+              kind: 'readFailed',
+              message: readError,
+            },
+            isInProgress,
+            streamCursor: appServer.getStreamCursor(),
+            ...taskSnapshot,
+            ...(sessionActivity?.known
+              ? {
+                sessionActivityKnown: true,
+                sessionRevision: sessionActivity.revision,
+              }
+              : {}),
+          })
         }
         return
       }
@@ -8288,7 +10466,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
       if (req.method === 'POST' && url.pathname === '/codex-api/transcribe') {
         const auth = await readCodexAuth()
-        if (!auth) {
+        if (!auth || !auth.accountId) {
           setJson(res, 401, { error: 'No auth token available for transcription' })
           return
         }
@@ -8478,6 +10656,80 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-queue-state') {
         const state = await readThreadQueueState()
         setJson(res, 200, { data: state })
+        return
+      }
+
+      if (req.method === 'POST' && url.pathname === '/codex-api/thread-queue/enqueue') {
+        const payload = asRecord(await readJsonBody(req))
+        const threadId = readNonEmptyString(payload?.threadId)
+        const beforeMessageId = readNonEmptyString(payload?.beforeMessageId)
+        const rawMessage = asRecord(payload?.message) ?? payload
+        const messageId = readNonEmptyString(rawMessage?.id)
+          || `web-${Date.now()}-${randomBytes(3).toString('hex')}`
+        const message = normalizeStoredQueuedMessage({ ...rawMessage, id: messageId })
+        if (!threadId || !message) {
+          setJson(res, 400, { error: 'Missing threadId or valid queued message' })
+          return
+        }
+        const result = await enqueueThreadQueuedMessage(threadId, message, beforeMessageId)
+        appServer.publishNotification('queue/updated', {
+          threadId,
+          messageId: message.id,
+          queueDepth: result.state[threadId]?.length ?? 0,
+          inserted: result.inserted,
+          atIso: new Date().toISOString(),
+        })
+        backendQueueProcessor.scheduleThreadQueueDrain(threadId, 0)
+        setJson(res, 200, {
+          queued: true,
+          inserted: result.inserted,
+          data: result.state[threadId] ?? [],
+        })
+        return
+      }
+
+      if (req.method === 'POST' && (url.pathname === '/codex-api/thread-queue/remove' || url.pathname === '/codex-api/thread-queue/reorder')) {
+        const payload = asRecord(await readJsonBody(req))
+        const threadId = readNonEmptyString(payload?.threadId)
+        const messageId = readNonEmptyString(payload?.messageId)
+        const targetId = readNonEmptyString(payload?.targetId)
+        if (!threadId || !messageId || (url.pathname.endsWith('/reorder') && !targetId)) {
+          setJson(res, 400, { error: 'Missing threadId, messageId, or targetId' })
+          return
+        }
+
+        const result = await withThreadQueueStateUpdate<{ state: ThreadQueueState; changed: boolean }>((state) => {
+          const queue = state[threadId] ?? []
+          const fromIndex = queue.findIndex((message) => message.id === messageId)
+          if (fromIndex < 0) return { nextState: state, result: { state, changed: false } }
+
+          if (url.pathname.endsWith('/remove')) {
+            const nextQueue = queue.filter((message) => message.id !== messageId)
+            const nextState = { ...state }
+            if (nextQueue.length > 0) nextState[threadId] = nextQueue
+            else delete nextState[threadId]
+            return { nextState, result: { state: nextState, changed: true } }
+          }
+
+          const targetIndex = queue.findIndex((message) => message.id === targetId)
+          if (targetIndex < 0 || targetIndex === fromIndex) return { nextState: state, result: { state, changed: false } }
+          const nextQueue = [...queue]
+          const [moved] = nextQueue.splice(fromIndex, 1)
+          nextQueue.splice(targetIndex, 0, moved)
+          const nextState = { ...state, [threadId]: nextQueue }
+          return { nextState, result: { state: nextState, changed: true } }
+        })
+        appServer.publishNotification('queue/updated', {
+          threadId,
+          messageId,
+          queueDepth: result.state[threadId]?.length ?? 0,
+          status: url.pathname.endsWith('/remove') ? 'removed' : 'reordered',
+          atIso: new Date().toISOString(),
+        })
+        setJson(res, 200, {
+          changed: result.changed,
+          data: result.state[threadId] ?? [],
+        })
         return
       }
 
@@ -9594,12 +11846,27 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         res.setHeader('Connection', 'keep-alive')
         res.setHeader('X-Accel-Buffering', 'no')
 
-        const unsubscribe = middleware.subscribeNotifications((notification: { method: string; params: unknown; atIso: string }) => {
+        const unsubscribe = middleware.subscribeNotifications((notification: { method: string; params: unknown; atIso: string; seq?: number }) => {
           if (res.writableEnded || res.destroyed) return
+          if (typeof notification.seq === 'number') {
+            res.write(`id: ${notification.seq}\n`)
+          }
           res.write(`data: ${JSON.stringify(notification)}\n\n`)
         })
 
-        res.write(`event: ready\ndata: ${JSON.stringify({ ok: true })}\n\n`)
+        const requestedAfterSeq = Number.parseInt(
+          url.searchParams.get('afterSeq')?.trim() || String(req.headers['last-event-id'] ?? ''),
+          10,
+        )
+        if (Number.isFinite(requestedAfterSeq)) {
+          const replay = middleware.getStreamEventsSince(requestedAfterSeq)
+          for (const event of replay.events) {
+            if (res.writableEnded || res.destroyed) break
+            res.write(`id: ${event.seq}\n`)
+            res.write(`data: ${JSON.stringify(event)}\n\n`)
+          }
+        }
+        res.write(`event: ready\ndata: ${JSON.stringify({ ok: true, ...appServer.getStreamCursor() })}\n\n`)
         const keepAlive = setInterval(() => {
           res.write(': ping\n\n')
         }, 15000)
@@ -9629,15 +11896,16 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
     telegramBridge.stop()
     terminalManager.dispose()
     backendQueueProcessor.dispose()
+    threadBroker.clearWriterState()
     appServer.dispose()
   }
   middleware.subscribeNotifications = (
-    listener: (value: { method: string; params: unknown; atIso: string }) => void,
+    listener: (value: AppServerNotification & { atIso: string }) => void,
   ) => {
-    const unsubscribeAppServer = appServer.onNotification((notification: { method: string; params: unknown }) => {
+    const unsubscribeAppServer = appServer.onNotification((notification: AppServerNotification) => {
       listener({
         ...notification,
-        atIso: new Date().toISOString(),
+        atIso: notification.atIso ?? new Date().toISOString(),
       })
     })
     const unsubscribeTerminal = terminalManager.subscribe((notification) => {
@@ -9651,6 +11919,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       unsubscribeTerminal()
     }
   }
+
+  middleware.getStreamCursor = () => appServer.getStreamCursor()
+  middleware.getStreamEventsSince = (afterSeq: number, threadId = '') => appServer.getStreamEventsSince(afterSeq, threadId)
 
   return middleware
 }

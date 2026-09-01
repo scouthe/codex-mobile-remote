@@ -41,3 +41,6 @@ Return to the [manual test index](../../tests.md).
 | [First user message is visible immediately in new chats](first-user-message-is-visible-immediately-in-new-chats.md) |
 | [New chat live thinking and stop controls](new-chat-live-thinking-and-stop-controls.md) |
 | [Bold URL trailing punctuation parsing](bold-url-trailing-punctuation-parsing.md) |
+| [Queued timeline does not grow while queue state is polled](queued-timeline-does-not-grow-on-polling.md) |
+| [Queued message drains after the session is idle](queued-message-drains-after-session-is-idle.md) |
+| [Idle session sends directly](idle-session-sends-directly.md) |

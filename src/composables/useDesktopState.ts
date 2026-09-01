@@ -11,6 +11,8 @@ import {
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
+  getThreadFastDetail,
+  getThreadLiveState,
   getOlderThreadMessages,
   getBackgroundThreadListLimit,
   interruptThreadTurn,
@@ -20,9 +22,11 @@ import {
   rollbackThread,
   getThreadGroupsPage,
   getThreadQueueState,
+  enqueueThreadMessage,
+  removeQueuedThreadMessage,
+  reorderQueuedThreadMessage,
   getWorkspaceRootsState,
   setCodexSpeedMode,
-  setThreadQueueState,
   setWorkspaceRootsState,
   getThreadTitleCache,
   persistThreadTitle,
@@ -34,7 +38,7 @@ import {
   startThreadTurn,
   type RpcNotification,
   type SkillInfo,
-  type ThreadQueueState,
+  type ThreadLiveState,
   type WorkspaceRootsState,
 } from '../api/codexGateway'
 import { CodexApiError } from '../api/codexErrors'
@@ -59,6 +63,13 @@ import type {
   UiTokenUsageBreakdown,
   UiThread,
 } from '../types/codex'
+import type {
+  TaskActiveRequest,
+  TaskQueueSummary,
+  TaskSnapshot,
+  TaskWriterIdentity,
+} from '../types/task'
+import { reduceTaskSnapshot } from '../task/taskStateReducer'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
@@ -90,12 +101,22 @@ const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
+const THREAD_STATUS_POLL_INTERVAL_MS = 1500
+const FAST_THREAD_BACKGROUND_HYDRATION_DELAY_MS = 300
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
 const OPENCODE_ZEN_DEFAULT_MODEL = 'big-pickle'
 const CODEX_CLI_MISSING_MESSAGE = 'Codex CLI not found. Install @openai/codex or set CODEXUI_CODEX_COMMAND.'
+const ACTIVE_TASK_STATES = new Set<TaskSnapshot['state']>([
+  'queued',
+  'starting',
+  'running',
+  'waiting_approval',
+  'waiting_user_input',
+  'steering',
+])
 type SelectThreadResult = 'ok' | 'not-found' | 'error'
 
 function isCodexCliMissingError(error: unknown): boolean {
@@ -667,7 +688,7 @@ function areMessageArraysEqual(first: UiMessage[], second: UiMessage[]): boolean
 function mergeMessages(
   previous: UiMessage[],
   incoming: UiMessage[],
-  options: { preserveMissing?: boolean } = {},
+  options: { preserveMissing?: boolean; preserveOnlyOlder?: boolean } = {},
 ): UiMessage[] {
   const previousById = new Map(previous.map((message) => [message.id, message]))
   const incomingById = new Map(incoming.map((message) => [message.id, message]))
@@ -684,17 +705,31 @@ function mergeMessages(
     return areMessageArraysEqual(previous, mergedIncoming) ? previous : mergedIncoming
   }
 
+  const incomingTurnIndexes = incoming
+    .map((message) => message.turnIndex)
+    .filter((turnIndex): turnIndex is number => typeof turnIndex === 'number' && Number.isFinite(turnIndex))
+  const earliestIncomingTurnIndex = incomingTurnIndexes.length > 0 ? Math.min(...incomingTurnIndexes) : null
+  const shouldPreserveMissingMessage = (message: UiMessage): boolean => {
+    if (options.preserveOnlyOlder !== true || earliestIncomingTurnIndex === null) return true
+    const turnIndex = message.turnIndex
+    // Messages without a turn index (optimistic/live rows from older bridge
+    // versions) are retained conservatively; indexed rows in the projected
+    // window are authoritative and may have been removed by rollback.
+    return typeof turnIndex !== 'number' || !Number.isFinite(turnIndex) || turnIndex < earliestIncomingTurnIndex
+  }
+
   const mergedFromPrevious = previous
     .map((previousMessage) => {
       const nextMessage = incomingById.get(previousMessage.id)
       if (!nextMessage) {
-        return previousMessage
+        return shouldPreserveMissingMessage(previousMessage) ? previousMessage : null
       }
       if (areMessageFieldsEqual(previousMessage, nextMessage)) {
         return previousMessage
       }
       return nextMessage
     })
+    .filter((message): message is UiMessage => Boolean(message))
     .filter((message) => !isOptimisticUserMessage(message) || !hasEquivalentUserMessage(message, incoming))
 
   const previousIdSet = new Set(previous.map((message) => message.id))
@@ -945,6 +980,8 @@ function areThreadFieldsEqual(first: UiThread, second: UiThread): boolean {
     first.preview === second.preview &&
     first.unread === second.unread &&
     first.inProgress === second.inProgress &&
+    first.sessionRevision === second.sessionRevision &&
+    first.sessionActivityKnown === second.sessionActivityKnown &&
     first.pendingRequestState === second.pendingRequestState
   )
 }
@@ -1400,6 +1437,10 @@ export function useDesktopState() {
   const liveCommandsByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveFileChangeMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const inProgressById = ref<Record<string, boolean>>({})
+  // A single reducer-backed view of task lifecycle.  Legacy maps remain in
+  // place for compatibility with existing components while new clients can
+  // consume this authoritative snapshot without inferring `inProgress`.
+  const taskSnapshotsByThreadId = ref<Record<string, TaskSnapshot>>({})
   type FileAttachment = { label: string; path: string; fsPath: string }
   type QueuedMessage = {
     id: string
@@ -1408,6 +1449,11 @@ export function useDesktopState() {
     skills: Array<{ name: string; path: string }>
     fileAttachments: FileAttachment[]
     collaborationMode: CollaborationModeKind
+    createdAtIso?: string
+    sourceClientId?: string
+    status?: 'queued' | 'processing' | 'failed'
+    attempts?: number
+    lastError?: string
   }
   type PendingTurnRequest = {
     text: string
@@ -1420,7 +1466,21 @@ export function useDesktopState() {
   }
   const queuedMessagesByThreadId = ref<Record<string, QueuedMessage[]>>({})
   const queueProcessingByThreadId = ref<Record<string, boolean>>({})
+  // A queue GET can race an enqueue/remove/reorder request.  Track a local
+  // mutation generation so a late read cannot overwrite a newer optimistic or
+  // server-confirmed queue snapshot.
+  const queueMutationVersionByThreadId = new Map<string, number>()
   let hasLoadedPersistedQueueState = false
+  let lastQueueStateRefreshAt = 0
+  const queueClientId = (() => {
+    if (typeof window === 'undefined') return 'server'
+    const key = 'codex-web-local.task-client-id.v1'
+    const existing = window.localStorage.getItem(key)?.trim()
+    if (existing) return existing
+    const generated = `web-${Math.random().toString(36).slice(2, 10)}`
+    window.localStorage.setItem(key, generated)
+    return generated
+  })()
   const eventUnreadByThreadId = ref<Record<string, boolean>>({})
   const availableModelIds = ref<string[]>([])
   const availableCollaborationModes = ref<CollaborationModeOption[]>([
@@ -1444,6 +1504,10 @@ export function useDesktopState() {
   const projectOrder = ref<string[]>(loadProjectOrder())
   const projectDisplayNameById = ref<Record<string, string>>(loadProjectDisplayNames())
   const loadedVersionByThreadId = ref<Record<string, string>>({})
+  // `updatedAtIso` is not guaranteed to change when a second Codex process
+  // appends to a session.  Keep the bridge-provided file revision separately
+  // so a poll can invalidate only the affected thread's message cache.
+  const loadedSessionRevisionByThreadId = ref<Record<string, string>>({})
   const loadedMessagesByThreadId = ref<Record<string, boolean>>({})
   const hasMoreOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const loadingOlderMessagesByThreadId = ref<Record<string, boolean>>({})
@@ -1457,6 +1521,12 @@ export function useDesktopState() {
   const threadListedByServerById = ref<Record<string, boolean>>({})
   const persistedUserMessageByThreadId = ref<Record<string, boolean>>({})
   const pendingServerRequestsByThreadId = ref<Record<string, UiServerRequest[]>>({})
+  // A reconnect can issue more than one pending-request read while server
+  // request/resolved notifications arrive in between.  Keep both a refresh
+  // sequence and an event mutation version so an older response cannot
+  // resurrect a request that a newer client already answered.
+  let pendingServerRequestRefreshSequence = 0
+  let pendingServerRequestMutationVersion = 0
   const pendingTurnRequestByThreadId = ref<Record<string, PendingTurnRequest>>({})
   const codexRateLimit = ref<UiRateLimitSnapshot | null>(null)
   const threadTokenUsageByThreadId = ref<Record<string, UiThreadTokenUsage>>(loadThreadTokenUsageMap())
@@ -1510,6 +1580,23 @@ export function useDesktopState() {
     return ''
   }
   let stopNotificationStream: (() => void) | null = null
+  let threadStatusPollTimer: number | null = null
+  type ThreadStatusSnapshot = {
+    inProgress: boolean
+    revision: string
+    terminalTurnId?: string
+    terminalState?: 'completed' | 'failed' | 'canceled' | ''
+    terminalError?: string
+  }
+  const lastObservedThreadStatusById = new Map<string, ThreadStatusSnapshot>()
+  const sessionActivityByThreadId = new Map<string, ThreadStatusSnapshot>()
+  // A live-state response can be a transient diagnostic envelope while the
+  // app-server is materializing a turn.  Keep retry intent separate from the
+  // observed status so an otherwise successful thread/read fallback does not
+  // suppress the next authoritative live read.
+  const liveStateRetryByThreadId = new Set<string>()
+  let lastStreamEpoch = ''
+  let lastStreamSeq = 0
   let eventSyncTimer: number | null = null
   let rateLimitRefreshTimer: number | null = null
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
@@ -1563,16 +1650,179 @@ export function useDesktopState() {
     }
     return rows.sort((first, second) => first.receivedAtIso.localeCompare(second.receivedAtIso))
   })
+  const selectedTaskSnapshot = computed<TaskSnapshot | null>(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? taskSnapshotsByThreadId.value[threadId] ?? null : null
+  })
+
+  /**
+   * Read the authoritative task lifecycle for one thread.  The legacy
+   * inProgress map is only a compatibility fallback for threads that have
+   * not received a reducer snapshot yet; once a snapshot exists, every
+   * action and view must use the same state source.
+   */
+  function isTaskActiveForThread(threadId: string): boolean {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return false
+    const snapshot = taskSnapshotsByThreadId.value[normalizedThreadId]
+    return snapshot
+      ? ACTIVE_TASK_STATES.has(snapshot.state)
+      : inProgressById.value[normalizedThreadId] === true
+  }
+
+  function updateTaskSnapshot(observation: {
+    threadId: string
+    atIso?: string
+    notification?: RpcNotification
+    inProgress?: boolean
+    activeTurnId?: string
+    terminalTurnId?: string
+    queue?: TaskQueueSummary
+    activeRequest?: TaskActiveRequest | null
+    writerClient?: TaskWriterIdentity | null
+    streamCursor?: TaskSnapshot['streamCursor']
+    error?: string | null
+    terminalState?: 'completed' | 'failed' | 'canceled' | ''
+    terminalError?: string
+    revision?: string
+    fullHydrationDeferred?: boolean
+  }): void {
+    const threadId = observation.threadId.trim()
+    if (!threadId) return
+    const previous = taskSnapshotsByThreadId.value[threadId]
+    const next = reduceTaskSnapshot(previous, observation)
+    if (next === previous) return
+    taskSnapshotsByThreadId.value = {
+      ...taskSnapshotsByThreadId.value,
+      [threadId]: next,
+    }
+    // Reducer observations also drive sidebar indicators.  Keeping this
+    // invalidation here prevents activity/queue/request notifications from
+    // updating only the selected task while other rows retain stale flags.
+    applyThreadFlags()
+  }
+
+  function isSessionActiveForThread(threadId: string): boolean {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return false
+    const snapshot = taskSnapshotsByThreadId.value[normalizedThreadId]
+    if (snapshot) {
+      return ['starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'].includes(snapshot.state)
+    }
+    return inProgressById.value[normalizedThreadId] === true
+  }
+
+  function updateTaskQueueSnapshot(threadId: string, queue: QueuedMessage[]): void {
+    const rows = queue ?? []
+    updateTaskSnapshot({
+      threadId,
+      queue: {
+        depth: rows.length,
+        oldestQueuedAt: rows.length > 0 ? new Date().toISOString() : null,
+        clientIds: [],
+      },
+      // `queued` is an active task-center state for send/stop affordances,
+      // but it is not an active Codex turn.  Feeding it back as
+      // `inProgress:true` would turn an emptied queue into `running`.
+      inProgress: isSessionActiveForThread(threadId),
+    })
+  }
+
+  /**
+   * Refresh the send decision when a browser still has an optimistic active
+   * bit.  A desktop writer can finish in another process without emitting a
+   * notification to this browser, so the legacy map may incorrectly route a
+   * normal message into the queue.  The bridge's live snapshot includes the
+   * authoritative session-file marker and queue depth.
+   */
+  async function refreshTaskStateBeforeSend(threadId: string): Promise<boolean | null> {
+    const snapshot = taskSnapshotsByThreadId.value[threadId]
+    const localStateLooksBusy = isTaskActiveForThread(threadId)
+      || (snapshot?.queueDepth ?? 0) > 0
+    if (!localStateLooksBusy) return null
+
+    let detail: ThreadLiveState
+    try {
+      detail = await getThreadLiveState(threadId)
+    } catch {
+      return null
+    }
+
+    // A diagnostic fallback can carry `inProgress: false` without a complete
+    // session read.  Do not let that transient envelope start a second turn.
+    if (detail.liveStateError || detail.sessionActivityKnown !== true) return null
+    if (selectedThreadId.value !== threadId) return null
+
+    const queueDepth = typeof detail.queueDepth === 'number'
+      ? Math.max(0, Math.trunc(detail.queueDepth))
+      : undefined
+    updateTaskSnapshot({
+      threadId,
+      inProgress: detail.inProgress,
+      activeTurnId: detail.activeTurnId,
+      terminalTurnId: detail.terminalTurnId,
+      activeRequest: detail.activeRequest,
+      writerClient: detail.writerClient,
+      streamCursor: detail.streamCursor ?? undefined,
+      revision: detail.sessionRevision,
+      ...(queueDepth === undefined
+        ? {}
+        : {
+          queue: {
+            depth: queueDepth,
+            oldestQueuedAt: null,
+            clientIds: [],
+          },
+        }),
+    })
+    if (detail.taskState) {
+      const current = taskSnapshotsByThreadId.value[threadId]
+      if (current) {
+        taskSnapshotsByThreadId.value = {
+          ...taskSnapshotsByThreadId.value,
+          [threadId]: {
+            ...current,
+            state: detail.taskState,
+            terminalTurnId: detail.terminalTurnId || current.terminalTurnId,
+            currentActivity: detail.currentActivity ?? current.currentActivity,
+            queueDepth: queueDepth ?? current.queueDepth,
+            activeRequest: detail.activeRequest === undefined ? current.activeRequest : detail.activeRequest,
+            writerClient: detail.writerClient === undefined ? current.writerClient : detail.writerClient,
+            startedAt: detail.startedAt === undefined ? current.startedAt : detail.startedAt,
+            finishedAt: detail.finishedAt === undefined ? current.finishedAt : detail.finishedAt,
+            timeline: detail.timeline ?? current.timeline,
+          },
+        }
+        // This path is reached before the legacy in-progress map is updated;
+        // refresh derived sidebar flags immediately so every thread reflects
+        // the same authoritative live snapshot, even when the boolean itself
+        // did not change.
+        applyThreadFlags()
+      }
+    }
+    setThreadInProgress(threadId, detail.inProgress)
+
+    const waitingForInput = detail.taskState === 'waiting_approval' || detail.taskState === 'waiting_user_input'
+    return detail.inProgress || waitingForInput || detail.taskState === 'queued' || (queueDepth ?? 0) > 0
+  }
+
   const selectedLiveOverlay = computed<UiLiveOverlay | null>(() => {
     const threadId = selectedThreadId.value
     if (!threadId) return null
 
-    const isInProgress = inProgressById.value[threadId] === true
-    const activity = isInProgress ? turnActivityByThreadId.value[threadId] : undefined
+    const taskSnapshot = taskSnapshotsByThreadId.value[threadId]
+    const taskIsActive = taskSnapshot
+      ? ['starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'].includes(taskSnapshot.state)
+      : false
+    const isInProgress = taskSnapshot ? taskIsActive : isTaskActiveForThread(threadId)
+    const activity = taskSnapshot?.currentActivity && taskSnapshot.currentActivity.kind !== 'idle'
+      ? { label: taskSnapshot.currentActivity.label, details: taskSnapshot.currentActivity.details }
+      : isInProgress ? turnActivityByThreadId.value[threadId] : undefined
     const reasoningText = isInProgress
       ? (liveReasoningTextByThreadId.value[threadId] ?? '').trim()
       : ''
     const liveErrorText = (turnErrorByThreadId.value[threadId]?.message ?? '').trim()
+    const snapshotErrorText = (!isInProgress ? taskSnapshot?.error : null)?.trim() ?? ''
     let latestPersistedTurnErrorText = ''
     if (!isInProgress && liveErrorText) {
       const persistedMessages = persistedMessagesByThreadId.value[threadId] ?? []
@@ -1583,10 +1833,26 @@ export function useDesktopState() {
         break
       }
     }
+    const effectiveLiveErrorText = liveErrorText || snapshotErrorText
     const errorText =
-      !isInProgress && liveErrorText && latestPersistedTurnErrorText === liveErrorText
+      !isInProgress && effectiveLiveErrorText && latestPersistedTurnErrorText === effectiveLiveErrorText
         ? ''
-        : liveErrorText
+        : effectiveLiveErrorText
+
+    // A failed snapshot carries an error activity for the task timeline.  If
+    // the same failure is already persisted in the conversation, suppress
+    // the transient overlay as well; otherwise the activity label alone
+    // would keep an empty error card visible forever.
+    if (!isInProgress && taskSnapshot?.state === 'failed' && !errorText) return null
+
+    if (taskSnapshot && taskIsActive && !activity && !reasoningText && !errorText) {
+      return {
+        activityLabel: taskSnapshot.currentActivity.label || 'Thinking',
+        activityDetails: taskSnapshot.currentActivity.details,
+        reasoningText: '',
+        errorText: '',
+      }
+    }
 
     if (!isInProgress && !activity && !reasoningText && !errorText) return null
     return {
@@ -1621,6 +1887,7 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     return threadId ? hasMoreOlderMessagesByThreadId.value[threadId] === true : false
   })
+  const deferAutoLoadPersistedAbove = computed(() => selectedTaskSnapshot.value?.fullHydrationDeferred === true)
   const isLoadingOlderMessages = computed(() => {
     const threadId = selectedThreadId.value
     return threadId ? loadingOlderMessagesByThreadId.value[threadId] === true : false
@@ -1841,6 +2108,71 @@ export function useDesktopState() {
     pendingTurnRequestByThreadId.value = {
       ...pendingTurnRequestByThreadId.value,
       [threadId]: request,
+    }
+  }
+
+  function isActiveThreadWriterConflict(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? '')
+    const normalized = message.toLowerCase()
+    return normalized.includes('already has an active writer')
+      || normalized.includes('already has a live local writer')
+      || normalized.includes('failed to acquire thread writer lock')
+      || normalized.includes('failed to acquire thread writer coordination lock')
+  }
+
+  /**
+   * A browser can have an optimistic/old activity snapshot and attempt a
+   * direct turn/start while Desktop still owns the thread writer.  Normal
+   * sends must not be dropped in that race: persist the pending request in the
+   * shared queue and let the backend drain it once the writer is available.
+   */
+  async function queuePendingTurnAfterWriterConflict(threadId: string): Promise<boolean> {
+    const pending = pendingTurnRequestByThreadId.value[threadId]
+    if (!pending) return false
+
+    const queuedMessage: QueuedMessage = {
+      id: `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text: pending.text,
+      imageUrls: [...pending.imageUrls],
+      skills: pending.skills.map((skill) => ({ ...skill })),
+      fileAttachments: pending.fileAttachments.map((file) => ({ ...file })),
+      collaborationMode: pending.collaborationMode,
+      createdAtIso: new Date().toISOString(),
+      sourceClientId: queueClientId,
+      status: 'queued',
+      attempts: 0,
+      lastError: '',
+    }
+
+    const mutationVersion = nextQueueMutationVersion(threadId)
+    try {
+      const result = await enqueueThreadMessage(threadId, queuedMessage)
+      const isCurrentMutation = (queueMutationVersionByThreadId.get(threadId) ?? 0) === mutationVersion
+      if (isCurrentMutation) {
+        queuedMessagesByThreadId.value = {
+          ...queuedMessagesByThreadId.value,
+          [threadId]: result.queue,
+        }
+        updateTaskQueueSnapshot(threadId, result.queue)
+      } else {
+        // A newer local queue operation won the race while the writer
+        // conflict was being converted into a queued message.  Reconcile
+        // instead of letting this older response roll the queue back.
+        void processQueuedMessages(threadId)
+      }
+      if (isCurrentMutation) {
+        setTurnActivityForThread(threadId, {
+          label: 'Queued',
+          details: ['Desktop is still using this task; it will start automatically afterward.'],
+        })
+        setTurnErrorForThread(threadId, null)
+      }
+      pendingThreadMessageRefresh.add(threadId)
+      return true
+    } catch {
+      // Preserve the original writer error when queue persistence itself is
+      // unavailable; the caller will surface that error to the user.
+      return false
     }
   }
 
@@ -2157,7 +2489,14 @@ export function useDesktopState() {
     const flaggedGroups: UiProjectGroup[] = withTitles.map((group) => ({
       projectName: group.projectName,
       threads: group.threads.map((thread) => {
-        const inProgress = inProgressById.value[thread.id] === true
+        // Prefer the reducer-backed task state when available.  The legacy
+        // inProgress map is still used as a compatibility fallback, but it
+        // can otherwise retain an optimistic active bit after an external
+        // desktop writer has already completed the session.
+        const taskSnapshot = taskSnapshotsByThreadId.value[thread.id]
+        const inProgress = taskSnapshot
+          ? ACTIVE_TASK_STATES.has(taskSnapshot.state)
+          : isTaskActiveForThread(thread.id)
         const pendingRequestState = readPendingRequestState(getThreadPendingRequests(thread.id))
         const isSelected = selectedThreadId.value === thread.id
         const unreadByEvent = eventUnreadByThreadId.value[thread.id] === true
@@ -2250,6 +2589,7 @@ export function useDesktopState() {
     }
     loadedMessagesByThreadId.value = pruneThreadStateMap(loadedMessagesByThreadId.value, activeThreadIds)
     loadedVersionByThreadId.value = pruneThreadStateMap(loadedVersionByThreadId.value, activeThreadIds)
+    loadedSessionRevisionByThreadId.value = pruneThreadStateMap(loadedSessionRevisionByThreadId.value, activeThreadIds)
     resumedThreadById.value = pruneThreadStateMap(resumedThreadById.value, activeThreadIds)
     turnIndexByTurnIdByThreadId.value = pruneThreadStateMap(turnIndexByTurnIdByThreadId.value, activeThreadIds)
     persistedMessagesByThreadId.value = pruneThreadStateMap(persistedMessagesByThreadId.value, activeThreadIds)
@@ -2271,11 +2611,27 @@ export function useDesktopState() {
     const nextQueuedMessages = pruneThreadStateMap(queuedMessagesByThreadId.value, activeThreadIds)
     if (nextQueuedMessages !== queuedMessagesByThreadId.value) {
       queuedMessagesByThreadId.value = nextQueuedMessages
-      persistQueueState()
+      // Queue state is shared by every browser client.  Pruning local
+      // component state must never PUT the truncated map back to disk, or a
+      // refresh in one client could erase queued work owned by another.
     }
     threadTokenUsageByThreadId.value = pruneThreadStateMap(threadTokenUsageByThreadId.value, activeThreadIds)
     eventUnreadByThreadId.value = pruneThreadStateMap(eventUnreadByThreadId.value, activeThreadIds)
     inProgressById.value = pruneThreadStateMap(inProgressById.value, activeThreadIds)
+    taskSnapshotsByThreadId.value = pruneThreadStateMap(taskSnapshotsByThreadId.value, activeThreadIds)
+    for (const threadId of queueMutationVersionByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) queueMutationVersionByThreadId.delete(threadId)
+    }
+    queueProcessingByThreadId.value = pruneThreadStateMap(queueProcessingByThreadId.value, activeThreadIds)
+    for (const threadId of sessionActivityByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) sessionActivityByThreadId.delete(threadId)
+    }
+    for (const threadId of lastObservedThreadStatusById.keys()) {
+      if (!activeThreadIds.has(threadId)) lastObservedThreadStatusById.delete(threadId)
+    }
+    for (const threadId of liveStateRetryByThreadId) {
+      if (!activeThreadIds.has(threadId)) liveStateRetryByThreadId.delete(threadId)
+    }
     const nextPending: Record<string, UiServerRequest[]> = {}
     for (const [threadId, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
       if (threadId === GLOBAL_SERVER_REQUEST_SCOPE || activeThreadIds.has(threadId)) {
@@ -2319,6 +2675,20 @@ export function useDesktopState() {
 
   function setThreadInProgress(threadId: string, nextInProgress: boolean): void {
     if (!threadId) return
+    const snapshot = taskSnapshotsByThreadId.value[threadId]
+    if (nextInProgress) {
+      // Keep the reducer-backed state authoritative even for optimistic
+      // starts (including retry/fallback paths) that do not receive a
+      // turn/started notification immediately.
+      if (!snapshot || !['starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'].includes(snapshot.state)) {
+        updateTaskSnapshot({ threadId, inProgress: true })
+      }
+    } else if (snapshot && ['starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'].includes(snapshot.state)) {
+      // A start/interrupt failure can clear the legacy map without emitting a
+      // terminal notification.  Reconcile the shared snapshot too or future
+      // sends will continue to believe this thread is active forever.
+      updateTaskSnapshot({ threadId, inProgress: false, activeTurnId: '' })
+    }
     const currentValue = inProgressById.value[threadId] === true
     if (currentValue === nextInProgress) return
     if (nextInProgress) {
@@ -2332,7 +2702,7 @@ export function useDesktopState() {
       clearInterruptPersistenceGate(threadId)
     }
     applyThreadFlags()
-    if (!nextInProgress && !hasActiveInProgressThreads() && threadListNextCursor) {
+    if (!nextInProgress && threadListNextCursor) {
       scheduleRemainingThreadPages()
     }
   }
@@ -2499,6 +2869,11 @@ export function useDesktopState() {
   function currentThreadVersion(threadId: string): string {
     const thread = flattenThreads(sourceGroups.value).find((row) => row.id === threadId)
     return thread?.updatedAtIso ?? ''
+  }
+
+  function currentThreadSessionRevision(threadId: string): string {
+    const thread = flattenThreads(sourceGroups.value).find((row) => row.id === threadId)
+    return thread?.sessionRevision?.trim() ?? ''
   }
 
   function setThreadTerminalOpen(threadId: string, isOpen: boolean): void {
@@ -2909,18 +3284,30 @@ export function useDesktopState() {
     if (notification.method !== 'turn/completed') return ''
     const params = asRecord(notification.params)
     const turn = asRecord(params?.turn)
-    if (!turn || turn.status !== 'failed') return ''
-    const errorPayload = asRecord(turn.error)
-    return readString(errorPayload?.message)
+    const status = readString(turn?.status) || readString(params?.status)
+    const readErrorMessage = (value: unknown): string => {
+      if (typeof value === 'string') return value.trim()
+      const record = asRecord(value)
+      if (!record) return ''
+      return readString(record.message) || readErrorMessage(record.error)
+    }
+    const message = readErrorMessage(turn?.error)
+      || readErrorMessage(params?.error)
+      || readString(params?.message)
+    if (status.toLowerCase() !== 'failed' && !message) return ''
+    return message || 'Task failed'
   }
 
   function readNotificationErrorState(notification: RpcNotification): { message: string; transient: boolean } | null {
     if (notification.method !== 'error') return null
     const params = asRecord(notification.params)
-    const message = (
-      readString(params?.message) ||
-      readString(asRecord(params?.error)?.message)
-    )
+    const readErrorMessage = (value: unknown): string => {
+      if (typeof value === 'string') return value.trim()
+      const record = asRecord(value)
+      if (!record) return ''
+      return readString(record.message) || readErrorMessage(record.error)
+    }
+    const message = readString(params?.message) || readErrorMessage(params?.error)
     if (!message) return null
 
     return {
@@ -3098,6 +3485,7 @@ export function useDesktopState() {
   }
 
   function upsertPendingServerRequest(request: UiServerRequest): void {
+    pendingServerRequestMutationVersion += 1
     const threadId = request.threadId || GLOBAL_SERVER_REQUEST_SCOPE
     const current = pendingServerRequestsByThreadId.value[threadId] ?? []
     const index = current.findIndex((row) => row.id === request.id)
@@ -3112,22 +3500,84 @@ export function useDesktopState() {
       ...pendingServerRequestsByThreadId.value,
       [threadId]: nextRows.sort((first, second) => first.receivedAtIso.localeCompare(second.receivedAtIso)),
     }
+    if (request.threadId) {
+      const activeRequest: TaskActiveRequest = {
+        id: request.id,
+        kind: /approval|permission/i.test(request.method)
+          ? 'approval'
+          : /input|requestUserInput/i.test(request.method)
+            ? 'user_input'
+            : 'other',
+        method: request.method,
+        receivedAtIso: request.receivedAtIso,
+      }
+      updateTaskSnapshot({ threadId: request.threadId, activeRequest })
+    }
     applyThreadFlags()
   }
 
   function removePendingServerRequestById(requestId: number): void {
+    const affectedThreadIds = new Set<string>()
+    let removedAny = false
+    for (const [threadId, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
+      if (requests.some((request) => request.id === requestId) && threadId !== GLOBAL_SERVER_REQUEST_SCOPE) {
+        affectedThreadIds.add(threadId)
+      }
+    }
     const next: Record<string, UiServerRequest[]> = {}
     for (const [threadId, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
       const filtered = requests.filter((request) => request.id !== requestId)
+      if (filtered.length !== requests.length) removedAny = true
       if (filtered.length > 0) {
         next[threadId] = filtered
       }
     }
     pendingServerRequestsByThreadId.value = next
+    if (removedAny) {
+      pendingServerRequestMutationVersion += 1
+    }
+    for (const threadId of affectedThreadIds) {
+      const remaining = next[threadId] ?? []
+      const request = remaining[0]
+      updateTaskSnapshot({
+        threadId,
+        activeRequest: request
+          ? {
+            id: request.id,
+            kind: /approval|permission/i.test(request.method) ? 'approval' : /input|requestUserInput/i.test(request.method) ? 'user_input' : 'other',
+            method: request.method,
+            receivedAtIso: request.receivedAtIso,
+          }
+          : null,
+      })
+    }
     applyThreadFlags()
   }
 
+  function clearPendingServerRequestsForThread(threadId: string): void {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return
+    const hasRequests = Boolean(pendingServerRequestsByThreadId.value[normalizedThreadId])
+    if (hasRequests) {
+      pendingServerRequestMutationVersion += 1
+      pendingServerRequestsByThreadId.value = omitKey(
+        pendingServerRequestsByThreadId.value,
+        normalizedThreadId,
+      )
+    }
+    // The bridge-local request map and reducer snapshot are separate caches.
+    // Clearing only the former leaves the task stuck in waiting_approval on
+    // this client after an authoritative idle/terminal read.
+    const snapshot = taskSnapshotsByThreadId.value[normalizedThreadId]
+    if (snapshot && (snapshot.activeRequest !== null || snapshot.state === 'waiting_approval' || snapshot.state === 'waiting_user_input')) {
+      updateTaskSnapshot({ threadId: normalizedThreadId, activeRequest: null })
+    }
+    if (hasRequests) applyThreadFlags()
+  }
+
   function replacePendingServerRequests(requests: UiServerRequest[]): void {
+    const previousThreadIds = Object.keys(pendingServerRequestsByThreadId.value)
+      .filter((threadId) => threadId !== GLOBAL_SERVER_REQUEST_SCOPE)
     const next: Record<string, UiServerRequest[]> = {}
     for (const request of requests) {
       const threadId = request.threadId || GLOBAL_SERVER_REQUEST_SCOPE
@@ -3141,6 +3591,28 @@ export function useDesktopState() {
     }
 
     pendingServerRequestsByThreadId.value = next
+    const threadIds = new Set([
+      ...previousThreadIds,
+      ...Object.keys(next).filter((threadId) => threadId !== GLOBAL_SERVER_REQUEST_SCOPE),
+    ])
+    for (const threadId of threadIds) {
+      const request = next[threadId]?.[0]
+      updateTaskSnapshot({
+        threadId,
+        activeRequest: request
+          ? {
+            id: request.id,
+            kind: /approval|permission/i.test(request.method) ? 'approval' : /input|requestUserInput/i.test(request.method) ? 'user_input' : 'other',
+            method: request.method,
+            receivedAtIso: request.receivedAtIso,
+          }
+          : null,
+      })
+    }
+    // This path is used on startup/reconnect and does not pass through the
+    // per-request upsert helper.  Re-apply derived sidebar flags after the
+    // complete replacement so all clients observe the same pending state.
+    applyThreadFlags()
   }
 
   function handleServerRequestNotification(notification: RpcNotification): boolean {
@@ -3732,7 +4204,71 @@ export function useDesktopState() {
     return false
   }
 
+  function extractTurnIdFromNotification(notification: RpcNotification): string {
+    const params = asRecord(notification.params)
+    if (!params) return ''
+    const turn = asRecord(params.turn)
+    const item = asRecord(params.item)
+    return readString(turn?.id)
+      || readString(params.turnId)
+      || readString(params.turn_id)
+      || readString(item?.turnId)
+      || readString(item?.turn_id)
+  }
+
+  function isTurnScopedNotification(method: string): boolean {
+    return method === 'turn/completed'
+      || method === 'turn/interrupt'
+      || method === 'error'
+      || method === 'server/request'
+      || method.startsWith('item/')
+  }
+
   function applyRealtimeUpdates(notification: RpcNotification): void {
+    const taskThreadId = extractThreadIdFromNotification(notification)
+    const incomingTurnId = extractTurnIdFromNotification(notification)
+    const currentTurnId = taskThreadId
+      ? activeTurnIdByThreadId.value[taskThreadId]
+        || taskSnapshotsByThreadId.value[taskThreadId]?.activeTurnId
+        || ''
+      : ''
+    const isStaleTurnNotification = Boolean(
+      taskThreadId
+      && incomingTurnId
+      && currentTurnId
+      && incomingTurnId !== currentTurnId
+      && isTurnScopedNotification(notification.method)
+      && notification.method !== 'turn/started',
+    )
+    // Do not feed stale frames into either the reducer or imperative live
+    // maps.  The subscription-level cursor has already consumed the frame;
+    // passing it to the reducer would let activity notifications replace the
+    // current active turn before the guard returns.
+    if (isStaleTurnNotification) {
+      return
+    }
+
+    if (taskThreadId) {
+      updateTaskSnapshot({
+        threadId: taskThreadId,
+        notification,
+        atIso: notification.atIso,
+      })
+    }
+    if (
+      taskThreadId
+      && (notification.method === 'queue/enqueued' || notification.method === 'queue/updated')
+    ) {
+      // Queue notifications may be emitted by another browser (or by the
+      // backend worker) while a queue GET is in flight.  Invalidate that
+      // read's generation before scheduling reconciliation so its response
+      // cannot roll the queue back to an older snapshot.
+      nextQueueMutationVersion(taskThreadId)
+      // Queue notifications carry only a depth and message id.  Refresh the
+      // full queue for the affected thread so every browser's queue list (not
+      // just its aggregate badge) converges after another client mutates it.
+      scheduleQueueStateRefresh(taskThreadId)
+    }
     if (handleServerRequestNotification(notification)) {
       return
     }
@@ -3998,13 +4534,16 @@ export function useDesktopState() {
     if (notification.method === 'thread/tokenUsage/updated') return
 
     const method = notification.method
+    const shouldRefreshAfterRequestResolution = method === 'server/request/resolved'
     const shouldRefreshMessages =
       method === 'turn/started' ||
       method === 'turn/completed' ||
-      method === 'error'
+      method === 'error' ||
+      shouldRefreshAfterRequestResolution
     const shouldRefreshThreads =
       method.startsWith('thread/') ||
-      method === 'turn/completed'
+      method === 'turn/completed' ||
+      shouldRefreshAfterRequestResolution
 
     if (!shouldRefreshMessages && !shouldRefreshThreads) return
 
@@ -4163,6 +4702,7 @@ export function useDesktopState() {
 
     const orderedGroups = orderGroupsByProjectOrder(visibleGroups, projectOrder.value)
     markServerListedThreads(new Set(flattenThreads(orderedGroups).map((thread) => thread.id)))
+    reconcileIncomingSessionActivity(flattenThreads(orderedGroups))
     const mergedWithInProgress = mergeIncomingWithLocalInProgressThreads(
       sourceGroups.value,
       orderedGroups,
@@ -4176,40 +4716,164 @@ export function useDesktopState() {
     applyThreadFlags()
   }
 
-  function normalizeQueueStateForPersistence(state: Record<string, QueuedMessage[]>): ThreadQueueState {
-    const next: ThreadQueueState = {}
-    for (const [threadId, queue] of Object.entries(state)) {
-      const normalizedThreadId = threadId.trim()
-      if (!normalizedThreadId || queue.length === 0) continue
-      next[normalizedThreadId] = queue.map((message) => ({
-        id: message.id,
-        text: message.text,
-        imageUrls: [...message.imageUrls],
-        skills: message.skills.map((skill) => ({ name: skill.name, path: skill.path })),
-        fileAttachments: message.fileAttachments.map((attachment) => ({
-          label: attachment.label,
-          path: attachment.path,
-          fsPath: attachment.fsPath,
-        })),
-        collaborationMode: message.collaborationMode,
-      }))
+  /**
+   * Promote activity observed by the bridge into the local status map.  The
+   * map historically only received websocket notifications, which meant a
+   * desktop-owned session could be marked active in the fresh thread list but
+   * immediately overwritten to idle by `applyThreadFlags`.
+   *
+   * Idle markers are recorded for transition detection, while the local
+   * active bit is cleared by `loadMessages` after it consumes the authoritative
+   * snapshot.  This keeps live-overlay cleanup in one transition path.
+   */
+  function reconcileIncomingSessionActivity(threads: UiThread[]): void {
+    let nextInProgress = inProgressById.value
+    let changed = false
+    const idleThreadIdsToClear = new Set<string>()
+
+    for (const thread of threads) {
+      const threadId = thread.id.trim()
+      if (!threadId) continue
+
+      // Older bridges may expose only the normalized `inProgress` bit.  A
+      // positive value is still safe to promote; idle values require the
+      // explicit activity marker below before they can clear local state.
+      if (thread.sessionActivityKnown !== true && thread.inProgress === true) {
+        // Keep the reducer-backed snapshot in sync as well as the legacy
+        // sidebar map.  Otherwise a previously completed row can suppress a
+        // fresh active marker from an older bridge build.
+        updateTaskSnapshot({ threadId, inProgress: true })
+        if (nextInProgress[threadId] !== true) {
+          nextInProgress = { ...nextInProgress, [threadId]: true }
+          changed = true
+        }
+        continue
+      }
+      if (thread.sessionActivityKnown !== true) continue
+
+      const revision = thread.sessionRevision?.trim() ?? ''
+      const incoming: ThreadStatusSnapshot = {
+        inProgress: thread.inProgress === true,
+        revision,
+        terminalState: thread.taskState === 'failed' || thread.taskState === 'canceled' || thread.taskState === 'completed'
+          ? thread.taskState
+          : '',
+        terminalTurnId: thread.terminalTurnId,
+        terminalError: thread.taskError,
+      }
+      sessionActivityByThreadId.set(threadId, incoming)
+
+      // The session activity marker is authoritative for the task lifecycle,
+      // including threads that are not currently selected.  Updating the
+      // snapshot here lets the sidebar converge without opening every thread
+      // and without waiting for a selected-thread message hydration.
+      updateTaskSnapshot({
+        threadId,
+        inProgress: incoming.inProgress,
+        activeRequest: incoming.inProgress ? undefined : null,
+        terminalTurnId: incoming.terminalTurnId,
+        terminalState: incoming.terminalState,
+        terminalError: incoming.terminalError,
+        revision,
+      })
+
+      if (incoming.inProgress) {
+        if (nextInProgress[threadId] === true) continue
+        nextInProgress = { ...nextInProgress, [threadId]: true }
+        changed = true
+        continue
+      }
+
+      // The selected thread still gets an authoritative message hydration in
+      // syncThreadStatus, which also reconciles its live overlay.  For every
+      // other thread there is no hydration pass, so clear the legacy active
+      // bit now or its sidebar spinner would remain stuck forever.
+      if (threadId !== selectedThreadId.value && nextInProgress[threadId] === true) {
+        idleThreadIdsToClear.add(threadId)
+      }
     }
-    return next
+
+    for (const threadId of idleThreadIdsToClear) {
+      nextInProgress = omitKey(nextInProgress, threadId)
+      clearCompletedTurnLiveState(threadId)
+      clearInterruptPersistenceGate(threadId)
+      changed = true
+    }
+
+    if (changed) {
+      inProgressById.value = nextInProgress
+      applyThreadFlags()
+    }
+
+    // Pending request rows are maintained in a separate bridge-local map and
+    // therefore are not removed by the reducer's `activeRequest: null`
+    // observation alone.  An idle session is authoritative for every client,
+    // so clear stale approval/input chips for selected and non-selected rows.
+    for (const thread of threads) {
+      if (thread.sessionActivityKnown === true && thread.inProgress !== true) {
+        clearPendingServerRequestsForThread(thread.id)
+      }
+    }
   }
 
-  function persistQueueState(): void {
-    void setThreadQueueState(normalizeQueueStateForPersistence(queuedMessagesByThreadId.value)).catch(() => {
-      // Queue persistence is best-effort; keep the current in-memory queue usable.
-    })
+  function reconcileThreadSessionActivity(
+    threadId: string,
+    snapshot: ThreadStatusSnapshot,
+  ): void {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return
+
+    sessionActivityByThreadId.set(normalizedThreadId, snapshot)
+
+    if (snapshot.inProgress) {
+      if (inProgressById.value[normalizedThreadId] !== true) {
+        inProgressById.value = {
+          ...inProgressById.value,
+          [normalizedThreadId]: true,
+        }
+        applyThreadFlags()
+      }
+      return
+    }
+
+    // Keep the local active bit until `setThreadInProgress(false)` consumes
+    // the authoritative idle snapshot.  This preserves the cleanup path for
+    // live overlays and interrupt persistence gates.
   }
 
   async function loadPersistedQueueStateIfNeeded(): Promise<void> {
     if (hasLoadedPersistedQueueState) return
-    hasLoadedPersistedQueueState = true
     try {
-      queuedMessagesByThreadId.value = await getThreadQueueState()
+      const readVersionByThreadId = new Map(queueMutationVersionByThreadId)
+      const localStateAtRead = queuedMessagesByThreadId.value
+      const serverState = await getThreadQueueState()
+      // Do not let startup hydration overwrite a queue mutation submitted
+      // while the initial read was in flight.
+      const mergedState: Record<string, QueuedMessage[]> = { ...serverState }
+      const threadIds = new Set([
+        ...Object.keys(localStateAtRead),
+        ...Object.keys(serverState),
+        ...queueMutationVersionByThreadId.keys(),
+      ])
+      for (const threadId of threadIds) {
+        const readVersion = readVersionByThreadId.get(threadId) ?? 0
+        if ((queueMutationVersionByThreadId.get(threadId) ?? 0) !== readVersion) {
+          // A mutation raced the read.  Keep its local optimistic state when
+          // available; an enqueue may not have populated local state yet, in
+          // which case its mutation response will reconcile this thread.
+          const localQueue = queuedMessagesByThreadId.value[threadId]
+          if (localQueue) mergedState[threadId] = localQueue
+          else delete mergedState[threadId]
+        }
+      }
+      queuedMessagesByThreadId.value = mergedState
+      for (const [threadId, queue] of Object.entries(queuedMessagesByThreadId.value)) {
+        updateTaskQueueSnapshot(threadId, queue)
+      }
+      hasLoadedPersistedQueueState = true
     } catch {
-      // Backend queue state is optional during startup.
+      // Backend queue state is optional during startup.  Keep the flag false
+      // so a later refresh can recover from a transient bridge failure.
     }
   }
 
@@ -4217,6 +4881,10 @@ export function useDesktopState() {
     loadedThreadListGroups = removeThreadFromGroups(loadedThreadListGroups, threadId)
     sourceGroups.value = removeThreadFromGroups(sourceGroups.value, threadId)
     inProgressById.value = omitKey(inProgressById.value, threadId)
+    loadedSessionRevisionByThreadId.value = omitKey(loadedSessionRevisionByThreadId.value, threadId)
+    sessionActivityByThreadId.delete(threadId)
+    lastObservedThreadStatusById.delete(threadId)
+    liveStateRetryByThreadId.delete(threadId)
     applyThreadFlags()
   }
 
@@ -4252,12 +4920,8 @@ export function useDesktopState() {
       })
   }
 
-  function hasActiveInProgressThreads(): boolean {
-    return Object.values(inProgressById.value).some((value) => value === true)
-  }
-
   function scheduleRemainingThreadPages(rootsState: WorkspaceRootsState | null = loadedThreadListRootsState): void {
-    if (!threadListNextCursor || isLoadingRemainingThreadPages || hasActiveInProgressThreads()) return
+    if (!threadListNextCursor || isLoadingRemainingThreadPages) return
 
     loadedThreadListRootsState = rootsState
 
@@ -4266,19 +4930,20 @@ export function useDesktopState() {
       return
     }
 
-    if (threadListBackgroundTimer !== null) {
-      window.clearTimeout(threadListBackgroundTimer)
-    }
+    // A forced first-page refresh runs frequently while a task is active.
+    // Keep the already scheduled low-priority page load instead of pushing it
+    // out on every refresh; otherwise the timer can be perpetually starved.
+    if (threadListBackgroundTimer !== null) return
 
     threadListBackgroundTimer = window.setTimeout(() => {
       threadListBackgroundTimer = null
-      if (!threadListNextCursor || hasActiveInProgressThreads()) return
+      if (!threadListNextCursor) return
       void loadRemainingThreadPages(loadedThreadListRootsState)
     }, BACKGROUND_THREAD_PAGINATION_DELAY_MS)
   }
 
   async function loadRemainingThreadPages(rootsState: WorkspaceRootsState | null): Promise<void> {
-    if (isLoadingRemainingThreadPages || !threadListNextCursor || hasActiveInProgressThreads()) return
+    if (isLoadingRemainingThreadPages || !threadListNextCursor) return
     isLoadingRemainingThreadPages = true
 
     try {
@@ -4292,7 +4957,7 @@ export function useDesktopState() {
       // Keep the first page usable; a later refresh can retry remaining pages.
     } finally {
       isLoadingRemainingThreadPages = false
-      if (threadListNextCursor && !hasActiveInProgressThreads()) {
+      if (threadListNextCursor) {
         scheduleRemainingThreadPages(rootsState)
       }
     }
@@ -4359,13 +5024,20 @@ export function useDesktopState() {
     await loadThreadsPromise
   }
 
-  async function loadMessages(threadId: string, options: { silent?: boolean } = {}) {
+  async function loadMessages(
+    threadId: string,
+    options: { silent?: boolean; force?: boolean; preferLiveState?: boolean; fast?: boolean } = {},
+  ) {
     if (!threadId) {
       return
     }
     const recentLoadFailure =
       Date.now() - (lastMessageLoadFailureAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
-    if (turnErrorByThreadId.value[threadId]?.transient && (options.silent === true || recentLoadFailure)) {
+    if (
+      options.force !== true
+      && turnErrorByThreadId.value[threadId]?.transient
+      && (options.silent === true || recentLoadFailure)
+    ) {
       return
     }
 
@@ -4385,15 +5057,21 @@ export function useDesktopState() {
       try {
       const version = currentThreadVersion(threadId)
       const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
+      const sessionRevision = currentThreadSessionRevision(threadId)
+      const loadedSessionRevision = loadedSessionRevisionByThreadId.value[threadId] ?? ''
       const loadedRecently =
         Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
+      const hasSessionRevisionChange = Boolean(
+        sessionRevision && sessionRevision !== loadedSessionRevision,
+      )
+      const shouldPreferLiveState = options.preferLiveState === true
       const canReuseLoadedMessages =
-        alreadyLoaded &&
+        options.force !== true && !hasSessionRevisionChange && alreadyLoaded &&
         (
           loadedRecently ||
           (
             (version.length === 0 || loadedVersion === version) &&
-            inProgressById.value[threadId] !== true
+            !isTaskActiveForThread(threadId)
           )
         )
 
@@ -4402,9 +5080,65 @@ export function useDesktopState() {
         return
       }
 
-      const needsResume = resumedThreadById.value[threadId] !== true
-      const resumedThread = needsResume ? await resumeThread(threadId) : null
-      const detail = resumedThread ?? await getThreadDetail(threadId)
+      // Loading an existing thread is a read-only operation.  Calling
+      // thread/resume here makes every browser tab a Codex writer and causes
+      // the app-server's active-writer lock when a second device opens the
+      // same in-progress thread.  Writes still resume explicitly in
+      // startTurnForThread below, behind the server-side writer path.
+      let detail: Awaited<ReturnType<typeof getThreadDetail>> & Partial<ThreadLiveState>
+      let liveStateErrorObserved = false
+      let loadedFastSnapshot = false
+      if (shouldPreferLiveState) {
+        try {
+          // A status transition or session revision change can be produced by
+          // another Codex process whose app-server snapshot is stale.  Read
+          // the bridge's live state first so the final assistant text is not
+          // lost when the ordinary thread/read still reports the old turns.
+          const liveDetail = await getThreadLiveState(threadId)
+          liveStateErrorObserved = Boolean(liveDetail.liveStateError)
+          // The live endpoint can return a diagnostic envelope when the
+          // app-server is temporarily unavailable.  Do not treat that empty
+          // envelope as an authoritative conversation and erase cached turns.
+          if (liveDetail.liveStateError && liveDetail.messages.length === 0) {
+            detail = await getThreadDetail(threadId)
+          } else {
+            detail = liveDetail
+          }
+        } catch {
+          liveStateErrorObserved = true
+          detail = await getThreadDetail(threadId)
+        }
+      } else {
+        // A full thread/read has to materialize the entire session JSONL in
+        // app-server.  Use the bounded session-tail projection for the first
+        // paint, then hydrate commands and older turns asynchronously.  A
+        // forced refresh always bypasses this path so it remains authoritative
+        // after a task completes or a stream gap is detected.
+        if (options.fast !== false && options.force !== true) {
+          try {
+            detail = await getThreadFastDetail(threadId)
+            loadedFastSnapshot = detail.partial === true
+          } catch {
+            detail = await getThreadDetail(threadId)
+          }
+        } else {
+          detail = await getThreadDetail(threadId)
+        }
+        if (detail.inProgress && !loadedFastSnapshot) {
+          try {
+            // The live endpoint merges the app-server snapshot with items and
+            // command output observed since the last persisted read.  It is a
+            // read-only supplement and must never resume the thread.
+            const liveDetail = await getThreadLiveState(threadId)
+            if (!liveDetail.liveStateError || liveDetail.messages.length > 0) {
+              detail = liveDetail
+            }
+          } catch {
+            // Keep the ordinary thread/read result when the live cache is
+            // temporarily unavailable.
+          }
+        }
+      }
 
       if (detail.modelProvider) {
         setThreadModelProviderId(threadId, detail.modelProvider)
@@ -4412,14 +5146,120 @@ export function useDesktopState() {
       if (detail.model) {
         setThreadModelId(threadId, resolveThreadModelForProvider(threadId, detail.model, detail.modelProvider))
       }
-      if (resumedThread) {
-        resumedThreadById.value = {
-          ...resumedThreadById.value,
-          [threadId]: true,
+      const {
+        messages: nextMessages,
+        inProgress: detailInProgress,
+        activeTurnId,
+        terminalTurnId: detailTerminalTurnId,
+        turnIndexByTurnId,
+        sessionRevision: detailSessionRevision,
+        sessionActivityKnown,
+      } = detail
+      const detailStreamCursor = 'streamCursor' in detail && detail.streamCursor && typeof detail.streamCursor === 'object'
+        ? detail.streamCursor as TaskSnapshot['streamCursor']
+        : undefined
+      const previousTaskSnapshot = taskSnapshotsByThreadId.value[threadId]
+      // A stream cursor only proves that the bridge can describe its own
+      // event buffer; it does not make a diagnostic live-state envelope
+      // authoritative.  If the live read failed and no shared session marker
+      // was available, retain the previous lifecycle until a clean poll.
+      const hasSharedTaskAuthority = sessionActivityKnown === true
+        || (!liveStateErrorObserved && Boolean(detailStreamCursor))
+      const previousSessionIsActive = Boolean(
+        previousTaskSnapshot
+        && ['starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'].includes(previousTaskSnapshot.state),
+      )
+      // A plain thread/read is an app-server projection and may lag a
+      // desktop writer.  Never let its idle result clear a newer local live
+      // snapshot; live/fast endpoints carry the shared session marker or
+      // stream cursor needed to make that transition authoritative.
+      const preservePreviousActiveTask = previousSessionIsActive
+        && !hasSharedTaskAuthority
+        && Boolean(previousTaskSnapshot?.streamCursor || previousTaskSnapshot?.activeTurnId)
+        && detailInProgress === false
+      const inProgress = preservePreviousActiveTask ? true : detailInProgress
+      const effectiveActiveTurnId = preservePreviousActiveTask
+        ? previousTaskSnapshot?.activeTurnId || undefined
+        : activeTurnId || (hasSharedTaskAuthority || !previousSessionIsActive ? '' : undefined)
+      updateTaskSnapshot({
+        threadId,
+        inProgress,
+        activeTurnId: effectiveActiveTurnId,
+        terminalTurnId: detailTerminalTurnId,
+        streamCursor: detailStreamCursor,
+        error: 'error' in detail && (typeof detail.error === 'string' || detail.error === null) ? detail.error : undefined,
+        revision: detailSessionRevision,
+        fullHydrationDeferred: detail.fullHydrationDeferred,
+      })
+      if ('taskState' in detail && detail.taskState) {
+        const current = taskSnapshotsByThreadId.value[threadId]
+        const detailQueueDepth = typeof detail.queueDepth === 'number'
+          ? Math.max(0, Math.trunc(detail.queueDepth))
+          : current?.queueDepth ?? 0
+        const preservesQueuedTask = current?.state === 'queued'
+          && !hasSharedTaskAuthority
+          && detail.taskState !== 'queued'
+        const terminalProjectionCanApply = !previousSessionIsActive
+          && (detail.taskState === 'failed' || detail.taskState === 'canceled' || detailQueueDepth === 0)
+        const streamCursorIsStale = Boolean(
+          previousTaskSnapshot?.streamCursor
+          && detailStreamCursor
+          && previousTaskSnapshot.streamCursor.streamEpoch
+          && detailStreamCursor.streamEpoch === previousTaskSnapshot.streamCursor.streamEpoch
+          && detailStreamCursor.latestSeq < previousTaskSnapshot.streamCursor.latestSeq,
+        )
+        const canApplyProjectedTaskState = Boolean(
+          current
+          && !preservePreviousActiveTask
+          && !preservesQueuedTask
+          && !streamCursorIsStale
+          && (hasSharedTaskAuthority || !previousTaskSnapshot || terminalProjectionCanApply),
+        )
+        if (canApplyProjectedTaskState && current) {
+          taskSnapshotsByThreadId.value = {
+            ...taskSnapshotsByThreadId.value,
+            [threadId]: {
+              ...current,
+              state: detail.taskState,
+              currentActivity: detail.currentActivity ?? current.currentActivity,
+              queueDepth: detail.queueDepth ?? current.queueDepth,
+              activeRequest: detail.activeRequest === undefined ? current.activeRequest : detail.activeRequest,
+              writerClient: detail.writerClient === undefined ? current.writerClient : detail.writerClient,
+              startedAt: detail.startedAt === undefined ? current.startedAt : detail.startedAt,
+              finishedAt: detail.finishedAt === undefined ? current.finishedAt : detail.finishedAt,
+              fullHydrationDeferred: detail.fullHydrationDeferred === undefined
+                ? current.fullHydrationDeferred
+                : detail.fullHydrationDeferred,
+              error: detail.error === undefined ? current.error : detail.error,
+              timeline: detail.timeline ?? current.timeline,
+            },
+          }
+          applyThreadFlags()
         }
       }
-
-      const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
+      const terminalTaskState = 'taskState' in detail && (
+        detail.taskState === 'completed' || detail.taskState === 'failed' || detail.taskState === 'canceled'
+      )
+      const hasAuthoritativeRequestState = 'activeRequest' in detail
+      if ((!preservePreviousActiveTask && terminalTaskState) || (hasAuthoritativeRequestState && detail.activeRequest === null)) {
+        // The pending-request endpoint is bridge-local.  A desktop writer or
+        // a restart can finish the task without emitting a matching resolved
+        // notification to this browser, so reconcile the local map from the
+        // authoritative snapshot before deriving sidebar flags.
+        clearPendingServerRequestsForThread(threadId)
+      }
+      const observedSessionRevision = detailSessionRevision?.trim() || sessionRevision
+      if (sessionActivityKnown === true || observedSessionRevision) {
+        reconcileThreadSessionActivity(threadId, {
+          inProgress,
+          revision: observedSessionRevision,
+          terminalState: detail.taskState === 'failed' || detail.taskState === 'canceled' || detail.taskState === 'completed'
+            ? detail.taskState
+            : '',
+          terminalTurnId: detail.terminalTurnId,
+          terminalError: detail.error ?? undefined,
+        })
+      }
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: detail.hasMoreOlder === true,
@@ -4428,8 +5268,20 @@ export function useDesktopState() {
       replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
       rebindLiveFileChangeTurnIndices(threadId)
       const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+      const incomingProjectionIsPartial = detail.hasMoreOlder === true
+        || detail.partial === true
+        || detail.fullHydrationDeferred === true
       const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
-        preserveMissing: options.silent === true || hasOptimisticUserMessages(previousPersisted),
+        // Full snapshots can remove stale live rows after a task settles, but
+        // bounded/partial projections must never delete history already
+        // painted from a fuller read.  They are only an additive update until
+        // the user explicitly paginates or a complete snapshot arrives.
+        preserveMissing:
+          incomingProjectionIsPartial
+          || (liveStateErrorObserved && nextMessages.length === 0)
+          || (options.silent === true && options.force !== true)
+          || hasOptimisticUserMessages(previousPersisted),
+        preserveOnlyOlder: incomingProjectionIsPartial,
       })
       setPersistedMessagesForThread(threadId, mergedMessages)
 
@@ -4456,12 +5308,25 @@ export function useDesktopState() {
           [threadId]: version,
         }
       }
+      if (observedSessionRevision) {
+        loadedSessionRevisionByThreadId.value = {
+          ...loadedSessionRevisionByThreadId.value,
+          [threadId]: observedSessionRevision,
+        }
+      }
+      if (shouldPreferLiveState) {
+        if (liveStateErrorObserved) {
+          liveStateRetryByThreadId.add(threadId)
+        } else {
+          liveStateRetryByThreadId.delete(threadId)
+        }
+      }
       setThreadInProgress(threadId, inProgress)
       clearTransientTurnErrorForThread(threadId)
-      if (activeTurnId) {
+      if (effectiveActiveTurnId) {
         activeTurnIdByThreadId.value = {
           ...activeTurnIdByThreadId.value,
-          [threadId]: activeTurnId,
+          [threadId]: effectiveActiveTurnId,
         }
       } else if (activeTurnIdByThreadId.value[threadId]) {
         activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
@@ -4470,6 +5335,30 @@ export function useDesktopState() {
         clearCompletedTurnLiveState(threadId)
       }
       markThreadAsRead(threadId)
+      // Large rollouts opt out of background full hydration.  Their bounded
+      // observer projection remains the live conversation view and older
+      // turns are fetched only when the user explicitly asks for them.
+      if (loadedFastSnapshot && detail.fullHydrationDeferred !== true) {
+        // Do not make the user wait for a complete app-server materialization.
+        // Schedule after this load promise settles; scheduling inline would
+        // observe the in-flight promise and await itself forever.
+        setTimeout(() => {
+          // A user can tap through several tasks before a full app-server
+          // read completes.  Only hydrate a fast snapshot in the background
+          // if it is still the visible task; a later selection can request
+          // the same full snapshot when needed.
+          if (selectedThreadId.value !== threadId) return
+          void loadMessages(threadId, {
+            silent: true,
+            force: true,
+            fast: false,
+            preferLiveState: inProgress,
+          }).catch(() => {
+            // The fast snapshot is still useful when the background hydration
+            // races a desktop writer or a transient app-server restart.
+          })
+        }, FAST_THREAD_BACKGROUND_HYDRATION_DELAY_MS)
+      }
       } catch (unknownError) {
         const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         if (selectedThreadId.value === threadId) {
@@ -4646,7 +5535,11 @@ export function useDesktopState() {
 
     try {
       await loadMessages(threadId)
-      await refreshModelPreferences({ includeProviderModels: true })
+      // Message hydration is the critical path when switching tasks.  Model,
+      // provider and skills metadata are ancillary and can refresh in the
+      // background; waiting for them made a healthy thread look stuck on
+      // "Loading messages..." whenever a provider endpoint was slow.
+      void refreshModelPreferences({ includeProviderModels: true })
       void refreshSkills()
       return 'ok'
     } catch (unknownError) {
@@ -4735,7 +5628,7 @@ export function useDesktopState() {
     const normalizedThreadId = threadId.trim()
     if (!normalizedThreadId || !Number.isInteger(turnIndex) || turnIndex < 0) return ''
 
-    if (inProgressById.value[normalizedThreadId] === true) {
+    if (isTaskActiveForThread(normalizedThreadId)) {
       error.value = 'Finish the current turn before forking from a response.'
       return ''
     }
@@ -4841,7 +5734,7 @@ export function useDesktopState() {
     text: string,
     imageUrls: string[] = [],
     skills: Array<{ name: string; path: string }> = [],
-    mode: 'steer' | 'queue' = 'steer',
+    mode: 'steer' | 'queue' = 'queue',
     fileAttachments: FileAttachment[] = [],
     queueInsertIndex?: number,
     collaborationModeOverride?: CollaborationModeKind,
@@ -4856,16 +5749,19 @@ export function useDesktopState() {
       return
     }
 
-    const isInProgress = inProgressById.value[threadId] === true
+    const taskSnapshot = taskSnapshotsByThreadId.value[threadId]
+    let isInProgress = isTaskActiveForThread(threadId)
+    let shouldQueue = isInProgress || (taskSnapshot?.queueDepth ?? 0) > 0
+    const refreshedBusyState = await refreshTaskStateBeforeSend(threadId)
+    if (refreshedBusyState !== null) {
+      isInProgress = refreshedBusyState
+      shouldQueue = refreshedBusyState
+    }
 
-    if (isInProgress && mode === 'queue') {
+    if (shouldQueue && mode === 'queue') {
       const queue = queuedMessagesByThreadId.value[threadId] ?? []
       const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-      const nextQueue = [...queue]
-      const insertIndex = typeof queueInsertIndex === 'number'
-        ? Math.max(0, Math.min(queueInsertIndex, nextQueue.length))
-        : nextQueue.length
-      nextQueue.splice(insertIndex, 0, {
+      const queuedMessage = {
         id,
         text: nextText,
         imageUrls,
@@ -4876,29 +5772,72 @@ export function useDesktopState() {
           : collaborationModeOverride === 'default'
             ? 'default'
             : selectedCollaborationMode.value,
-      })
-      queuedMessagesByThreadId.value = {
-        ...queuedMessagesByThreadId.value,
-        [threadId]: nextQueue,
+        createdAtIso: new Date().toISOString(),
+        sourceClientId: queueClientId,
+        status: 'queued' as const,
+        attempts: 0,
+        lastError: '',
+      } satisfies QueuedMessage
+
+      // Both append and indexed insertion use the bridge's atomic endpoint so
+      // two browser clients cannot overwrite each other's queued work.
+      const beforeMessageId = typeof queueInsertIndex === 'number'
+        ? queue[Math.max(0, Math.min(queueInsertIndex, queue.length))]?.id
+        : undefined
+      const mutationVersion = nextQueueMutationVersion(threadId)
+      try {
+        const result = beforeMessageId
+          ? await enqueueThreadMessage(threadId, queuedMessage, beforeMessageId)
+          : await enqueueThreadMessage(threadId, queuedMessage)
+        if ((queueMutationVersionByThreadId.get(threadId) ?? 0) === mutationVersion) {
+          queuedMessagesByThreadId.value = {
+            ...queuedMessagesByThreadId.value,
+            [threadId]: result.queue,
+          }
+          updateTaskQueueSnapshot(threadId, result.queue)
+        } else {
+          // A second local operation completed while this request was in
+          // flight.  Keep its newer state and reconcile from the server.
+          void processQueuedMessages(threadId)
+        }
+        return
+      } catch (enqueueError) {
+        // Never fall back to a whole-state PUT here: that stale map can erase
+        // work submitted by another browser.  Reconcile the authoritative
+        // queue and surface the enqueue failure so the message is not shown as
+        // queued when it was not durably accepted.
+        await processQueuedMessages(threadId)
+        throw enqueueError
       }
-      persistQueueState()
-      return
     }
 
     if (isInProgress) {
+      if (mode === 'steer') {
+        updateTaskSnapshot({
+          threadId,
+          notification: {
+            method: 'turn/steer',
+            params: { threadId },
+            atIso: new Date().toISOString(),
+          },
+        })
+      }
       shouldAutoScrollOnNextAgentEvent = true
-      void startTurnForThread(
-        threadId,
-        nextText,
-        imageUrls,
-        skills,
-        fileAttachments,
-        collaborationModeOverride,
-      ).catch((unknownError) => {
+      try {
+        await startTurnForThread(
+          threadId,
+          nextText,
+          imageUrls,
+          skills,
+          fileAttachments,
+          collaborationModeOverride,
+        )
+      } catch (unknownError) {
         const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         setTurnErrorForThread(threadId, errorMessage)
         error.value = errorMessage
-      })
+        throw unknownError
+      }
       return
     }
 
@@ -4922,6 +5861,11 @@ export function useDesktopState() {
     )
     setTurnErrorForThread(threadId, null)
     setThreadInProgress(threadId, true)
+    updateTaskSnapshot({
+      threadId,
+      inProgress: true,
+      atIso: new Date().toISOString(),
+    })
 
     try {
       await startTurnForThread(
@@ -4931,6 +5875,7 @@ export function useDesktopState() {
         skills,
         fileAttachments,
         collaborationModeOverride,
+        true,
       )
     } catch (unknownError) {
       shouldAutoScrollOnNextAgentEvent = false
@@ -4941,6 +5886,45 @@ export function useDesktopState() {
       error.value = errorMessage
       throw unknownError
     }
+  }
+
+  /** Public task-center send operation. Normal messages never steer an active turn. */
+  async function sendTaskMessage(
+    text: string,
+    imageUrls: string[] = [],
+    skills: Array<{ name: string; path: string }> = [],
+    fileAttachments: FileAttachment[] = [],
+    queueInsertIndex?: number,
+    collaborationModeOverride?: CollaborationModeKind,
+  ): Promise<void> {
+    await sendMessageToSelectedThread(
+      text,
+      imageUrls,
+      skills,
+      'queue',
+      fileAttachments,
+      queueInsertIndex,
+      collaborationModeOverride,
+    )
+  }
+
+  /** Explicit guide operation; maps to turn/steer while a turn is active. */
+  async function steerTaskMessage(
+    text: string,
+    imageUrls: string[] = [],
+    skills: Array<{ name: string; path: string }> = [],
+    fileAttachments: FileAttachment[] = [],
+    collaborationModeOverride?: CollaborationModeKind,
+  ): Promise<void> {
+    await sendMessageToSelectedThread(
+      text,
+      imageUrls,
+      skills,
+      'steer',
+      fileAttachments,
+      undefined,
+      collaborationModeOverride,
+    )
   }
 
   async function sendMessageToNewThread(
@@ -5046,6 +6030,7 @@ export function useDesktopState() {
     skills: Array<{ name: string; path: string }> = [],
     fileAttachments: FileAttachment[] = [],
     collaborationModeOverride?: CollaborationModeKind,
+    allowQueueOnWriterConflict = false,
   ): Promise<void> {
     const reasoningEffort = selectedReasoningEffort.value
     const collaborationMode = collaborationModeOverride === 'plan' ? 'plan' : collaborationModeOverride === 'default'
@@ -5142,23 +6127,46 @@ export function useDesktopState() {
       await syncFromNotifications()
       scheduleDelayedTurnSync(threadId)
     } catch (unknownError) {
+      if (allowQueueOnWriterConflict && isActiveThreadWriterConflict(unknownError)) {
+        if (await queuePendingTurnAfterWriterConflict(threadId)) return
+      }
       throw unknownError
     }
   }
 
   async function processQueuedMessages(threadId: string): Promise<void> {
-    if (queueProcessingByThreadId.value[threadId] === true) return
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return
+    if (queueProcessingByThreadId.value[normalizedThreadId] === true) return
+    const readVersion = queueMutationVersionByThreadId.get(normalizedThreadId) ?? 0
     queueProcessingByThreadId.value = {
       ...queueProcessingByThreadId.value,
-      [threadId]: true,
+      [normalizedThreadId]: true,
     }
     try {
-      queuedMessagesByThreadId.value = await getThreadQueueState()
+      const serverState = await getThreadQueueState()
+      // If a local queue mutation completed while this request was in flight,
+      // its response is no longer safe to apply.  The mutation response (or a
+      // later refresh) is authoritative for that newer generation.
+      if ((queueMutationVersionByThreadId.get(normalizedThreadId) ?? 0) !== readVersion) return
+      const serverQueue = serverState[normalizedThreadId] ?? []
+      const currentState = queuedMessagesByThreadId.value
+      queuedMessagesByThreadId.value = serverQueue.length > 0
+        ? { ...currentState, [normalizedThreadId]: serverQueue }
+        : omitKey(currentState, normalizedThreadId)
+      updateTaskQueueSnapshot(normalizedThreadId, serverQueue)
     } catch {
       // Backend queue state is optional during transient bridge failures.
     } finally {
-      queueProcessingByThreadId.value = omitKey(queueProcessingByThreadId.value, threadId)
+      queueProcessingByThreadId.value = omitKey(queueProcessingByThreadId.value, normalizedThreadId)
     }
+  }
+
+  function nextQueueMutationVersion(threadId: string): number {
+    const normalizedThreadId = threadId.trim()
+    const next = (queueMutationVersionByThreadId.get(normalizedThreadId) ?? 0) + 1
+    queueMutationVersionByThreadId.set(normalizedThreadId, next)
+    return next
   }
 
   function scheduleQueueStateRefresh(threadId: string): void {
@@ -5172,12 +6180,21 @@ export function useDesktopState() {
   async function interruptSelectedThreadTurn(): Promise<void> {
     const threadId = selectedThreadId.value
     if (!threadId) return
-    if (inProgressById.value[threadId] !== true) return
+    if (!isTaskActiveForThread(threadId)) return
     if (interruptBlockedUntilPersistedByThreadId.value[threadId] === true) return
     let turnId = activeTurnIdByThreadId.value[threadId]
     if (!turnId) {
-      const { activeTurnId } = await getThreadDetail(threadId)
-      turnId = activeTurnId
+      // Prefer the bridge's shared live snapshot: a desktop writer can have
+      // an active turn that is not present in this app-server's projection.
+      try {
+        turnId = (await getThreadLiveState(threadId)).activeTurnId
+      } catch {
+        turnId = ''
+      }
+      if (!turnId) {
+        const detail = await getThreadDetail(threadId)
+        turnId = detail.activeTurnId
+      }
       if (turnId) {
         activeTurnIdByThreadId.value = {
           ...activeTurnIdByThreadId.value,
@@ -5193,6 +6210,14 @@ export function useDesktopState() {
     error.value = ''
     try {
       await interruptThreadTurn(threadId, turnId)
+      updateTaskSnapshot({
+        threadId,
+        notification: {
+          method: 'turn/interrupt',
+          params: { threadId, turnId },
+          atIso: new Date().toISOString(),
+        },
+      })
       setThreadInProgress(threadId, false)
       setTurnActivityForThread(threadId, null)
       setTurnErrorForThread(threadId, null)
@@ -5209,6 +6234,11 @@ export function useDesktopState() {
     } finally {
       isInterruptingTurn.value = false
     }
+  }
+
+  /** Public task-center stop operation; always maps to turn/interrupt. */
+  async function interruptTask(): Promise<void> {
+    await interruptSelectedThreadTurn()
   }
 
   async function rollbackSelectedThread(turnId: string): Promise<void> {
@@ -5421,20 +6451,114 @@ export function useDesktopState() {
     if (isPolling.value) return
     isPolling.value = true
 
+    const threadIdBeforeRefresh = selectedThreadId.value.trim()
+    const previousThread = threadIdBeforeRefresh
+      ? flattenThreads(sourceGroups.value).find((thread) => thread.id === threadIdBeforeRefresh)
+      : undefined
+    const previousSnapshot: ThreadStatusSnapshot | null = threadIdBeforeRefresh
+      ? (() => {
+        const observed = lastObservedThreadStatusById.get(threadIdBeforeRefresh)
+        return {
+          inProgress: Boolean(
+            observed?.inProgress
+            // A queued message is active in the task center, but no Codex
+            // turn is running yet.  Treating queued as an active session
+            // makes every status poll look like an active→idle transition
+            // and needlessly forces a full message read.
+            || isSessionActiveForThread(threadIdBeforeRefresh)
+            || previousThread?.inProgress === true,
+          ),
+          revision: observed?.revision || previousThread?.sessionRevision?.trim() || '',
+        }
+      })()
+      : null
+
     try {
-      await loadThreads()
+      // Notifications are scoped to this codexapp process.  A desktop Codex
+      // client may be writing the same session from another process, so force
+      // a lightweight list refresh to observe the session-file activity
+      // marker merged by the server.
+      await loadThreads({ force: true })
 
       if (!selectedThreadId.value) return
 
       const threadId = selectedThreadId.value
+      if (Date.now() - lastQueueStateRefreshAt >= THREAD_STATUS_POLL_INTERVAL_MS) {
+        try {
+          const queueState = await getThreadQueueState()
+          lastQueueStateRefreshAt = Date.now()
+          updateTaskQueueSnapshot(threadId, queueState[threadId] ?? [])
+        } catch {
+          // Queue state is optional; preserve the last known snapshot.
+        }
+      }
+      // Selection can change while the forced list request is in flight.  Do
+      // not apply the prior thread's transition to the newly selected one.
+      const sameSelectedThread = threadId === threadIdBeforeRefresh
+      const currentThread = flattenThreads(sourceGroups.value).find((thread) => thread.id === threadId)
       const currentVersion = currentThreadVersion(threadId)
       const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
+      // `applyThreadFlags` intentionally keeps the local active bit until a
+      // final snapshot has been consumed, so an incoming idle row can still
+      // render as active during that read.  The activity map is populated
+      // from the same server response before flags are applied and is the
+      // authoritative value for transition detection here.
+      const observedSessionActivity = sessionActivityByThreadId.get(threadId)
+      const currentSessionRevision = observedSessionActivity?.revision
+        || currentThread?.sessionRevision?.trim()
+        || ''
+      const loadedSessionRevision = loadedSessionRevisionByThreadId.value[threadId] ?? ''
       const hasVersionChange = currentVersion.length > 0 && currentVersion !== loadedVersion
-      const isInProgress = inProgressById.value[threadId] === true
+      const hasSessionRevisionChange = Boolean(
+        currentSessionRevision && currentSessionRevision !== loadedSessionRevision,
+      )
+      // When the row is present, its status is the server's latest
+      // observation and must be used for transition detection even if the
+      // local map still carries an optimistic active bit.  Fall back to the
+      // map only while a newly-created local thread is absent from the list.
+      const isInProgress = observedSessionActivity
+        ? observedSessionActivity.inProgress
+        : currentThread
+          // A legacy bridge does not provide a shared session marker.  Its
+          // explicit row status is still the freshest cross-client signal;
+          // using a locally cached task snapshot here would keep a completed
+          // task spinning forever after another client finished it.
+          ? currentThread.inProgress === true
+          : isTaskActiveForThread(threadId)
 
-      if (isInProgress || hasVersionChange) {
-        await loadMessages(threadId, { silent: true })
+      const currentSnapshot: ThreadStatusSnapshot = {
+        inProgress: isInProgress,
+        revision: currentSessionRevision,
       }
+      const previousForThread = sameSelectedThread ? previousSnapshot : null
+      const becameIdle = Boolean(previousForThread?.inProgress && !currentSnapshot.inProgress)
+      const shouldRetryLiveState = liveStateRetryByThreadId.has(threadId)
+
+      // While a thread is active, websocket events (when available) provide
+      // incremental content.  Polling only hydrates an unloaded thread; it
+      // performs a forced live read when a status/list version settles or its
+      // session revision changes.  This avoids rereading full turns every
+      // interval while keeping cross-process projections authoritative.
+      const shouldForceRefresh = becameIdle || hasVersionChange || hasSessionRevisionChange || shouldRetryLiveState
+      // A thread-list version change can be caused by a writer in another
+      // Codex process.  Its ordinary app-server projection may still be
+      // behind the session file, so all forced refreshes use the read-only
+      // live path.
+      const shouldPreferLiveState = becameIdle || hasVersionChange || hasSessionRevisionChange || shouldRetryLiveState
+      const shouldLoadMessages =
+        shouldForceRefresh || (isInProgress && loadedMessagesByThreadId.value[threadId] !== true)
+
+      if (shouldLoadMessages) {
+        await loadMessages(threadId, {
+          silent: true,
+          force: shouldForceRefresh,
+          preferLiveState: shouldPreferLiveState,
+        })
+      }
+      // Record the observation only after a requested hydration succeeds.  If
+      // a transient read fails during active→idle, retaining the prior active
+      // snapshot causes the next poll to retry the authoritative live read.
+      lastObservedThreadStatusById.set(threadId, currentSnapshot)
     } catch {
       // ignore poll failures and keep last known state
     } finally {
@@ -5471,7 +6595,7 @@ export function useDesktopState() {
       if (!activeThreadId) return
 
       const isActiveDirty = threadIdsToRefresh.has(activeThreadId)
-      const isInProgress = inProgressById.value[activeThreadId] === true
+      const isInProgress = isTaskActiveForThread(activeThreadId)
       const currentVersion = currentThreadVersion(activeThreadId)
       const loadedVersion = loadedVersionByThreadId.value[activeThreadId] ?? ''
       const hasVersionChange = currentVersion.length > 0 && currentVersion !== loadedVersion
@@ -5483,7 +6607,16 @@ export function useDesktopState() {
         (shouldRefreshThreads && loadedMessagesByThreadId.value[activeThreadId] !== true)
 
       if (shouldRefreshActiveThread) {
-        await loadMessages(activeThreadId, { silent: true })
+        // Event-driven refreshes commonly arrive before app-server's
+        // materialized `thread/read` projection catches up (especially after
+        // a desktop-owned turn completes).  Use the bridge's read-only live
+        // projection so a stale RPC snapshot cannot roll the conversation
+        // back to an older set of turns.
+        await loadMessages(activeThreadId, {
+          silent: true,
+          force: true,
+          preferLiveState: true,
+        })
       }
     } catch {
       // Keep UI stable on transient event sync failures.
@@ -5506,10 +6639,9 @@ export function useDesktopState() {
   async function recoverBridgeState(): Promise<void> {
     await loadPendingServerRequestsFromBridge()
     pendingThreadsRefresh = !hasLoadedThreads.value
-    if (
-      selectedThreadId.value &&
-      loadedMessagesByThreadId.value[selectedThreadId.value] !== true
-    ) {
+    if (selectedThreadId.value) {
+      // A reconnect/gap means notifications may have been missed even when
+      // the thread was already loaded, so force a read-only snapshot refresh.
       pendingThreadMessageRefresh.add(selectedThreadId.value)
     }
     await syncFromNotifications()
@@ -5522,18 +6654,56 @@ export function useDesktopState() {
     void loadPendingServerRequestsFromBridge()
     stopNotificationStream = subscribeCodexNotifications((notification) => {
       if (notification.method === 'ready') {
+        const readyParams = asRecord(notification.params)
+        const readyEpoch = typeof readyParams?.streamEpoch === 'string' ? readyParams.streamEpoch : ''
+        const readySeq = typeof readyParams?.latestSeq === 'number' && Number.isFinite(readyParams.latestSeq)
+          ? Math.floor(readyParams.latestSeq)
+          : 0
+        if (readyEpoch) lastStreamEpoch = readyEpoch
+        if (readySeq > lastStreamSeq) lastStreamSeq = readySeq
         clearAllTransientTurnErrors()
         void recoverBridgeState()
         return
       }
+
+      if (typeof notification.seq === 'number' && Number.isFinite(notification.seq)) {
+        const nextSeq = Math.floor(notification.seq)
+        const nextEpoch = notification.streamEpoch ?? ''
+        const epochChanged = Boolean(nextEpoch && lastStreamEpoch && nextEpoch !== lastStreamEpoch)
+        const sequenceGap = !epochChanged && lastStreamSeq > 0 && nextSeq > lastStreamSeq + 1
+        if (epochChanged || sequenceGap) {
+          lastStreamEpoch = nextEpoch || lastStreamEpoch
+          lastStreamSeq = nextSeq
+          void recoverBridgeState()
+          return
+        }
+        if (nextEpoch) lastStreamEpoch = nextEpoch
+        if (nextSeq <= lastStreamSeq) return
+        lastStreamSeq = nextSeq
+      }
       applyRealtimeUpdates(notification)
       queueEventDrivenSync(notification)
     })
+
+    if (threadStatusPollTimer === null && typeof window.setInterval === 'function') {
+      threadStatusPollTimer = window.setInterval(() => {
+        void syncThreadStatus()
+      }, THREAD_STATUS_POLL_INTERVAL_MS)
+    }
+    void syncThreadStatus()
   }
 
   async function loadPendingServerRequestsFromBridge(): Promise<void> {
+    const refreshSequence = ++pendingServerRequestRefreshSequence
+    const mutationVersion = pendingServerRequestMutationVersion
     try {
       const rows = await getPendingServerRequests()
+      // A request event/resolution or a newer reconnect read won while this
+      // request was in flight.  Its response is no longer authoritative.
+      if (
+        refreshSequence !== pendingServerRequestRefreshSequence
+        || mutationVersion !== pendingServerRequestMutationVersion
+      ) return
       const normalizedRequests = rows
         .map((row) => normalizeServerRequest(row))
         .filter((request): request is UiServerRequest => request !== null)
@@ -5562,10 +6732,26 @@ export function useDesktopState() {
       stopNotificationStream()
       stopNotificationStream = null
     }
+    if (
+      threadStatusPollTimer !== null
+      && typeof window !== 'undefined'
+      && typeof window.clearInterval === 'function'
+    ) {
+      window.clearInterval(threadStatusPollTimer)
+      threadStatusPollTimer = null
+    }
+    if (typeof window === 'undefined' || typeof window.clearInterval !== 'function') {
+      threadStatusPollTimer = null
+    }
 
     pendingThreadsRefresh = false
     pendingThreadMessageRefresh.clear()
     pendingTurnStartsById.clear()
+    lastObservedThreadStatusById.clear()
+    sessionActivityByThreadId.clear()
+    pendingServerRequestRefreshSequence += 1
+    pendingServerRequestMutationVersion += 1
+    pendingServerRequestsByThreadId.value = {}
     if (eventSyncTimer !== null && typeof window !== 'undefined') {
       window.clearTimeout(eventSyncTimer)
       eventSyncTimer = null
@@ -5592,6 +6778,7 @@ export function useDesktopState() {
     liveReasoningTextByThreadId.value = {}
     liveCommandsByThreadId.value = {}
     liveFileChangeMessagesByThreadId.value = {}
+    taskSnapshotsByThreadId.value = {}
     turnIndexByTurnIdByThreadId.value = {}
     turnActivityByThreadId.value = {}
     turnSummaryByThreadId.value = {}
@@ -5600,9 +6787,14 @@ export function useDesktopState() {
     interruptBlockedUntilPersistedByThreadId.value = {}
     threadListedByServerById.value = {}
     persistedUserMessageByThreadId.value = {}
-    queuedMessagesByThreadId.value = {}
+    // The queue is shared across browser clients and persisted in the bridge.
+    // Stopping polling (account refresh, reconnect, or component unmount)
+    // must not turn this client's temporary empty memory into a destructive
+    // whole-state PUT that erases work submitted by another client.
     queueProcessingByThreadId.value = {}
-    persistQueueState()
+    queueMutationVersionByThreadId.clear()
+    hasLoadedPersistedQueueState = false
+    lastQueueStateRefreshAt = 0
     codexRateLimit.value = null
     threadTokenUsageByThreadId.value = {}
   }
@@ -5613,19 +6805,35 @@ export function useDesktopState() {
     return queuedMessagesByThreadId.value[threadId] ?? []
   })
 
-  function removeQueuedMessage(messageId: string): void {
+  async function removeQueuedMessage(messageId: string): Promise<void> {
     const threadId = selectedThreadId.value
     if (!threadId) return
     const queue = queuedMessagesByThreadId.value[threadId]
     if (!queue) return
     const next = queue.filter((m) => m.id !== messageId)
+    const mutationVersion = nextQueueMutationVersion(threadId)
     queuedMessagesByThreadId.value = next.length > 0
       ? { ...queuedMessagesByThreadId.value, [threadId]: next }
       : omitKey(queuedMessagesByThreadId.value, threadId)
-    persistQueueState()
+    updateTaskQueueSnapshot(threadId, next)
+    try {
+      const serverQueue = await removeQueuedThreadMessage(threadId, messageId)
+      if ((queueMutationVersionByThreadId.get(threadId) ?? 0) === mutationVersion) {
+        queuedMessagesByThreadId.value = serverQueue.length > 0
+          ? { ...queuedMessagesByThreadId.value, [threadId]: serverQueue }
+          : omitKey(queuedMessagesByThreadId.value, threadId)
+        updateTaskQueueSnapshot(threadId, serverQueue)
+      } else {
+        void processQueuedMessages(threadId)
+      }
+    } catch {
+      // Reconcile with the server rather than writing a stale whole-state
+      // snapshot over another browser's queue mutation.
+      await processQueuedMessages(threadId)
+    }
   }
 
-  function reorderQueuedMessage(draggedId: string, targetId: string): void {
+  async function reorderQueuedMessage(draggedId: string, targetId: string): Promise<void> {
     const threadId = selectedThreadId.value
     if (!threadId) return
     const queue = queuedMessagesByThreadId.value[threadId]
@@ -5638,21 +6846,35 @@ export function useDesktopState() {
     const next = [...queue]
     const [moved] = next.splice(fromIndex, 1)
     next.splice(toIndex, 0, moved)
+    const mutationVersion = nextQueueMutationVersion(threadId)
     queuedMessagesByThreadId.value = {
       ...queuedMessagesByThreadId.value,
       [threadId]: next,
     }
-    persistQueueState()
+    updateTaskQueueSnapshot(threadId, next)
+    try {
+      const serverQueue = await reorderQueuedThreadMessage(threadId, draggedId, targetId)
+      if ((queueMutationVersionByThreadId.get(threadId) ?? 0) === mutationVersion) {
+        queuedMessagesByThreadId.value = serverQueue.length > 0
+          ? { ...queuedMessagesByThreadId.value, [threadId]: serverQueue }
+          : omitKey(queuedMessagesByThreadId.value, threadId)
+        updateTaskQueueSnapshot(threadId, serverQueue)
+      } else {
+        void processQueuedMessages(threadId)
+      }
+    } catch {
+      await processQueuedMessages(threadId)
+    }
   }
 
-  function steerQueuedMessage(messageId: string): void {
+  async function steerQueuedMessage(messageId: string): Promise<void> {
     const threadId = selectedThreadId.value
     if (!threadId) return
     const queue = queuedMessagesByThreadId.value[threadId]
     if (!queue) return
     const msg = queue.find((m) => m.id === messageId)
     if (!msg) return
-    removeQueuedMessage(messageId)
+    await removeQueuedMessage(messageId)
     setSelectedCollaborationMode(msg.collaborationMode)
     void sendMessageToSelectedThread(msg.text, msg.imageUrls, msg.skills, 'steer', msg.fileAttachments)
   }
@@ -5669,6 +6891,8 @@ export function useDesktopState() {
     selectedThreadTerminalOpen,
     isSelectedThreadInterruptPending,
     selectedThreadServerRequests,
+    selectedTaskSnapshot,
+    taskSnapshotsByThreadId,
     selectedLiveOverlay,
     codexQuota,
     selectedThreadId,
@@ -5683,6 +6907,7 @@ export function useDesktopState() {
     accountRateLimitSnapshots,
     messages,
     hasMoreOlderMessages,
+    deferAutoLoadPersistedAbove,
     isLoadingThreads,
     isThreadListFullyLoaded,
     isLoadingMessages,
@@ -5708,8 +6933,11 @@ export function useDesktopState() {
     rollbackSelectedThread,
 
     sendMessageToSelectedThread,
+    sendTaskMessage,
+    steerTaskMessage,
     sendMessageToNewThread,
     interruptSelectedThreadTurn,
+    interruptTask,
     selectedThreadQueuedMessages,
     removeQueuedMessage,
     reorderQueuedMessage,
@@ -5728,6 +6956,7 @@ export function useDesktopState() {
     pinProjectToTop,
     startPolling,
     stopPolling,
+    syncThreadStatus,
     primeSelectedThread,
   }
 }

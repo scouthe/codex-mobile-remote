@@ -56,7 +56,9 @@ import type {
   UiThreadAutomation,
   UiThreadAutomationStatus,
 } from '../types/codex'
+import type { TaskSnapshot, TaskState, TaskActivity, TaskActiveRequest, TaskTimelineEvent, TaskWriterIdentity } from '../types/task'
 import { normalizePathForUi } from '../pathUtils.js'
+import { getTaskClientHeaders } from './codexRpcClient'
 
 type CurrentModelConfig = {
   model: string
@@ -290,6 +292,11 @@ export type StoredQueuedMessage = {
   skills: Array<{ name: string; path: string }>
   fileAttachments: Array<{ label: string; path: string; fsPath: string }>
   collaborationMode: CollaborationModeKind
+  createdAtIso?: string
+  sourceClientId?: string
+  status?: 'queued' | 'processing' | 'failed'
+  attempts?: number
+  lastError?: string
 }
 
 export type ThreadQueueState = Record<string, StoredQueuedMessage[]>
@@ -533,6 +540,8 @@ function normalizeAccountEntry(
     unavailableReason: normalizeAccountUnavailableReason(record.unavailableReason)
       ?? (isPaymentRequiredErrorMessage(readString(record.quotaError)) ? 'payment_required' : null),
     isActive: readBoolean(record.isActive) ?? (storageId === activeStorageId || accountId === activeAccountId),
+    accountKind: record.accountKind === 'codex-provider' ? 'codex-provider' : 'chatgpt',
+    providerId: readString(record.providerId),
   }
 }
 
@@ -729,6 +738,40 @@ export type ThreadTurnPage = {
   turnIndexByTurnId: ThreadTurnIndexById
 }
 
+export type ThreadLiveState = {
+  model: string
+  modelProvider: string
+  messages: UiMessage[]
+  inProgress: boolean
+  activeTurnId: string
+  terminalTurnId?: string
+  hasMoreOlder: boolean
+  turnIndexByTurnId: ThreadTurnIndexById
+  /** Optional bridge-side marker for changes written by another client. */
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
+  streamCursor: {
+    streamEpoch: string
+    latestSeq: number
+    oldestSeq: number | null
+  } | null
+  liveStateError: string | null
+  /** Unified task-center snapshot; optional for older bridge responses. */
+  taskState?: TaskState
+  currentActivity?: TaskActivity
+  queueDepth?: number
+  activeRequest?: TaskActiveRequest | null
+  writerClient?: TaskWriterIdentity | null
+  startedAt?: string | null
+  finishedAt?: string | null
+  error?: string | null
+  timeline?: TaskTimelineEvent[]
+  /** The bridge returned a bounded projection rather than the full history. */
+  partial?: boolean
+  /** Large session logs stay on the bounded observer projection. */
+  fullHydrationDeferred?: boolean
+}
+
 async function getThreadGroupsPageV2(cursor: string | null, limit: number): Promise<ThreadGroupsPage> {
   const payload = await callRpc<ThreadListResponse>('thread/list', {
     archived: false,
@@ -767,8 +810,14 @@ async function getThreadDetailV2(threadId: string): Promise<{
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
+  terminalTurnId?: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
+  partial?: boolean
+  taskState?: TaskState
+  error?: string | null
 }> {
   const payload = await callRpc<ThreadReadResponse>('thread/read', {
     threadId,
@@ -776,14 +825,215 @@ async function getThreadDetailV2(threadId: string): Promise<{
   })
   const startTurnIndex = readThreadTurnStartIndex(payload)
   const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
+  const rawThread = asRecord(payload.thread)
+  const rawRevision = rawThread?.sessionRevision ?? rawThread?.revision
+  const sessionRevision = typeof rawRevision === 'string'
+    ? rawRevision.trim()
+    : typeof rawRevision === 'number' && Number.isFinite(rawRevision)
+      ? String(rawRevision)
+      : ''
+  const sessionActivityKnown = rawThread?.sessionActivityKnown === true
+  const terminalTurnId = readString(rawThread?.terminalTurnId)
+  const rawTurns = Array.isArray(rawThread?.turns) ? rawThread.turns : []
+  const lastTurn = asRecord(rawTurns.at(-1))
+  const rawTurnStatus = asRecord(lastTurn?.status)
+  const turnStatus = (readString(lastTurn?.status) || readString(rawTurnStatus?.type) || '').toLowerCase()
+  const turnErrorRecord = asRecord(lastTurn?.error)
+  const turnError = readString(turnErrorRecord?.message) || readString(lastTurn?.error)
+  const terminalState = (readString(rawThread?.terminalState) ?? '').toLowerCase()
+  const terminalError = readString(rawThread?.terminalError) || turnError
+  const taskState: TaskState = terminalState === 'failed' || turnStatus === 'failed'
+    ? 'failed'
+    : terminalState === 'canceled'
+      ? 'canceled'
+      : readThreadInProgressFromResponse(payload)
+        ? 'running'
+        : 'completed'
   return {
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
     inProgress: readThreadInProgressFromResponse(payload),
     activeTurnId: readActiveTurnIdFromResponse(payload),
+    ...(terminalTurnId ? { terminalTurnId } : {}),
     hasMoreOlder: startTurnIndex > 0,
+    ...(startTurnIndex > 0 ? { partial: true } : {}),
     turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+    ...(sessionRevision ? { sessionRevision } : {}),
+    ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
+    taskState,
+    error: taskState === 'failed' ? (terminalError || 'Task failed') : null,
+  }
+}
+
+async function getThreadFastDetailV2(threadId: string): Promise<{
+  model: string
+  modelProvider: string
+  messages: UiMessage[]
+  inProgress: boolean
+  activeTurnId: string
+  terminalTurnId?: string
+  hasMoreOlder: boolean
+  turnIndexByTurnId: ThreadTurnIndexById
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
+  streamCursor?: {
+    streamEpoch: string
+    latestSeq: number
+    oldestSeq: number | null
+  } | null
+  partial: boolean
+  taskState?: TaskState
+  currentActivity?: TaskActivity
+  queueDepth?: number
+  activeRequest?: TaskActiveRequest | null
+  writerClient?: TaskWriterIdentity | null
+  startedAt?: string | null
+  finishedAt?: string | null
+  error?: string | null
+  timeline?: TaskTimelineEvent[]
+  /** Large session logs stay on the bounded observer projection. */
+  fullHydrationDeferred?: boolean
+}> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) throw new Error('Missing thread id')
+  const response = await fetch(`/codex-api/thread-fast-state?threadId=${encodeURIComponent(normalizedThreadId)}`, {
+    headers: getTaskClientHeaders(),
+  })
+  const payload = await response.json() as ThreadReadResponse & {
+    partial?: unknown
+    hasMoreOlder?: unknown
+    inProgress?: unknown
+    activeTurnId?: unknown
+    terminalTurnId?: unknown
+    sessionRevision?: unknown
+    sessionActivityKnown?: unknown
+    streamCursor?: unknown
+    taskState?: unknown
+    currentActivity?: unknown
+    queueDepth?: unknown
+    activeRequest?: unknown
+    writerClient?: unknown
+    startedAt?: unknown
+    finishedAt?: unknown
+    error?: unknown
+    timeline?: unknown
+    fullHydrationDeferred?: unknown
+  }
+  if (!response.ok) {
+    throw new Error(`Fast thread state request failed with ${response.status}`)
+  }
+  if (!payload.thread || payload.partial !== true) {
+    throw new Error('Fast thread state response was incomplete')
+  }
+  const startTurnIndex = readThreadTurnStartIndex(payload)
+  const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
+  const rawThread = asRecord(payload.thread)
+  const rawRevision = payload.sessionRevision ?? rawThread?.sessionRevision ?? rawThread?.revision
+  const sessionRevision = typeof rawRevision === 'string'
+    ? rawRevision.trim()
+    : typeof rawRevision === 'number' && Number.isFinite(rawRevision)
+      ? String(rawRevision)
+      : ''
+  const sessionActivityKnown = payload.sessionActivityKnown === true || rawThread?.sessionActivityKnown === true
+  const inProgress = typeof payload.inProgress === 'boolean'
+    ? payload.inProgress
+    : readThreadInProgressFromResponse(payload)
+  const activeTurnId = typeof payload.activeTurnId === 'string'
+    ? payload.activeTurnId.trim()
+    : readActiveTurnIdFromResponse(payload)
+  const terminalTurnId = typeof payload.terminalTurnId === 'string'
+    ? payload.terminalTurnId.trim()
+    : ''
+  const taskStates: TaskState[] = [
+    'queued', 'starting', 'running', 'waiting_approval', 'waiting_user_input',
+    'steering', 'completed', 'failed', 'canceled',
+  ]
+  const taskState = typeof payload.taskState === 'string' && taskStates.includes(payload.taskState as TaskState)
+    ? payload.taskState as TaskState
+    : undefined
+  const streamCursorRecord = asRecord(payload.streamCursor)
+  const streamCursor = streamCursorRecord
+    && typeof streamCursorRecord.streamEpoch === 'string'
+    && typeof streamCursorRecord.latestSeq === 'number'
+    ? {
+      streamEpoch: streamCursorRecord.streamEpoch,
+      latestSeq: Math.max(0, Math.trunc(streamCursorRecord.latestSeq)),
+      oldestSeq: typeof streamCursorRecord.oldestSeq === 'number' ? Math.max(0, Math.trunc(streamCursorRecord.oldestSeq)) : null,
+    }
+    : payload.streamCursor === null ? null : undefined
+  const activityRecord = asRecord(payload.currentActivity)
+  const activityKinds: TaskActivity['kind'][] = [
+    'thinking', 'command', 'file_change', 'response', 'approval', 'user_input', 'queue', 'error', 'idle',
+  ]
+  const activityKind = typeof activityRecord?.kind === 'string' && activityKinds.includes(activityRecord.kind as TaskActivity['kind'])
+    ? activityRecord.kind as TaskActivity['kind']
+    : undefined
+  const currentActivity = activityKind
+    ? {
+      kind: activityKind,
+      label: readString(activityRecord?.label) || 'Idle',
+      details: Array.isArray(activityRecord?.details)
+        ? activityRecord.details.filter((item): item is string => typeof item === 'string')
+        : [],
+    }
+    : undefined
+  const activeRequestRecord = asRecord(payload.activeRequest)
+  const activeRequest = activeRequestRecord && typeof activeRequestRecord.id === 'number'
+    ? {
+      id: Math.trunc(activeRequestRecord.id),
+      kind: activeRequestRecord.kind === 'approval' || activeRequestRecord.kind === 'user_input' ? activeRequestRecord.kind : 'other',
+      method: readString(activeRequestRecord.method),
+      receivedAtIso: readString(activeRequestRecord.receivedAtIso),
+    } as TaskActiveRequest
+    : payload.activeRequest === null ? null : undefined
+  const writerClient = payload.writerClient && typeof payload.writerClient === 'object'
+    ? payload.writerClient as TaskWriterIdentity
+    : payload.writerClient === null ? null : undefined
+  const timeline = Array.isArray(payload.timeline)
+    ? payload.timeline.flatMap((item) => {
+      const row = asRecord(item)
+      if (!row) return []
+      const id = readString(row.id)
+      const type = readString(row.type)
+      const atIso = readString(row.atIso)
+      const label = readString(row.label)
+      if (!id || !type || !atIso || !label) return []
+      return [{
+        id,
+        type: type as TaskTimelineEvent['type'],
+        atIso,
+        label,
+        details: Array.isArray(row.details) ? row.details.filter((value): value is string => typeof value === 'string') : [],
+        turnId: readString(row.turnId) ?? '',
+        ...(typeof row.itemId === 'string' ? { itemId: row.itemId } : {}),
+        ...(typeof row.status === 'string' ? { status: row.status as TaskTimelineEvent['status'] } : {}),
+      }]
+    })
+    : undefined
+  return {
+    model: normalizeThreadModelFromPayload(payload),
+    modelProvider: normalizeThreadModelProviderFromPayload(payload),
+    messages: normalized,
+    inProgress,
+    activeTurnId,
+    hasMoreOlder: payload.hasMoreOlder === true || startTurnIndex > 0,
+    turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+    ...(sessionRevision ? { sessionRevision } : {}),
+    ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
+    ...(streamCursor !== undefined ? { streamCursor } : {}),
+    ...(terminalTurnId ? { terminalTurnId } : {}),
+    ...(taskState ? { taskState } : {}),
+    ...(currentActivity ? { currentActivity } : {}),
+    ...(typeof payload.queueDepth === 'number' ? { queueDepth: Math.max(0, Math.trunc(payload.queueDepth)) } : {}),
+    ...(activeRequest !== undefined ? { activeRequest } : {}),
+    ...(writerClient !== undefined ? { writerClient } : {}),
+    ...(typeof payload.startedAt === 'string' ? { startedAt: payload.startedAt } : payload.startedAt === null ? { startedAt: null } : {}),
+    ...(typeof payload.finishedAt === 'string' ? { finishedAt: payload.finishedAt } : payload.finishedAt === null ? { finishedAt: null } : {}),
+    ...(typeof payload.error === 'string' ? { error: payload.error } : payload.error === null ? { error: null } : {}),
+    ...(timeline ? { timeline } : {}),
+    ...(typeof payload.fullHydrationDeferred === 'boolean' ? { fullHydrationDeferred: payload.fullHydrationDeferred } : {}),
+    partial: true,
   }
 }
 
@@ -862,13 +1112,211 @@ export async function getThreadDetail(threadId: string): Promise<{
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
+  terminalTurnId?: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
+  partial?: boolean
+  taskState?: TaskState
+  error?: string | null
 }> {
   try {
     return await getThreadDetailV2(threadId)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load thread ${threadId}`, 'thread/read')
+  }
+}
+
+/**
+ * Return a bounded, read-only session tail for fast task switching.  The
+ * caller should schedule a normal getThreadDetail refresh afterwards to fill
+ * command output and older turns.
+ */
+export async function getThreadFastDetail(threadId: string): Promise<{
+  model: string
+  modelProvider: string
+  messages: UiMessage[]
+  inProgress: boolean
+  activeTurnId: string
+  terminalTurnId?: string
+  hasMoreOlder: boolean
+  turnIndexByTurnId: ThreadTurnIndexById
+  sessionRevision?: string
+  sessionActivityKnown?: boolean
+  streamCursor?: {
+    streamEpoch: string
+    latestSeq: number
+    oldestSeq: number | null
+  } | null
+  partial: boolean
+  taskState?: TaskState
+  currentActivity?: TaskActivity
+  queueDepth?: number
+  activeRequest?: TaskActiveRequest | null
+  writerClient?: TaskWriterIdentity | null
+  startedAt?: string | null
+  finishedAt?: string | null
+  error?: string | null
+  timeline?: TaskTimelineEvent[]
+  /** Large session logs stay on the bounded observer projection. */
+  fullHydrationDeferred?: boolean
+}> {
+  try {
+    return await getThreadFastDetailV2(threadId)
+  } catch (error) {
+    throw normalizeCodexApiError(error, `Failed to load fast thread ${threadId}`, 'thread/read')
+  }
+}
+
+export async function getThreadLiveState(threadId: string): Promise<ThreadLiveState> {
+  const normalizedThreadId = threadId.trim()
+  if (!normalizedThreadId) {
+    throw new Error('Missing thread id')
+  }
+
+  try {
+    const response = await fetch(`/codex-api/thread-live-state?threadId=${encodeURIComponent(normalizedThreadId)}`, {
+      headers: getTaskClientHeaders(),
+    })
+    const payload = await response.json() as unknown
+    if (!response.ok) {
+      throw new Error(`Live thread state request failed with ${response.status}`)
+    }
+
+    const record = asRecord(payload)
+    const thread = asRecord(record?.thread)
+    const conversationState = asRecord(record?.conversationState)
+    const turns = Array.isArray(conversationState?.turns)
+      ? conversationState.turns
+      : Array.isArray(thread?.turns)
+        ? thread.turns
+        : []
+    const threadPayload = {
+      thread: {
+        ...(thread ?? {}),
+        id: readString(thread?.id) ?? normalizedThreadId,
+        turns,
+      },
+      model: readString(record?.model) ?? readString(thread?.model) ?? '',
+      modelProvider: readString(record?.modelProvider) ?? readString(thread?.modelProvider) ?? '',
+      threadTurnStartIndex: typeof record?.threadTurnStartIndex === 'number' ? record.threadTurnStartIndex : 0,
+    } as unknown as ThreadReadResponse
+    const rawRevision = record?.sessionRevision ?? thread?.sessionRevision ?? thread?.revision
+    const sessionRevision = typeof rawRevision === 'string'
+      ? rawRevision.trim()
+      : typeof rawRevision === 'number' && Number.isFinite(rawRevision)
+        ? String(rawRevision)
+        : ''
+    const sessionActivityKnown = record?.sessionActivityKnown === true || thread?.sessionActivityKnown === true
+    const cursorRecord = asRecord(record?.streamCursor)
+    const streamCursor = cursorRecord && typeof cursorRecord.streamEpoch === 'string'
+      ? {
+        streamEpoch: cursorRecord.streamEpoch,
+        latestSeq: typeof cursorRecord.latestSeq === 'number' ? Math.floor(cursorRecord.latestSeq) : 0,
+        oldestSeq: typeof cursorRecord.oldestSeq === 'number' ? Math.floor(cursorRecord.oldestSeq) : null,
+      }
+      : null
+    const taskStates: TaskState[] = [
+      'queued', 'starting', 'running', 'waiting_approval', 'waiting_user_input',
+      'steering', 'completed', 'failed', 'canceled',
+    ]
+    const taskState = typeof record?.taskState === 'string' && taskStates.includes(record.taskState as TaskState)
+      ? record.taskState as TaskState
+      : undefined
+    const activityRecord = asRecord(record?.currentActivity)
+    const activityKinds: TaskActivity['kind'][] = [
+      'thinking', 'command', 'file_change', 'response', 'approval', 'user_input', 'queue', 'error', 'idle',
+    ]
+    const activityKind = typeof activityRecord?.kind === 'string' && activityKinds.includes(activityRecord.kind as TaskActivity['kind'])
+      ? activityRecord.kind as TaskActivity['kind']
+      : undefined
+    const currentActivity = activityKind
+      ? {
+        kind: activityKind,
+        label: readString(activityRecord?.label) || 'Idle',
+        details: Array.isArray(activityRecord?.details)
+          ? activityRecord.details.filter((item): item is string => typeof item === 'string')
+          : [],
+      }
+      : undefined
+    const activeRequestRecord = asRecord(record?.activeRequest)
+    const activeRequest = activeRequestRecord && typeof activeRequestRecord.id === 'number'
+      ? {
+        id: Math.trunc(activeRequestRecord.id),
+        kind: activeRequestRecord.kind === 'approval' || activeRequestRecord.kind === 'user_input' ? activeRequestRecord.kind : 'other',
+        method: readString(activeRequestRecord.method),
+        receivedAtIso: readString(activeRequestRecord.receivedAtIso),
+      } as TaskActiveRequest
+      : record?.activeRequest === null ? null : undefined
+    const timeline = Array.isArray(record?.timeline)
+      ? record.timeline.flatMap((item) => {
+        const row = asRecord(item)
+        if (!row) return []
+        const id = readString(row.id)
+        const type = readString(row.type)
+        const atIso = readString(row.atIso)
+        const label = readString(row.label)
+        if (!id || !type || !atIso || !label) return []
+        return [{
+          id,
+          type: type as TaskTimelineEvent['type'],
+          atIso,
+          label,
+          details: Array.isArray(row.details) ? row.details.filter((value): value is string => typeof value === 'string') : [],
+          turnId: readString(row.turnId) ?? '',
+          ...((readString(row.itemId) ?? '') ? { itemId: readString(row.itemId) ?? '' } : {}),
+          ...(typeof row.status === 'string' ? { status: row.status as TaskTimelineEvent['status'] } : {}),
+        }]
+      })
+      : undefined
+    const writerClient = record?.writerClient && typeof record.writerClient === 'object'
+      ? record.writerClient as TaskWriterIdentity
+      : record?.writerClient === null ? null : undefined
+    const terminalTurnId = readString(record?.terminalTurnId) || readString(thread?.terminalTurnId)
+    const liveStateErrorRecord = asRecord(record?.liveStateError)
+    const explicitInProgress = sessionActivityKnown
+      ? typeof record?.isInProgress === 'boolean'
+        ? record.isInProgress
+        : typeof record?.inProgress === 'boolean'
+          ? record.inProgress
+          : typeof thread?.inProgress === 'boolean'
+            ? thread.inProgress
+            : undefined
+      : undefined
+    const threadTurnStartIndex = readThreadTurnStartIndex(threadPayload)
+    const hasMoreOlder = threadTurnStartIndex > 0 || record?.hasMoreOlder === true
+    return {
+      model: normalizeThreadModelFromPayload(threadPayload),
+      modelProvider: normalizeThreadModelProviderFromPayload(threadPayload),
+      messages: normalizeThreadMessagesV2(threadPayload, threadTurnStartIndex),
+      // When the bridge has read the shared session log, its boolean marker
+      // is authoritative even when false.  Falling back with `||` would let
+      // an old projected in-progress turn resurrect the spinner after the
+      // desktop task has completed.
+      inProgress: explicitInProgress ?? readThreadInProgressFromResponse(threadPayload),
+      activeTurnId: readString(record?.activeTurnId) || readActiveTurnIdFromResponse(threadPayload),
+      ...(terminalTurnId ? { terminalTurnId } : {}),
+      hasMoreOlder,
+      ...(record?.partial === true || hasMoreOlder ? { partial: true } : {}),
+      turnIndexByTurnId: buildTurnIndexByTurnId(threadPayload, threadTurnStartIndex),
+      ...(sessionRevision ? { sessionRevision } : {}),
+      ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
+      streamCursor,
+      liveStateError: readString(liveStateErrorRecord?.message),
+      ...(taskState ? { taskState } : {}),
+      ...(currentActivity ? { currentActivity } : {}),
+      ...(typeof record?.queueDepth === 'number' ? { queueDepth: Math.max(0, Math.trunc(record.queueDepth)) } : {}),
+      ...(activeRequest !== undefined ? { activeRequest } : {}),
+      ...(writerClient !== undefined ? { writerClient } : {}),
+      ...(typeof record?.startedAt === 'string' ? { startedAt: record.startedAt } : {}),
+      ...(typeof record?.finishedAt === 'string' ? { finishedAt: record.finishedAt } : {}),
+      ...(typeof record?.error === 'string' ? { error: record.error } : record?.error === null ? { error: null } : {}),
+      ...(timeline ? { timeline } : {}),
+      ...(record?.fullHydrationDeferred === true ? { fullHydrationDeferred: true } : {}),
+    }
+  } catch (error) {
+    throw normalizeCodexApiError(error, `Failed to load live thread state ${normalizedThreadId}`, 'thread-live-state')
   }
 }
 
@@ -2558,6 +3006,11 @@ function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | nul
     skills,
     fileAttachments,
     collaborationMode: record.collaborationMode === 'plan' ? 'plan' : 'default',
+    ...(typeof record.createdAtIso === 'string' ? { createdAtIso: record.createdAtIso } : {}),
+    ...(typeof record.sourceClientId === 'string' ? { sourceClientId: record.sourceClientId } : {}),
+    ...(record.status === 'failed' || record.status === 'processing' || record.status === 'queued' ? { status: record.status } : {}),
+    ...(typeof record.attempts === 'number' && Number.isFinite(record.attempts) ? { attempts: Math.max(0, Math.trunc(record.attempts)) } : {}),
+    ...(typeof record.lastError === 'string' ? { lastError: record.lastError } : {}),
   }
 }
 
@@ -2644,6 +3097,72 @@ export async function setThreadQueueState(nextState: ThreadQueueState): Promise<
   if (!response.ok) {
     throw new Error('Failed to save thread queue state')
   }
+}
+
+export async function enqueueThreadMessage(
+  threadId: string,
+  message: StoredQueuedMessage,
+  beforeMessageId?: string,
+): Promise<{ inserted: boolean; queue: StoredQueuedMessage[] }> {
+  const normalizedBeforeMessageId = beforeMessageId?.trim() ?? ''
+  const response = await fetch('/codex-api/thread-queue/enqueue', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      threadId,
+      message: normalizeStoredQueuedMessage(message),
+      ...(normalizedBeforeMessageId ? { beforeMessageId: normalizedBeforeMessageId } : {}),
+    }),
+  })
+  const payload = await response.json() as unknown
+  if (!response.ok) {
+    throw new Error(getErrorMessageFromPayload(payload, 'Failed to enqueue thread message'))
+  }
+  const record = asRecord(payload)
+  const queue = Array.isArray(record?.data)
+    ? record.data.flatMap((item) => {
+      const normalized = normalizeStoredQueuedMessage(item)
+      return normalized ? [normalized] : []
+    })
+    : []
+  return {
+    inserted: record?.inserted === true,
+    queue,
+  }
+}
+
+async function mutateThreadQueue(
+  path: '/remove' | '/reorder',
+  payload: Record<string, string>,
+): Promise<StoredQueuedMessage[]> {
+  const response = await fetch(`/codex-api/thread-queue${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const body = await response.json() as unknown
+  if (!response.ok) {
+    throw new Error(getErrorMessageFromPayload(body, `Failed to mutate thread queue (${path.slice(1)})`))
+  }
+  const record = asRecord(body)
+  return Array.isArray(record?.data)
+    ? record.data.flatMap((item) => {
+      const normalized = normalizeStoredQueuedMessage(item)
+      return normalized ? [normalized] : []
+    })
+    : []
+}
+
+export async function removeQueuedThreadMessage(threadId: string, messageId: string): Promise<StoredQueuedMessage[]> {
+  return await mutateThreadQueue('/remove', { threadId, messageId })
+}
+
+export async function reorderQueuedThreadMessage(
+  threadId: string,
+  messageId: string,
+  targetId: string,
+): Promise<StoredQueuedMessage[]> {
+  return await mutateThreadQueue('/reorder', { threadId, messageId, targetId })
 }
 
 export async function createWorktree(sourceCwd: string, baseBranch?: string): Promise<WorktreeCreateResult> {

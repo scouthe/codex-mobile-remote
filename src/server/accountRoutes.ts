@@ -55,6 +55,8 @@ type StoredAccountEntry = {
   quotaStatus: AccountQuotaStatus
   quotaError: string | null
   unavailableReason: AccountUnavailableReason | null
+  accountKind?: 'chatgpt' | 'codex-provider'
+  providerId?: string | null
 }
 
 type StoredAccountsState = {
@@ -158,6 +160,12 @@ function getErrorMessage(payload: unknown, fallback: string): string {
     return record.message.trim()
   }
   return fallback
+}
+
+function getErrorCode(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object' || !('code' in payload)) return null
+  const code = (payload as { code?: unknown }).code
+  return typeof code === 'string' ? code : null
 }
 
 function isPaymentRequiredErrorMessage(value: string | null): boolean {
@@ -290,6 +298,8 @@ function normalizeStoredAccountEntry(value: unknown): StoredAccountEntry | null 
     quotaError: readString(record?.quotaError),
     unavailableReason: normalizeAccountUnavailableReason(record?.unavailableReason)
       ?? (isPaymentRequiredErrorMessage(readString(record?.quotaError)) ? 'payment_required' : null),
+    accountKind: record?.accountKind === 'codex-provider' ? 'codex-provider' : 'chatgpt',
+    providerId: readString(record?.providerId),
   }
 }
 
@@ -385,6 +395,134 @@ function toPublicAccountEntry(entry: StoredAccountEntry, activeStorageId: string
   return {
     ...entry,
     isActive: entry.storageId === activeStorageId,
+  }
+}
+
+type ConfiguredCodexProvider = {
+  id: string
+  name: string
+  model: string | null
+}
+
+function stripTomlCommentForProvider(line: string): string {
+  let quote: 'single' | 'double' | null = null
+  let escaped = false
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]
+    if (quote === 'double' && escaped) {
+      escaped = false
+      continue
+    }
+    if (quote === 'double' && character === '\\') {
+      escaped = true
+      continue
+    }
+    if (character === '"' && quote !== 'single') {
+      quote = quote === 'double' ? null : 'double'
+      continue
+    }
+    if (character === "'" && quote !== 'double') {
+      quote = quote === 'single' ? null : 'single'
+      continue
+    }
+    if (character === '#' && !quote) return line.slice(0, index)
+  }
+  return line
+}
+
+function readTopLevelModelProvider(configRaw: string): string {
+  let inTopLevelTable = true
+  for (const rawLine of configRaw.split(/\r?\n/u)) {
+    const content = stripTomlCommentForProvider(rawLine).trim()
+    if (!content) continue
+    if (/^\[\[?[^\]]+\]?\]$/u.test(content)) {
+      inTopLevelTable = false
+      continue
+    }
+    if (!inTopLevelTable) continue
+    const match = content.match(/^(?:model_provider|"model_provider"|'model_provider')\s*=\s*(?:"([^"]*)"|'([^']*)')\s*$/u)
+    const provider = match?.[1] ?? match?.[2] ?? ''
+    if (provider.trim()) return provider.trim()
+  }
+  return ''
+}
+
+async function readConfiguredCodexProvider(appServer: AppServerLike): Promise<ConfiguredCodexProvider | null> {
+  try {
+    // The bridge may inject OpenRouter/Zen compatibility providers into the
+    // child process.  Only a provider explicitly selected in the user's
+    // config.toml should be represented as the local Codex account row.
+    const configPath = join(getCodexHomeDir(), 'config.toml')
+    const configRaw = await readFile(configPath, 'utf8')
+    const configuredProvider = readTopLevelModelProvider(configRaw)
+    if (!configuredProvider) return null
+
+    const payload = asRecord(await appServer.rpc('config/read', {}))
+    const config = asRecord(payload?.config)
+    const id = configuredProvider
+    const providers = asRecord(config?.model_providers)
+    const provider = asRecord(providers?.[id])
+    return {
+      id,
+      name: readString(provider?.name) ?? id,
+      model: readString(config?.model),
+    }
+  } catch {
+    return null
+  }
+}
+
+function toProviderAccountEntry(provider: ConfiguredCodexProvider): StoredAccountEntry & { isActive: boolean } {
+  const providerAccountId = `codex-provider:${provider.id}`
+  return {
+    accountId: providerAccountId,
+    storageId: providerAccountId,
+    userId: null,
+    authMode: 'codex-provider',
+    email: provider.name,
+    planType: provider.model ? `${provider.id} · ${provider.model}` : provider.id,
+    lastRefreshedAtIso: new Date().toISOString(),
+    lastActivatedAtIso: new Date().toISOString(),
+    quotaSnapshot: null,
+    quotaUpdatedAtIso: null,
+    quotaStatus: 'idle',
+    quotaError: null,
+    unavailableReason: null,
+    accountKind: 'codex-provider',
+    providerId: provider.id,
+    isActive: true,
+  }
+}
+
+async function readAccountsResponse(
+  appServer: AppServerLike,
+  state: StoredAccountsState,
+): Promise<{
+  activeAccountId: string | null
+  activeStorageId: string | null
+  accounts: Array<StoredAccountEntry & { isActive: boolean }>
+}> {
+  if (state.accounts.length > 0) {
+    return {
+      activeAccountId: state.activeAccountId,
+      activeStorageId: state.activeStorageId,
+      accounts: sortAccounts(state.accounts, state.activeStorageId).map((entry) => toPublicAccountEntry(entry, state.activeStorageId)),
+    }
+  }
+
+  // Third-party Codex providers (API key/custom base URL) do not have a
+  // ChatGPT account_id.  Expose the configured provider as a read-only row so
+  // the account panel remains useful without importing or fabricating OAuth
+  // account metadata.
+  const provider = await readConfiguredCodexProvider(appServer)
+  if (!provider) {
+    return { activeAccountId: null, activeStorageId: null, accounts: [] }
+  }
+  const entry = toProviderAccountEntry(provider)
+  return {
+    activeAccountId: entry.accountId,
+    activeStorageId: entry.storageId,
+    accounts: [entry],
   }
 }
 
@@ -1130,11 +1268,12 @@ export async function handleAccountRoutes(
 
   if (req.method === 'GET' && url.pathname === '/codex-api/accounts') {
     const state = await scheduleAccountsBackgroundRefresh()
+    const response = await readAccountsResponse(appServer, state)
     setJson(res, 200, {
       data: {
-        activeAccountId: state.activeAccountId,
-        activeStorageId: state.activeStorageId,
-        accounts: sortAccounts(state.accounts, state.activeStorageId).map((entry) => toPublicAccountEntry(entry, state.activeStorageId)),
+        activeAccountId: response.activeAccountId,
+        activeStorageId: response.activeStorageId,
+        accounts: response.accounts,
       },
     })
     return true
@@ -1145,15 +1284,38 @@ export async function handleAccountRoutes(
     const active = state.activeStorageId
       ? state.accounts.find((entry) => entry.storageId === state.activeStorageId) ?? null
       : null
-    setJson(res, 200, {
-      data: active ? toPublicAccountEntry(active, state.activeStorageId) : null,
-    })
+    if (active) {
+      setJson(res, 200, { data: toPublicAccountEntry(active, state.activeStorageId) })
+    } else {
+      const response = await readAccountsResponse(appServer, state)
+      setJson(res, 200, { data: response.accounts[0] ?? null })
+    }
     return true
   }
 
   if (req.method === 'POST' && url.pathname === '/codex-api/accounts/refresh') {
     try {
-      const imported = await importAccountFromAuthPath(getActiveAuthPath())
+      let imported: Awaited<ReturnType<typeof importAccountFromAuthPath>>
+      try {
+        imported = await importAccountFromAuthPath(getActiveAuthPath())
+      } catch (error) {
+        // API-key/custom providers commonly have no auth.json or no
+        // tokens.account_id.  Refreshing the account panel is a no-op in that
+        // mode; return the configured provider row instead of an error.
+        if (getErrorMessage(error, '') === 'missing_account_id' || getErrorCode(error) === 'ENOENT') {
+          const state = await readStoredAccountsState()
+          const response = await readAccountsResponse(appServer, state)
+          setJson(res, 200, {
+            data: {
+              activeAccountId: response.activeAccountId,
+              activeStorageId: response.activeStorageId,
+              accounts: response.accounts,
+            },
+          })
+          return true
+        }
+        throw error
+      }
 
       try {
         appServer.dispose()

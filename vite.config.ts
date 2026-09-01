@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { stat, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute } from "node:path";
+import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import pkg from "./package.json";
 
@@ -153,18 +154,28 @@ export default defineConfig({
               });
             });
 
-            wss.on("connection", (ws: WebSocket) => {
-              ws.send(
-                JSON.stringify({
-                  method: "ready",
-                  params: { ok: true },
-                  atIso: new Date().toISOString(),
-                }),
-              );
+            wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+              const requestUrl = new URL(req.url ?? "", "http://localhost");
               const unsubscribe = bridge.subscribeNotifications((notification) => {
                 if (ws.readyState !== ws.OPEN) return;
                 ws.send(JSON.stringify(notification));
               });
+
+              const afterSeq = Number.parseInt(requestUrl.searchParams.get("afterSeq") ?? "", 10);
+              if (Number.isFinite(afterSeq)) {
+                const replay = bridge.getStreamEventsSince(afterSeq);
+                for (const event of replay.events) {
+                  if (ws.readyState !== ws.OPEN) break;
+                  ws.send(JSON.stringify(event));
+                }
+              }
+              ws.send(
+                JSON.stringify({
+                  method: "ready",
+                  params: { ok: true, ...bridge.getStreamCursor() },
+                  atIso: new Date().toISOString(),
+                }),
+              );
 
               ws.on("close", unsubscribe);
               ws.on("error", unsubscribe);

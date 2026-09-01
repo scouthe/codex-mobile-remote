@@ -1,3 +1,6 @@
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
 const SANDBOX_MODES = new Set([
   'read-only',
   'workspace-write',
@@ -19,6 +22,26 @@ type AppServerRuntimeConfig = {
   approvalPolicy: CodexApprovalPolicy
   memories: boolean
 }
+
+/**
+ * Unix socket exposed by the official Codex app-server used by codexapp.
+ *
+ * The value is deliberately kept separate from the normal runtime config:
+ * codexapp connects through the official `proxy` command and does not pass
+ * local sandbox/provider overrides to the Codex process.
+ */
+export const APP_SERVER_SOCKET_ENV_KEY = 'CODEXUI_APP_SERVER_SOCKET'
+/**
+ * The official app-server command uses this transport when it is launched as
+ * a local shared service.  Keeping the command construction here makes the
+ * bootstrap path explicit and keeps it separate from the short-lived account
+ * inspection process below.
+ */
+export const OFFICIAL_APP_SERVER_LISTEN_SCHEME = 'unix://'
+const DEFAULT_SHARED_APP_SERVER_SOCKET_RELATIVE_PATH = join(
+  'app-server-control',
+  'app-server-control.sock',
+)
 
 const DEFAULT_RUNTIME_CONFIG: AppServerRuntimeConfig = {
   sandboxMode: 'danger-full-access',
@@ -65,6 +88,64 @@ export function resolveAppServerRuntimeConfig(): AppServerRuntimeConfig {
   }
 }
 
+export function resolveSharedAppServerSocket(): string | null {
+  const configuredSocketPath = process.env[APP_SERVER_SOCKET_ENV_KEY]?.trim() ?? ''
+  if (configuredSocketPath.length > 0) return configuredSocketPath
+
+  const codexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
+  return join(codexHome, DEFAULT_SHARED_APP_SERVER_SOCKET_RELATIVE_PATH)
+}
+
+export function requireSharedAppServerSocket(): string {
+  const socketPath = resolveSharedAppServerSocket()
+  if (!socketPath) {
+    throw new Error(
+      `Shared Codex app-server socket is not configured. Set ${APP_SERVER_SOCKET_ENV_KEY} `
+        + 'or pass --app-server-socket before starting codexapp.',
+    )
+  }
+  return socketPath
+}
+
+/**
+ * A configured Desktop socket is an architectural requirement, not a hint.
+ * Falling back to a second app-server would split thread state and bring back
+ * the writer-lock failures that shared mode is meant to prevent.
+ */
+export function assertSharedAppServerSocketAvailable(socketPath: string, available: boolean): void {
+  const normalizedSocketPath = socketPath.trim()
+  if (!normalizedSocketPath || available) return
+  throw new Error(
+    `Shared Codex app-server socket is unavailable: ${normalizedSocketPath}. `
+      + 'Start the official Codex app-server, then retry the request.',
+  )
+}
+
+export function buildAppServerProxyArgs(socketPath = resolveSharedAppServerSocket()): string[] | null {
+  const normalizedSocketPath = socketPath?.trim() ?? ''
+  if (!normalizedSocketPath) return null
+  return ['app-server', 'proxy', '--sock', normalizedSocketPath]
+}
+
+/**
+ * Build the official Codex app-server invocation used when the shared socket
+ * is not present yet.  `unix://` asks Codex to use its standard
+ * `$CODEX_HOME/app-server-control/app-server-control.sock` location.  A
+ * configured alternate socket is passed as an explicit Unix URL so the
+ * bootstrap process and proxy still refer to the same endpoint.
+ */
+export function buildOfficialAppServerArgs(socketPath = resolveSharedAppServerSocket()): string[] {
+  const normalizedSocketPath = socketPath?.trim() ?? ''
+  const listenUrl = normalizedSocketPath
+    ? `${OFFICIAL_APP_SERVER_LISTEN_SCHEME}${normalizedSocketPath}`
+    : OFFICIAL_APP_SERVER_LISTEN_SCHEME
+  return ['app-server', '--listen', listenUrl]
+}
+
+/**
+ * Runtime args for the short-lived account inspection process. The main
+ * bridge never calls this function; it always uses the official shared proxy.
+ */
 export function buildAppServerArgs(): string[] {
   const config = resolveAppServerRuntimeConfig()
   return [

@@ -18,9 +18,9 @@ import {
   resolveCodexCommand,
 } from '../commandResolution.js'
 import {
+  APP_SERVER_SOCKET_ENV_KEY,
   parseApprovalPolicy,
   parseSandboxMode,
-  resolveAppServerRuntimeConfig,
 } from '../server/appServerRuntimeConfig.js'
 import { createServer as createApp } from '../server/httpServer.js'
 import { generatePassword } from '../server/password.js'
@@ -502,6 +502,7 @@ async function startServer(options: {
   memories: boolean
   sandboxMode?: string
   approvalPolicy?: string
+  appServerSocket?: string
   projectPath?: string
 }) {
   const version = await readCliVersion()
@@ -524,7 +525,18 @@ async function startServer(options: {
   if (options.approvalPolicy) {
     process.env.CODEXUI_APPROVAL_POLICY = options.approvalPolicy
   }
-  const runtimeConfig = resolveAppServerRuntimeConfig()
+  if (options.appServerSocket !== undefined) {
+    const socketPath = options.appServerSocket.trim()
+    if (socketPath) {
+      process.env[APP_SERVER_SOCKET_ENV_KEY] = socketPath
+    } else {
+      delete process.env[APP_SERVER_SOCKET_ENV_KEY]
+    }
+  }
+  // The bridge uses the official shared socket. If the official app-server is
+  // not running yet, the first RPC bootstraps it and waits for the socket;
+  // keeping web startup independent lets the status page explain a failed
+  // bootstrap instead of making the whole 5900 service unavailable.
   if (options.login && !hasCodexAuth()) {
     console.log('\nCodex is not logged in. You can log in later via settings or run `codexui login`.\n')
   }
@@ -564,8 +576,7 @@ async function startServer(options: {
     '  GitHub:   https://github.com/friuns2/codexui',
     '',
     `  Bind:     http://0.0.0.0:${String(port)}`,
-    `  Codex sandbox: ${runtimeConfig.sandboxMode}`,
-    `  Approval policy: ${runtimeConfig.approvalPolicy}`,
+    '  Codex app-server: official shared proxy',
   ]
   const accessUrls = getAccessibleUrls(port)
   if (accessUrls.length > 0) {
@@ -642,6 +653,7 @@ program
   .option('--no-memories', 'disable Codex memories for spawned app-server processes')
   .option('--sandbox-mode <mode>', 'Codex sandbox mode: read-only, workspace-write, danger-full-access')
   .option('--approval-policy <policy>', 'Codex approval policy: untrusted, on-failure, on-request, never')
+  .option('--app-server-socket <path>', 'override the official Codex app-server Unix socket path')
   .action(async (
     projectPath: string | undefined,
     opts: {
@@ -653,6 +665,7 @@ program
       memories: boolean
       sandboxMode?: string
       approvalPolicy?: string
+      appServerSocket?: string
       openProject?: string
     },
   ) => {
