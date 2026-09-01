@@ -184,6 +184,35 @@ termux-wake-lock
 
 ---
 
+## Native Android Remote Client
+
+This repository also includes an optional native Android shell in [`android/`](./android/).
+It connects to the `codexapp` bridge running on your computer; Codex CLI and the
+official app-server continue to run only on that computer. The APK reuses the
+existing web UI and shared-observer protocol, so it can display the same projects,
+conversation history, task progress, queue, approvals, and user-input requests.
+
+The remote client does not install Termux, Node.js, Codex CLI, or a second
+app-server on the phone. It supports a saved HTTPS/Tailscale endpoint, secure
+credential storage, reconnect after network changes, native notifications, file
+picker, share-sheet intake, clipboard, and Android back navigation.
+
+Build a debug APK from the repository root:
+
+```bash
+pnpm install
+pnpm run build:frontend
+pnpm run build:cli
+cd android
+./gradlew assembleDebug
+```
+
+The APK is written to
+`android/app/build/outputs/apk/debug/app-debug.apk`. For setup, security notes,
+and the native bridge contract, see [`android/README.md`](./android/README.md).
+
+---
+
 ## iPhone / iPad via Tailscale Serve
 
 If you want to use codexUI from iPhone or iPad Safari, serving it over HTTPS is recommended.

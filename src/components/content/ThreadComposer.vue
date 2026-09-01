@@ -477,6 +477,8 @@ export type SubmitPayload = {
 export type ThreadComposerExposed = {
   hydrateDraft: (payload: ComposerDraftPayload) => void
   appendTextToDraft: (text: string) => void
+  /** Attach files supplied by a native share intent or another host shell. */
+  attachIncomingFiles: (files: FileList | File[]) => void
   hasUnsavedDraft: () => boolean
 }
 
@@ -1817,6 +1819,7 @@ onMounted(() => {
 defineExpose<ThreadComposerExposed>({
   hydrateDraft,
   appendTextToDraft,
+  attachIncomingFiles: (files: FileList | File[]) => attachIncomingFiles(files),
   hasUnsavedDraft: () => hasUnsavedDraft.value,
 })
 

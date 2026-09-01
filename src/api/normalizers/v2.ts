@@ -547,9 +547,22 @@ function pickThreadName(summary: Thread): string {
   return ''
 }
 
+function stripMarkdownForDisplay(text: string): string {
+  let result = text
+  result = result.replace(/\[([^\]]+)\]\([^)]*\)/gu, '$1')
+  result = result.replace(/\*\*(.+?)\*\*/gu, '$1')
+  result = result.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/gu, '$1')
+  result = result.replace(/~~(.+?)~~/gu, '$1')
+  result = result.replace(/`([^`]+)`/gu, '$1')
+  result = result.replace(/^#{1,6}\s+/gmu, '')
+  result = result.replace(/\s+/gu, ' ')
+  return result.trim()
+}
+
 function toThreadTitle(summary: Thread): string {
   const named = pickThreadName(summary)
-  return named.length > 0 ? named : 'Untitled thread'
+  if (named.length === 0) return 'Untitled thread'
+  return stripMarkdownForDisplay(named)
 }
 
 function isTurnInProgress(turn: Turn | null | undefined): boolean {

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Codex Remote</string>
+
+    <string name="setup_title">Connect to Codex</string>
+    <string name="setup_description">Enter the HTTPS address exposed by Tailscale Serve on your computer.</string>
+    <string name="server_url_label">Server address</string>
+    <string name="server_url_hint">https://my-computer.tailnet.ts.net</string>
+    <string name="password_label">codexapp password (optional)</string>
+    <string name="password_hint">Leave blank when Tailscale is trusted</string>
+    <string name="password_security_note">Saved passwords are encrypted with Android Keystore and are never added to the URL.</string>
+    <string name="allow_http_label">Allow unencrypted HTTP (private test networks only)</string>
+    <string name="connect">Connect</string>
+    <string name="clear">Clear</string>
+    <string name="cancel">Cancel</string>
+    <string name="retry">Retry connection</string>
+
+    <string name="status_connection">Connection status</string>
+    <string name="connection_dot">●</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_reconnecting">Reconnecting…</string>
+    <string name="status_connecting_short">Connecting</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_disconnected">Disconnected</string>
+    <string name="status_offline">Waiting for network</string>
+    <string name="status_loading_percent">Loading… %1$d%%</string>
+    <string name="open_connection_settings">Connection settings</string>
+
+    <string name="error_connection_title">Couldn’t connect</string>
+    <string name="error_connection">The remote Codex service could not be reached.</string>
+    <string name="error_tls_certificate">The HTTPS certificate is not trusted. Fix Tailscale Serve or the certificate on the computer; the app will not bypass TLS errors.</string>
+    <string name="error_invalid_url">Enter a full HTTP or HTTPS server address</string>
+    <string name="error_http_confirmation">Confirm that you accept unencrypted traffic</string>
+    <string name="error_save_connection">Couldn’t save connection: %1$s</string>
+    <string name="error_saved_password">The saved codexapp password was rejected. Update it or leave it blank to sign in on the page.</string>
+
+    <string name="clear_connection_title">Forget this server?</string>
+    <string name="clear_connection_message">The saved address, encrypted password, and WebView login cookies will be removed.</string>
+
+    <string name="notification_channel_name">Codex tasks</string>
+    <string name="notification_channel_description">Live task progress and approval requests from the connected computer</string>
+    <string name="notification_task_running">Codex task</string>
+    <string name="notification_task_default_detail">Open Codex Remote to view progress</string>
+    <string name="notification_stop_monitoring">Stop monitoring</string>
+    <string name="shared_file_default_name">shared-file</string>
+</resources>
