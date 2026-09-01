@@ -36,11 +36,14 @@ You run one command. It starts a local web server. You open it from your machine
 > **The main event.**
 
 ```bash
-# 🔓 Run instantly (recommended)
-npx codexapp
+# Configure the official Codex app-server socket first
+export CODEXUI_APP_SERVER_SOCKET="$HOME/.codex/app-server-control/app-server-control.sock"
+
+# 🔓 Start the shared web bridge
+npx codexapp --no-tunnel --port 5900
 
 # 🌐 Then open in browser
-# http://localhost:18923
+# http://localhost:5900
 ```
 
 By default, `codexapp` now also starts:
@@ -58,13 +61,12 @@ If you are using a provider or AI gateway that is already authenticated and do n
 npx codexapp --no-login
 ```
 
-### Reuse the Codex Desktop app-server (optional)
+### Use the official Codex app-server (required)
 
-When Codex Desktop is already running on the same Ubuntu host (for example
-through SSH), codexapp can attach to its existing app-server instead of
-starting a second one. This keeps the official Desktop process, provider
-configuration, permissions, and conversation state unchanged. The adapter
-uses the official CLI proxy command:
+This branch does not start a second app-server. It attaches to the existing
+official Codex app-server on the Ubuntu host and uses the official CLI proxy
+command, so Desktop and the web UI share provider configuration, permissions,
+conversation state, and task events:
 
 ```bash
 export CODEXUI_APP_SERVER_SOCKET="$HOME/.codex/app-server-control/app-server-control.sock"
@@ -78,20 +80,18 @@ You can use the equivalent CLI option:
 npx codexapp --app-server-socket "$HOME/.codex/app-server-control/app-server-control.sock"
 ```
 
-When a shared socket is configured but unavailable, codexapp fails closed for
-app-server requests instead of starting a second standalone app-server. This
-prevents split thread state and writer-lock conflicts while Desktop is
-restarting. The web service remains available; once Desktop recreates the
-socket, retry the request and codexapp reconnects through the proxy. Check the
-active mode with:
+The socket must be configured before starting codexapp. If it is unavailable,
+the web service remains available for diagnostics, but app-server requests
+fail closed; codexapp never starts a standalone replacement. Once the official
+socket is available again, retry the request and codexapp reconnects through
+the proxy. Check the active mode with:
 
 ```bash
 curl http://127.0.0.1:5900/codex-api/app-server/status
 ```
 
-The response reports `mode: "shared-proxy"` when the Desktop-owned server is
-being used. Do not change the Windows Desktop connection or its app-server
-startup command.
+The response reports `mode: "shared-proxy"`. Do not change the Windows Desktop
+connection or the official app-server startup command.
 
 ### Keep the web service running (Linux)
 
@@ -114,6 +114,9 @@ your local paths differ. Check or restart it with:
 systemctl --user status codexapp-5900.service
 systemctl --user restart codexapp-5900.service
 ```
+
+All launch examples below assume the official app-server socket is configured
+as shown above. This fork does not support standalone app-server startup.
 
 ### Linux 🐧
 ```bash

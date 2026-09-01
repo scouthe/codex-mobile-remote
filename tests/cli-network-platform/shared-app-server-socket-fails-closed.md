@@ -6,14 +6,17 @@
 - A running Codex Desktop-owned app-server socket for the recovery check.
 
 #### Steps
-1. Start an isolated instance on a disposable port with `--app-server-socket` set to the missing socket path.
-2. Query `/codex-api/app-server/status` and post a read-only RPC to `/codex-api/rpc`.
-3. Confirm the status reports `mode: "shared-proxy"`, `running: false`, and `socketAvailable: false`; confirm the RPC explains that the shared socket is unavailable.
-4. Confirm the isolated process has not spawned a `codex app-server` child.
-5. Stop the isolated instance, point a new disposable instance at the real Desktop socket, and query `thread/list`.
+1. Start an isolated instance on a disposable port without `--app-server-socket`.
+2. Confirm startup exits with a shared-socket configuration error before binding the web port.
+3. Start another isolated instance on a disposable port with `--app-server-socket` set to the missing socket path.
+4. Query `/codex-api/app-server/status` and post a read-only RPC to `/codex-api/rpc`.
+5. Confirm the status reports `mode: "shared-proxy"`, `running: false`, and `socketAvailable: false`; confirm the RPC explains that the shared socket is unavailable.
+6. Confirm the isolated process has not spawned a `codex app-server` child.
+7. Stop the isolated instance, point a new disposable instance at the real Desktop socket, and query `thread/list`.
 
 #### Expected Results
 - A configured but unavailable shared socket never falls back to a second standalone app-server.
+- The main bridge refuses to start without a configured shared socket.
 - The web process remains available for diagnostics and retries successfully once the Desktop socket is available again.
 - The recovery instance uses `codex app-server proxy --sock` and can read existing threads.
 

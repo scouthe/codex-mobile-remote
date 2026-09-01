@@ -21,12 +21,11 @@ type AppServerRuntimeConfig = {
 }
 
 /**
- * Optional Unix socket exposed by a Codex Desktop-owned app-server.
+ * Unix socket exposed by the official Codex app-server used by codexapp.
  *
  * The value is deliberately kept separate from the normal runtime config:
- * when it is present codexapp must connect through the official `proxy`
- * command and must not pass any local sandbox/provider overrides to the
- * Desktop process.
+ * codexapp connects through the official `proxy` command and does not pass
+ * local sandbox/provider overrides to the Codex process.
  */
 export const APP_SERVER_SOCKET_ENV_KEY = 'CODEXUI_APP_SERVER_SOCKET'
 
@@ -80,6 +79,17 @@ export function resolveSharedAppServerSocket(): string | null {
   return socketPath.length > 0 ? socketPath : null
 }
 
+export function requireSharedAppServerSocket(): string {
+  const socketPath = resolveSharedAppServerSocket()
+  if (!socketPath) {
+    throw new Error(
+      `Shared Codex app-server socket is not configured. Set ${APP_SERVER_SOCKET_ENV_KEY} `
+        + 'or pass --app-server-socket before starting codexapp.',
+    )
+  }
+  return socketPath
+}
+
 /**
  * A configured Desktop socket is an architectural requirement, not a hint.
  * Falling back to a second app-server would split thread state and bring back
@@ -100,6 +110,10 @@ export function buildAppServerProxyArgs(socketPath = resolveSharedAppServerSocke
   return ['app-server', 'proxy', '--sock', normalizedSocketPath]
 }
 
+/**
+ * Runtime args for the short-lived account inspection process. The main
+ * bridge never calls this function; it always uses the official shared proxy.
+ */
 export function buildAppServerArgs(): string[] {
   const config = resolveAppServerRuntimeConfig()
   return [

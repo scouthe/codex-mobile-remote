@@ -16,8 +16,8 @@ import WebSocket from 'ws'
 import { handleAccountRoutes } from './accountRoutes.js'
 import {
   assertSharedAppServerSocketAvailable,
-  buildAppServerArgs,
   buildAppServerProxyArgs,
+  requireSharedAppServerSocket,
   resolveSharedAppServerSocket,
 } from './appServerRuntimeConfig.js'
 import { callRpcWithRateLimitDecodeRecovery } from './rateLimitDecodeRecovery.js'
@@ -36,9 +36,6 @@ import {
   OPENCODE_ZEN_PROVIDER_ID,
   createDefaultOpenCodeZenFreeModeState,
   filterOpenCodeZenModelsForAuthState,
-  getFreeModeConfigArgs,
-  getFreeModeEnvVars,
-  getProviderCompatibilityConfigArgs,
   shouldMarkOpenRouterKeyAsCustom,
   shouldCreateDefaultFreeModeStateForMissingAuth,
   shouldSuppressCommunityFreeModeForCodexAuth,
@@ -7669,7 +7666,7 @@ const MERGEABLE_ITEM_TYPES = new Set([
 // interrupting an active turn.
 const IDLE_WRITER_RELEASE_DELAY_MS = 1200
 
-type AppServerLaunchMode = 'standalone' | 'shared-proxy'
+type AppServerLaunchMode = 'shared-proxy'
 
 function isUsableAppServerSocket(socketPath: string): boolean {
   try {
@@ -7726,7 +7723,6 @@ export class AppServerProcess {
   private processGeneration = 0
   private initialized = false
   private initializePromise: Promise<void> | null = null
-  private readBuffer = ''
   private nextId = 1
   private stopping = false
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>()
@@ -7750,7 +7746,7 @@ export class AppServerProcess {
   private readonly sessionActivityReader = new ThreadSessionActivityReader()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
   private activeConfigSignature = ''
-  private activeLaunchMode: AppServerLaunchMode = 'standalone'
+  private activeLaunchMode: AppServerLaunchMode = 'shared-proxy'
   private readonly activeTurnThreadIds = new Set<string>()
   private idleWriterReleaseTimer: ReturnType<typeof setTimeout> | null = null
   private sharedWebSocket: WebSocket | null = null
@@ -7771,48 +7767,20 @@ export class AppServerProcess {
     launchMode: AppServerLaunchMode
     sharedSocketPath: string | null
   } {
-    const configuredSocketPath = resolveSharedAppServerSocket()
-    if (configuredSocketPath) {
-      const socketAvailable = isUsableAppServerSocket(configuredSocketPath)
-      if (socketAvailable) {
-        const proxyArgs = buildAppServerProxyArgs(configuredSocketPath)
-        if (proxyArgs) {
-          return {
-            args: proxyArgs,
-            env: {},
-            launchMode: 'shared-proxy',
-            sharedSocketPath: configuredSocketPath,
-          }
-        }
-      }
-
-      // A configured shared socket is an invariant.  Do not silently create
-      // a second app-server while Desktop is restarting: that would split the
-      // thread state and reintroduce writer-lock conflicts.  The web server
-      // remains available, and the next request retries this check after the
-      // Desktop socket is recreated.
-      assertSharedAppServerSocketAvailable(configuredSocketPath, socketAvailable)
-    }
-
-    const args = buildAppServerArgs()
-    let extraEnv: Record<string, string> = {}
-    const serverPort = parseInt(process.env.CODEXUI_SERVER_PORT ?? '', 10) || undefined
-    args.push(...getProviderCompatibilityConfigArgs(serverPort))
-    const statePath = join(getCodexHomeDir(), FREE_MODE_STATE_FILE)
-    try {
-      const state = ensureDefaultFreeModeStateForMissingAuthSync(statePath)
-      if (state) {
-        args.push(...getFreeModeConfigArgs(state, serverPort))
-        extraEnv = getFreeModeEnvVars(state)
-      }
-    } catch {
-      // No free-mode state or invalid — use defaults
+    const configuredSocketPath = requireSharedAppServerSocket()
+    const socketAvailable = isUsableAppServerSocket(configuredSocketPath)
+    // A configured shared socket is an invariant.  Do not silently create a
+    // second app-server while the official service is restarting.
+    assertSharedAppServerSocketAvailable(configuredSocketPath, socketAvailable)
+    const proxyArgs = buildAppServerProxyArgs(configuredSocketPath)
+    if (!proxyArgs) {
+      throw new Error(`Could not build Codex app-server proxy command for ${configuredSocketPath}.`)
     }
     return {
-      args,
-      env: extraEnv,
-      launchMode: 'standalone',
-      sharedSocketPath: null,
+      args: proxyArgs,
+      env: {},
+      launchMode: 'shared-proxy',
+      sharedSocketPath: configuredSocketPath,
     }
   }
 
@@ -7865,35 +7833,14 @@ export class AppServerProcess {
     this.activeConfigSignature = this.getAppServerConfigSignature(config)
     this.activeLaunchMode = config.launchMode
     const invocation = getSpawnInvocation(this.getCodexCommand(), config.args)
-    if (config.launchMode === 'shared-proxy') {
-      console.info(`[app-server] Using Desktop-owned app-server via ${config.sharedSocketPath}`)
-    }
+    console.info(`[app-server] Using official Codex app-server via ${config.sharedSocketPath}`)
     const spawnEnv = Object.keys(config.env).length > 0
       ? { ...process.env, ...config.env }
       : undefined
     const proc = spawn(invocation.command, invocation.args, { stdio: ['pipe', 'pipe', 'pipe'], ...(spawnEnv ? { env: spawnEnv } : {}) })
     this.process = proc
 
-    if (config.launchMode === 'shared-proxy' && config.sharedSocketPath) {
-      this.connectSharedProxy(proc)
-    } else {
-      proc.stdout.setEncoding('utf8')
-      proc.stdout.on('data', (chunk: string) => {
-        this.readBuffer += chunk
-
-        let lineEnd = this.readBuffer.indexOf('\n')
-        while (lineEnd !== -1) {
-          const line = this.readBuffer.slice(0, lineEnd).trim()
-          this.readBuffer = this.readBuffer.slice(lineEnd + 1)
-
-          if (line.length > 0) {
-            this.handleLine(line)
-          }
-
-          lineEnd = this.readBuffer.indexOf('\n')
-        }
-      })
-    }
+    this.connectSharedProxy(proc)
 
     proc.stderr.setEncoding('utf8')
     proc.stderr.on('data', () => {
@@ -7920,7 +7867,6 @@ export class AppServerProcess {
       this.processGeneration += 1
       this.initialized = false
       this.initializePromise = null
-      this.readBuffer = ''
     })
   }
 
@@ -7983,15 +7929,10 @@ export class AppServerProcess {
       throw new Error('codex app-server is not running')
     }
 
-    if (this.activeLaunchMode === 'shared-proxy') {
-      if (!this.sharedWebSocket || this.sharedWebSocket.readyState !== WebSocket.OPEN) {
-        throw new Error('shared codex app-server proxy is not connected')
-      }
-      this.sharedWebSocket.send(JSON.stringify(payload))
-      return
+    if (!this.sharedWebSocket || this.sharedWebSocket.readyState !== WebSocket.OPEN) {
+      throw new Error('shared codex app-server proxy is not connected')
     }
-
-    this.process.stdin.write(`${JSON.stringify(payload)}\n`)
+    this.sharedWebSocket.send(JSON.stringify(payload))
   }
 
   private handleLine(line: string): void {
@@ -8494,14 +8435,10 @@ export class AppServerProcess {
     const configuredSocketPath = resolveSharedAppServerSocket()
     const socketAvailable = configuredSocketPath ? isUsableAppServerSocket(configuredSocketPath) : false
     return {
-      // Before the first RPC the bridge has not spawned a transport yet, but
-      // report the configured launch mode so a missing shared socket is not
-      // mistaken for an intentional standalone fallback.
-      mode: this.process
-        ? this.activeLaunchMode
-        : configuredSocketPath
-          ? 'shared-proxy'
-          : 'standalone',
+      // The bridge has one launch mode now: the official shared proxy. Keep
+      // socket fields separate so callers can distinguish an unconfigured or
+      // unavailable socket from a healthy connection.
+      mode: this.activeLaunchMode,
       running: this.process !== null,
       configuredSocketPath,
       socketAvailable,
@@ -8580,8 +8517,7 @@ export class AppServerProcess {
     this.initialized = false
     this.initializePromise = null
     this.activeConfigSignature = ''
-    this.activeLaunchMode = 'standalone'
-    this.readBuffer = ''
+    this.activeLaunchMode = 'shared-proxy'
 
     if (sharedWebSocket && sharedWebSocket.readyState !== WebSocket.CLOSED) {
       sharedWebSocket.terminate()

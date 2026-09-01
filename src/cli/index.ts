@@ -21,7 +21,7 @@ import {
   APP_SERVER_SOCKET_ENV_KEY,
   parseApprovalPolicy,
   parseSandboxMode,
-  resolveAppServerRuntimeConfig,
+  requireSharedAppServerSocket,
 } from '../server/appServerRuntimeConfig.js'
 import { createServer as createApp } from '../server/httpServer.js'
 import { generatePassword } from '../server/password.js'
@@ -534,7 +534,10 @@ async function startServer(options: {
       delete process.env[APP_SERVER_SOCKET_ENV_KEY]
     }
   }
-  const runtimeConfig = resolveAppServerRuntimeConfig()
+  // This remote bridge is intentionally shared-only. Fail before binding the
+  // web port when no official Codex app-server socket was configured, rather
+  // than exposing a page that could never execute a request.
+  requireSharedAppServerSocket()
   if (options.login && !hasCodexAuth()) {
     console.log('\nCodex is not logged in. You can log in later via settings or run `codexui login`.\n')
   }
@@ -574,8 +577,7 @@ async function startServer(options: {
     '  GitHub:   https://github.com/friuns2/codexui',
     '',
     `  Bind:     http://0.0.0.0:${String(port)}`,
-    `  Codex sandbox: ${runtimeConfig.sandboxMode}`,
-    `  Approval policy: ${runtimeConfig.approvalPolicy}`,
+    '  Codex app-server: official shared proxy',
   ]
   const accessUrls = getAccessibleUrls(port)
   if (accessUrls.length > 0) {
@@ -652,7 +654,7 @@ program
   .option('--no-memories', 'disable Codex memories for spawned app-server processes')
   .option('--sandbox-mode <mode>', 'Codex sandbox mode: read-only, workspace-write, danger-full-access')
   .option('--approval-policy <policy>', 'Codex approval policy: untrusted, on-failure, on-request, never')
-  .option('--app-server-socket <path>', 'connect through an existing Codex app-server Unix socket')
+  .option('--app-server-socket <path>', 'required: connect through the official Codex app-server Unix socket')
   .action(async (
     projectPath: string | undefined,
     opts: {
