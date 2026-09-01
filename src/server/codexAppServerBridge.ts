@@ -1,12 +1,12 @@
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes, open } from 'node:fs/promises'
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import { homedir } from 'node:os'
-import { tmpdir } from 'node:os'
+import { createConnection as createNetConnection } from 'node:net'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
@@ -17,6 +17,7 @@ import { handleAccountRoutes } from './accountRoutes.js'
 import {
   assertSharedAppServerSocketAvailable,
   buildAppServerProxyArgs,
+  buildOfficialAppServerArgs,
   requireSharedAppServerSocket,
   resolveSharedAppServerSocket,
 } from './appServerRuntimeConfig.js'
@@ -7668,12 +7669,42 @@ const IDLE_WRITER_RELEASE_DELAY_MS = 1200
 
 type AppServerLaunchMode = 'shared-proxy'
 
+const OFFICIAL_APP_SERVER_STARTUP_TIMEOUT_MS = 15_000
+const OFFICIAL_APP_SERVER_STARTUP_POLL_INTERVAL_MS = 100
+
 function isUsableAppServerSocket(socketPath: string): boolean {
   try {
     return statSync(socketPath).isSocket()
   } catch {
     return false
   }
+}
+
+function isRunningChild(child: ChildProcess | null): child is ChildProcess {
+  return child !== null && child.exitCode === null && child.signalCode === null
+}
+
+/**
+ * A Unix socket file can outlive an app-server that was killed abruptly.  A
+ * cheap connect probe distinguishes that stale path from a listening
+ * official service before we decide that no bootstrap is needed.
+ */
+async function isReachableAppServerSocket(socketPath: string): Promise<boolean> {
+  if (!isUsableAppServerSocket(socketPath)) return false
+
+  return await new Promise<boolean>((resolve) => {
+    let settled = false
+    const socket = createNetConnection({ path: socketPath })
+    const finish = (reachable: boolean) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(reachable)
+    }
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+    socket.setTimeout(500, () => finish(false))
+  })
 }
 
 /**
@@ -7720,6 +7751,15 @@ function createProxyProcessDuplex(child: ChildProcessWithoutNullStreams): Duplex
 
 export class AppServerProcess {
   private process: ChildProcessWithoutNullStreams | null = null
+  /**
+   * The official server is deliberately separate from the proxy child.  It
+   * is a long-lived shared service and must survive a codexapp restart so
+   * Desktop and other official clients keep their session and writer state.
+   */
+  private officialAppServerProcess: ChildProcess | null = null
+  private officialAppServerStartPromise: Promise<void> | null = null
+  private officialAppServerSocketProbePromise: Promise<boolean> | null = null
+  private officialAppServerLaunchError: Error | null = null
   private processGeneration = 0
   private initialized = false
   private initializePromise: Promise<void> | null = null
@@ -7782,6 +7822,134 @@ export class AppServerProcess {
       launchMode: 'shared-proxy',
       sharedSocketPath: configuredSocketPath,
     }
+  }
+
+  private async ensureOfficialAppServer(): Promise<void> {
+    const socketPath = requireSharedAppServerSocket()
+    // Once this bridge has a live proxy, or we own a running official child,
+    // the socket was already validated.  Avoid opening an extra Unix probe on
+    // every thread/list poll; a broken proxy will be noticed by its close
+    // handler and the next request will re-enter bootstrap detection.
+    if (isUsableAppServerSocket(socketPath) && (
+      isRunningChild(this.process)
+      || isRunningChild(this.officialAppServerProcess)
+    )) return
+
+    const socketReachable = await this.probeOfficialAppServerSocket(socketPath)
+    if (socketReachable) return
+
+    if (this.officialAppServerStartPromise) {
+      await this.officialAppServerStartPromise
+      return
+    }
+
+    const existingProcess = this.officialAppServerProcess
+    if (isRunningChild(existingProcess)) {
+      await this.waitForOfficialAppServerSocket(socketPath, existingProcess)
+      return
+    }
+
+    const startup = this.startOfficialAppServer(socketPath)
+      .finally(() => {
+        if (this.officialAppServerStartPromise === startup) {
+          this.officialAppServerStartPromise = null
+        }
+      })
+    this.officialAppServerStartPromise = startup
+    await startup
+  }
+
+  private async probeOfficialAppServerSocket(socketPath: string): Promise<boolean> {
+    if (!this.officialAppServerSocketProbePromise) {
+      const probe = isReachableAppServerSocket(socketPath).finally(() => {
+        if (this.officialAppServerSocketProbePromise === probe) {
+          this.officialAppServerSocketProbePromise = null
+        }
+      })
+      this.officialAppServerSocketProbePromise = probe
+    }
+    return await this.officialAppServerSocketProbePromise
+  }
+
+  private async startOfficialAppServer(socketPath: string): Promise<void> {
+    // A second request can observe the missing socket between the first
+    // check and this call.  Re-check immediately before spawning to avoid
+    // racing an already-starting Desktop/daemon process.
+    if (await isReachableAppServerSocket(socketPath)) return
+
+    const invocation = getSpawnInvocation(
+      this.getCodexCommand(),
+      buildOfficialAppServerArgs(socketPath),
+    )
+    console.info(`[app-server] Official socket unavailable; starting Codex app-server via ${socketPath}`)
+
+    const child = spawn(invocation.command, invocation.args, {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: process.env,
+    })
+    this.officialAppServerProcess = child
+    this.officialAppServerLaunchError = null
+
+    let stderrTail = ''
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', (chunk: string) => {
+      stderrTail = `${stderrTail}${chunk}`.slice(-4_000)
+    })
+    child.once('error', (error) => {
+      if (this.officialAppServerProcess === child) {
+        this.officialAppServerLaunchError = error instanceof Error ? error : new Error(String(error))
+      }
+    })
+    child.once('exit', () => {
+      if (this.officialAppServerProcess !== child) return
+      this.officialAppServerProcess = null
+    })
+
+    try {
+      await this.waitForOfficialAppServerSocket(socketPath, child, () => stderrTail)
+    } catch (error) {
+      // Do not leave a failed bootstrap process behind.  A successful
+      // bootstrap is intentionally not terminated by `dispose()`.
+      if (child.exitCode === null && child.signalCode === null) {
+        try {
+          child.kill('SIGTERM')
+        } catch {
+          // The child may have exited between the state check and kill.
+        }
+      }
+      throw error
+    }
+  }
+
+  private async waitForOfficialAppServerSocket(
+    socketPath: string,
+    child: ChildProcess,
+    readStderr?: () => string,
+  ): Promise<void> {
+    const deadline = Date.now() + OFFICIAL_APP_SERVER_STARTUP_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      if (await isReachableAppServerSocket(socketPath)) return
+
+      if (this.officialAppServerLaunchError) {
+        throw new Error(`Failed to start the official Codex app-server: ${this.officialAppServerLaunchError.message}`)
+      }
+
+      if (child.exitCode !== null || child.signalCode !== null) {
+        const details = readStderr?.().trim()
+        throw new Error(
+          `The official Codex app-server exited before creating ${socketPath}`
+            + (details ? `: ${details}` : '.'),
+        )
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, OFFICIAL_APP_SERVER_STARTUP_POLL_INTERVAL_MS))
+    }
+
+    const details = readStderr?.().trim()
+    throw new Error(
+      `Timed out waiting for the official Codex app-server socket ${socketPath}`
+        + (details ? `: ${details}` : '.'),
+    )
   }
 
   private getAppServerConfigSignature(config: {
@@ -8334,6 +8502,7 @@ export class AppServerProcess {
   }
 
   private async call(method: string, params: unknown): Promise<unknown> {
+    await this.ensureOfficialAppServer()
     this.start()
     if (this.sharedTransportReadyPromise) {
       await this.sharedTransportReadyPromise
@@ -8392,6 +8561,7 @@ export class AppServerProcess {
       || method.endsWith('/read')
       || method === 'config/read'
     if (!isReadOnlyRpc) this.cancelIdleWriterRelease()
+    await this.ensureOfficialAppServer()
     this.disposeIfConfigChanged()
     await this.ensureInitialized()
     const result = await this.call(method, params)
@@ -8431,6 +8601,8 @@ export class AppServerProcess {
     running: boolean
     configuredSocketPath: string | null
     socketAvailable: boolean
+    officialServerStarting: boolean
+    officialServerManaged: boolean
   } {
     const configuredSocketPath = resolveSharedAppServerSocket()
     const socketAvailable = configuredSocketPath ? isUsableAppServerSocket(configuredSocketPath) : false
@@ -8442,6 +8614,9 @@ export class AppServerProcess {
       running: this.process !== null,
       configuredSocketPath,
       socketAvailable,
+      officialServerStarting: this.officialAppServerStartPromise !== null,
+      officialServerManaged: this.officialAppServerProcess !== null
+        && isRunningChild(this.officialAppServerProcess),
     }
   }
 

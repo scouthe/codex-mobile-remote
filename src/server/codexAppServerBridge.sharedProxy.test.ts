@@ -33,6 +33,8 @@ describe('shared app-server launch guard', () => {
       mode: 'shared-proxy',
       running: false,
       socketAvailable: false,
+      officialServerStarting: false,
+      officialServerManaged: false,
     })
     expect(() => buildConfig(appServer)).toThrow(
       /Shared Codex app-server socket is unavailable/u,

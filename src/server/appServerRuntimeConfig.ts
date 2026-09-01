@@ -31,6 +31,13 @@ type AppServerRuntimeConfig = {
  * local sandbox/provider overrides to the Codex process.
  */
 export const APP_SERVER_SOCKET_ENV_KEY = 'CODEXUI_APP_SERVER_SOCKET'
+/**
+ * The official app-server command uses this transport when it is launched as
+ * a local shared service.  Keeping the command construction here makes the
+ * bootstrap path explicit and keeps it separate from the short-lived account
+ * inspection process below.
+ */
+export const OFFICIAL_APP_SERVER_LISTEN_SCHEME = 'unix://'
 const DEFAULT_SHARED_APP_SERVER_SOCKET_RELATIVE_PATH = join(
   'app-server-control',
   'app-server-control.sock',
@@ -110,7 +117,7 @@ export function assertSharedAppServerSocketAvailable(socketPath: string, availab
   if (!normalizedSocketPath || available) return
   throw new Error(
     `Shared Codex app-server socket is unavailable: ${normalizedSocketPath}. `
-      + 'Start or reconnect Codex Desktop, then retry the request.',
+      + 'Start the official Codex app-server, then retry the request.',
   )
 }
 
@@ -118,6 +125,21 @@ export function buildAppServerProxyArgs(socketPath = resolveSharedAppServerSocke
   const normalizedSocketPath = socketPath?.trim() ?? ''
   if (!normalizedSocketPath) return null
   return ['app-server', 'proxy', '--sock', normalizedSocketPath]
+}
+
+/**
+ * Build the official Codex app-server invocation used when the shared socket
+ * is not present yet.  `unix://` asks Codex to use its standard
+ * `$CODEX_HOME/app-server-control/app-server-control.sock` location.  A
+ * configured alternate socket is passed as an explicit Unix URL so the
+ * bootstrap process and proxy still refer to the same endpoint.
+ */
+export function buildOfficialAppServerArgs(socketPath = resolveSharedAppServerSocket()): string[] {
+  const normalizedSocketPath = socketPath?.trim() ?? ''
+  const listenUrl = normalizedSocketPath
+    ? `${OFFICIAL_APP_SERVER_LISTEN_SCHEME}${normalizedSocketPath}`
+    : OFFICIAL_APP_SERVER_LISTEN_SCHEME
+  return ['app-server', '--listen', listenUrl]
 }
 
 /**
