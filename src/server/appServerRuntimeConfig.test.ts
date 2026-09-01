@@ -3,6 +3,7 @@ import {
   APP_SERVER_SOCKET_ENV_KEY,
   buildAppServerArgs,
   buildAppServerProxyArgs,
+  requireSharedAppServerSocket,
   resolveSharedAppServerSocket,
 } from './appServerRuntimeConfig'
 
@@ -45,9 +46,16 @@ describe('app-server runtime config', () => {
     }
   })
 
-  it('keeps the legacy launch path when no shared socket is configured', () => {
+  it('leaves proxy args unset when no shared socket is configured', () => {
     delete process.env[APP_SERVER_SOCKET_ENV_KEY]
     expect(resolveSharedAppServerSocket()).toBeNull()
     expect(buildAppServerProxyArgs()).toBeNull()
+  })
+
+  it('requires a shared socket for the main Codex bridge', () => {
+    delete process.env[APP_SERVER_SOCKET_ENV_KEY]
+    expect(() => requireSharedAppServerSocket()).toThrow(
+      /Shared Codex app-server socket is not configured/u,
+    )
   })
 })

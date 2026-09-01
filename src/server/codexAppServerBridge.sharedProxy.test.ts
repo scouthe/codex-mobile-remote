@@ -3,12 +3,12 @@ import { AppServerProcess } from './codexAppServerBridge.js'
 import { APP_SERVER_SOCKET_ENV_KEY } from './appServerRuntimeConfig.js'
 
 const buildConfig = (appServer: AppServerProcess): {
-  launchMode: 'standalone' | 'shared-proxy'
+  launchMode: 'shared-proxy'
   sharedSocketPath: string | null
 } => (
   appServer as unknown as {
     buildAppServerConfig: () => {
-      launchMode: 'standalone' | 'shared-proxy'
+      launchMode: 'shared-proxy'
       sharedSocketPath: string | null
     }
   }
@@ -36,13 +36,12 @@ describe('shared app-server launch guard', () => {
     )
   })
 
-  it('keeps standalone mode when no shared socket is configured', () => {
+  it('requires the shared socket instead of starting a standalone app-server', () => {
     delete process.env[APP_SERVER_SOCKET_ENV_KEY]
     const appServer = new AppServerProcess()
 
-    expect(buildConfig(appServer)).toMatchObject({
-      launchMode: 'standalone',
-      sharedSocketPath: null,
-    })
+    expect(() => buildConfig(appServer)).toThrow(
+      /Shared Codex app-server socket is not configured/u,
+    )
   })
 })
