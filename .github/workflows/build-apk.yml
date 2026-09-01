@@ -1,8 +1,6 @@
 name: Build Android remote client
 
 on:
-  push:
-    branches: [main, android-remote-client]
   workflow_dispatch:
 
 permissions:
