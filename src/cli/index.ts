@@ -18,6 +18,7 @@ import {
   resolveCodexCommand,
 } from '../commandResolution.js'
 import {
+  APP_SERVER_SOCKET_ENV_KEY,
   parseApprovalPolicy,
   parseSandboxMode,
   resolveAppServerRuntimeConfig,
@@ -502,6 +503,7 @@ async function startServer(options: {
   memories: boolean
   sandboxMode?: string
   approvalPolicy?: string
+  appServerSocket?: string
   projectPath?: string
 }) {
   const version = await readCliVersion()
@@ -523,6 +525,14 @@ async function startServer(options: {
   }
   if (options.approvalPolicy) {
     process.env.CODEXUI_APPROVAL_POLICY = options.approvalPolicy
+  }
+  if (options.appServerSocket !== undefined) {
+    const socketPath = options.appServerSocket.trim()
+    if (socketPath) {
+      process.env[APP_SERVER_SOCKET_ENV_KEY] = socketPath
+    } else {
+      delete process.env[APP_SERVER_SOCKET_ENV_KEY]
+    }
   }
   const runtimeConfig = resolveAppServerRuntimeConfig()
   if (options.login && !hasCodexAuth()) {
@@ -642,6 +652,7 @@ program
   .option('--no-memories', 'disable Codex memories for spawned app-server processes')
   .option('--sandbox-mode <mode>', 'Codex sandbox mode: read-only, workspace-write, danger-full-access')
   .option('--approval-policy <policy>', 'Codex approval policy: untrusted, on-failure, on-request, never')
+  .option('--app-server-socket <path>', 'connect through an existing Codex app-server Unix socket')
   .action(async (
     projectPath: string | undefined,
     opts: {
@@ -653,6 +664,7 @@ program
       memories: boolean
       sandboxMode?: string
       approvalPolicy?: string
+      appServerSocket?: string
       openProject?: string
     },
   ) => {

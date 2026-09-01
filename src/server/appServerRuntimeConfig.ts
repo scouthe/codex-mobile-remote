@@ -20,6 +20,16 @@ type AppServerRuntimeConfig = {
   memories: boolean
 }
 
+/**
+ * Optional Unix socket exposed by a Codex Desktop-owned app-server.
+ *
+ * The value is deliberately kept separate from the normal runtime config:
+ * when it is present codexapp must connect through the official `proxy`
+ * command and must not pass any local sandbox/provider overrides to the
+ * Desktop process.
+ */
+export const APP_SERVER_SOCKET_ENV_KEY = 'CODEXUI_APP_SERVER_SOCKET'
+
 const DEFAULT_RUNTIME_CONFIG: AppServerRuntimeConfig = {
   sandboxMode: 'danger-full-access',
   approvalPolicy: 'never',
@@ -63,6 +73,17 @@ export function resolveAppServerRuntimeConfig(): AppServerRuntimeConfig {
     approvalPolicy: readApprovalPolicyFromEnv(),
     memories: readMemoriesFromEnv(),
   }
+}
+
+export function resolveSharedAppServerSocket(): string | null {
+  const socketPath = process.env[APP_SERVER_SOCKET_ENV_KEY]?.trim() ?? ''
+  return socketPath.length > 0 ? socketPath : null
+}
+
+export function buildAppServerProxyArgs(socketPath = resolveSharedAppServerSocket()): string[] | null {
+  const normalizedSocketPath = socketPath?.trim() ?? ''
+  if (!normalizedSocketPath) return null
+  return ['app-server', 'proxy', '--sock', normalizedSocketPath]
 }
 
 export function buildAppServerArgs(): string[] {

@@ -58,6 +58,38 @@ If you are using a provider or AI gateway that is already authenticated and do n
 npx codexapp --no-login
 ```
 
+### Reuse the Codex Desktop app-server (optional)
+
+When Codex Desktop is already running on the same Ubuntu host (for example
+through SSH), codexapp can attach to its existing app-server instead of
+starting a second one. This keeps the official Desktop process, provider
+configuration, permissions, and conversation state unchanged. The adapter
+uses the official CLI proxy command:
+
+```bash
+export CODEXUI_APP_SERVER_SOCKET="$HOME/.codex/app-server-control/app-server-control.sock"
+npx codexapp --no-tunnel --port 5900
+```
+
+The socket must already exist and be readable by the user running codexapp.
+You can use the equivalent CLI option:
+
+```bash
+npx codexapp --app-server-socket "$HOME/.codex/app-server-control/app-server-control.sock"
+```
+
+If the socket is unavailable, codexapp falls back to its existing standalone
+app-server launch path and logs a warning. Once Desktop recreates the socket,
+the next request reconnects through the proxy. Check the active mode with:
+
+```bash
+curl http://127.0.0.1:5900/codex-api/app-server/status
+```
+
+The response reports `mode: "shared-proxy"` when the Desktop-owned server is
+being used. Do not change the Windows Desktop connection or its app-server
+startup command.
+
 ### Linux 🐧
 ```bash
 node -v   # should be 18+
