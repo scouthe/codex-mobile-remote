@@ -2,6 +2,7 @@ import { computed, ref } from 'vue'
 import {
 
   archiveThread,
+  clearThreadGoal,
   forkThread,
   getAvailableCollaborationModes,
   getAccountRateLimits,
@@ -12,6 +13,7 @@ import {
   getSkillsList,
   getThreadDetail,
   getThreadFastDetail,
+  getThreadGoal,
   getThreadLiveState,
   getOlderThreadMessages,
   getBackgroundThreadListLimit,
@@ -27,6 +29,7 @@ import {
   reorderQueuedThreadMessage,
   getWorkspaceRootsState,
   setCodexSpeedMode,
+  setThreadGoal,
   setWorkspaceRootsState,
   getThreadTitleCache,
   persistThreadTitle,
@@ -41,6 +44,7 @@ import {
   type ThreadLiveState,
   type WorkspaceRootsState,
 } from '../api/codexGateway'
+import type { ThreadGoal, ThreadGoalStatus } from '../api/appServerDtos'
 import { CodexApiError } from '../api/codexErrors'
 import { normalizeFileChangeStatus, toUiFileChanges } from '../api/normalizers/v2'
 import type {
@@ -101,6 +105,7 @@ const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
+const RECENT_THREAD_GOAL_LOAD_REUSE_MS = 2000
 const THREAD_STATUS_POLL_INTERVAL_MS = 1500
 const FAST_THREAD_BACKGROUND_HYDRATION_DELAY_MS = 300
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
@@ -116,6 +121,14 @@ const ACTIVE_TASK_STATES = new Set<TaskSnapshot['state']>([
   'waiting_approval',
   'waiting_user_input',
   'steering',
+])
+const THREAD_GOAL_STATUSES = new Set<ThreadGoalStatus>([
+  'active',
+  'paused',
+  'blocked',
+  'usageLimited',
+  'budgetLimited',
+  'complete',
 ])
 type SelectThreadResult = 'ok' | 'not-found' | 'error'
 
@@ -1532,6 +1545,10 @@ export function useDesktopState() {
   const threadTokenUsageByThreadId = ref<Record<string, UiThreadTokenUsage>>(loadThreadTokenUsageMap())
   const terminalOpenByThreadId = ref<Record<string, boolean>>(loadThreadTerminalOpenMap())
   const threadModelProviderByThreadId = ref<Record<string, string>>({})
+  const threadGoalByThreadId = ref<Record<string, ThreadGoal | null>>({})
+  const threadGoalLoadingByThreadId = ref<Record<string, boolean>>({})
+  const threadGoalErrorByThreadId = ref<Record<string, string>>({})
+  const isThreadGoalSupported = ref(true)
 
   const threadTitleById = ref<Record<string, string>>({})
 
@@ -1624,6 +1641,9 @@ export function useDesktopState() {
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
   const fallbackRetryInFlightThreadIds = new Set<string>()
+  const threadGoalLoadPromiseByThreadId = new Map<string, Promise<void>>()
+  const threadGoalMutationVersionByThreadId = new Map<string, number>()
+  const lastThreadGoalLoadAtByThreadId = new Map<string, number>()
 
 
   const allThreads = computed(() => flattenThreads(projectGroups.value))
@@ -1654,6 +1674,209 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     return threadId ? taskSnapshotsByThreadId.value[threadId] ?? null : null
   })
+  const selectedThreadGoal = computed<ThreadGoal | null>(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? threadGoalByThreadId.value[threadId] ?? null : null
+  })
+  const isSelectedThreadGoalLoading = computed(() => {
+    const threadId = selectedThreadId.value
+    return Boolean(threadId && threadGoalLoadingByThreadId.value[threadId])
+  })
+  const selectedThreadGoalError = computed(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? threadGoalErrorByThreadId.value[threadId] ?? '' : ''
+  })
+
+  function nextThreadGoalMutationVersion(threadId: string): number {
+    const nextVersion = (threadGoalMutationVersionByThreadId.get(threadId) ?? 0) + 1
+    threadGoalMutationVersionByThreadId.set(threadId, nextVersion)
+    return nextVersion
+  }
+
+  function setThreadGoalLoading(threadId: string, loading: boolean): void {
+    if (loading) {
+      threadGoalLoadingByThreadId.value = {
+        ...threadGoalLoadingByThreadId.value,
+        [threadId]: true,
+      }
+      return
+    }
+    threadGoalLoadingByThreadId.value = omitKey(threadGoalLoadingByThreadId.value, threadId)
+  }
+
+  function setThreadGoalError(threadId: string, message: string): void {
+    if (message) {
+      threadGoalErrorByThreadId.value = {
+        ...threadGoalErrorByThreadId.value,
+        [threadId]: message,
+      }
+      return
+    }
+    threadGoalErrorByThreadId.value = omitKey(threadGoalErrorByThreadId.value, threadId)
+  }
+
+  function normalizeThreadGoal(value: unknown): ThreadGoal | null {
+    const row = asRecord(value)
+    const threadId = readString(row?.threadId).trim()
+    const status = readString(row?.status) as ThreadGoalStatus
+    if (!row || !threadId || !THREAD_GOAL_STATUSES.has(status)) return null
+
+    return {
+      threadId,
+      objective: readString(row.objective),
+      status,
+      tokenBudget: row.tokenBudget === null ? null : readNumber(row.tokenBudget),
+      tokensUsed: readNumber(row.tokensUsed) ?? 0,
+      timeUsedSeconds: readNumber(row.timeUsedSeconds) ?? 0,
+      createdAt: readNumber(row.createdAt) ?? 0,
+      updatedAt: readNumber(row.updatedAt) ?? 0,
+    }
+  }
+
+  function setGoalForThread(threadId: string, goal: ThreadGoal | null): void {
+    threadGoalByThreadId.value = {
+      ...threadGoalByThreadId.value,
+      [threadId]: goal,
+    }
+    setThreadGoalError(threadId, '')
+  }
+
+  function isThreadGoalUnavailableError(unknownError: unknown): boolean {
+    const message = unknownError instanceof Error ? unknownError.message : String(unknownError ?? '')
+    return /method not found|unknown method|unsupported method|thread\/goal\/(get|set|clear).*not (available|supported)/iu.test(message)
+  }
+
+  async function loadThreadGoal(threadId: string, options: { force?: boolean } = {}): Promise<void> {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId || !isThreadGoalSupported.value) return
+
+    const existingLoad = threadGoalLoadPromiseByThreadId.get(normalizedThreadId)
+    if (existingLoad) {
+      await existingLoad
+      return
+    }
+
+    const hasCachedGoal = Object.prototype.hasOwnProperty.call(threadGoalByThreadId.value, normalizedThreadId)
+    const loadedRecently = Date.now() - (lastThreadGoalLoadAtByThreadId.get(normalizedThreadId) ?? 0) < RECENT_THREAD_GOAL_LOAD_REUSE_MS
+    // A reconnect can race the initial refresh (the server emits `ready` as
+    // soon as the stream attaches).  Reuse a goal read completed moments ago
+    // even for forced recovery; the stream's replay cursor will deliver any
+    // missed goal notification without creating a duplicate RPC.
+    if (hasCachedGoal && loadedRecently) return
+
+    const mutationVersion = threadGoalMutationVersionByThreadId.get(normalizedThreadId) ?? 0
+    setThreadGoalLoading(normalizedThreadId, true)
+    setThreadGoalError(normalizedThreadId, '')
+
+    const loadPromise = (async () => {
+      try {
+        const goal = await getThreadGoal(normalizedThreadId)
+        if ((threadGoalMutationVersionByThreadId.get(normalizedThreadId) ?? 0) !== mutationVersion) return
+        setGoalForThread(normalizedThreadId, goal)
+        lastThreadGoalLoadAtByThreadId.set(normalizedThreadId, Date.now())
+      } catch (unknownError) {
+        if (isThreadGoalUnavailableError(unknownError)) {
+          isThreadGoalSupported.value = false
+        }
+        setThreadGoalError(
+          normalizedThreadId,
+          unknownError instanceof Error ? unknownError.message : 'Failed to load thread goal',
+        )
+      }
+    })().finally(() => {
+      setThreadGoalLoading(normalizedThreadId, false)
+      threadGoalLoadPromiseByThreadId.delete(normalizedThreadId)
+    })
+
+    threadGoalLoadPromiseByThreadId.set(normalizedThreadId, loadPromise)
+    await loadPromise
+  }
+
+  async function updateSelectedThreadGoal(objective: string): Promise<boolean> {
+    const threadId = selectedThreadId.value.trim()
+    const normalizedObjective = objective.trim()
+    if (!threadId || !normalizedObjective || !isThreadGoalSupported.value) return false
+
+    const mutationVersion = nextThreadGoalMutationVersion(threadId)
+    setThreadGoalLoading(threadId, true)
+    setThreadGoalError(threadId, '')
+    try {
+      const goal = await setThreadGoal(threadId, normalizedObjective)
+      if ((threadGoalMutationVersionByThreadId.get(threadId) ?? 0) === mutationVersion) {
+        setGoalForThread(threadId, goal)
+        lastThreadGoalLoadAtByThreadId.set(threadId, Date.now())
+      }
+      return true
+    } catch (unknownError) {
+      if (isThreadGoalUnavailableError(unknownError)) {
+        isThreadGoalSupported.value = false
+      }
+      setThreadGoalError(
+        threadId,
+        unknownError instanceof Error ? unknownError.message : 'Failed to save thread goal',
+      )
+      return false
+    } finally {
+      setThreadGoalLoading(threadId, false)
+    }
+  }
+
+  async function clearSelectedThreadGoal(): Promise<boolean> {
+    const threadId = selectedThreadId.value.trim()
+    if (!threadId || !isThreadGoalSupported.value) return false
+
+    const mutationVersion = nextThreadGoalMutationVersion(threadId)
+    setThreadGoalLoading(threadId, true)
+    setThreadGoalError(threadId, '')
+    try {
+      await clearThreadGoal(threadId)
+      if ((threadGoalMutationVersionByThreadId.get(threadId) ?? 0) === mutationVersion) {
+        setGoalForThread(threadId, null)
+        lastThreadGoalLoadAtByThreadId.set(threadId, Date.now())
+      }
+      return true
+    } catch (unknownError) {
+      if (isThreadGoalUnavailableError(unknownError)) {
+        isThreadGoalSupported.value = false
+      }
+      setThreadGoalError(
+        threadId,
+        unknownError instanceof Error ? unknownError.message : 'Failed to clear thread goal',
+      )
+      return false
+    } finally {
+      setThreadGoalLoading(threadId, false)
+    }
+  }
+
+  function handleThreadGoalNotification(notification: RpcNotification): boolean {
+    if (notification.method === 'thread/goal/updated') {
+      const params = asRecord(notification.params)
+      const goal = normalizeThreadGoal(params?.goal)
+      const threadId = goal?.threadId || readString(params?.threadId).trim()
+      if (threadId && goal) {
+        nextThreadGoalMutationVersion(threadId)
+        setGoalForThread(threadId, goal)
+        lastThreadGoalLoadAtByThreadId.set(threadId, Date.now())
+        isThreadGoalSupported.value = true
+      }
+      return true
+    }
+
+    if (notification.method === 'thread/goal/cleared') {
+      const params = asRecord(notification.params)
+      const threadId = readString(params?.threadId).trim()
+      if (threadId) {
+        nextThreadGoalMutationVersion(threadId)
+        setGoalForThread(threadId, null)
+        lastThreadGoalLoadAtByThreadId.set(threadId, Date.now())
+        isThreadGoalSupported.value = true
+      }
+      return true
+    }
+
+    return false
+  }
 
   /**
    * Read the authoritative task lifecycle for one thread.  The legacy
@@ -2608,6 +2831,9 @@ export function useDesktopState() {
     threadListedByServerById.value = pruneThreadStateMap(threadListedByServerById.value, activeThreadIds)
     persistedUserMessageByThreadId.value = pruneThreadStateMap(persistedUserMessageByThreadId.value, activeThreadIds)
     threadModelProviderByThreadId.value = pruneThreadStateMap(threadModelProviderByThreadId.value, activeThreadIds)
+    threadGoalByThreadId.value = pruneThreadStateMap(threadGoalByThreadId.value, activeThreadIds)
+    threadGoalLoadingByThreadId.value = pruneThreadStateMap(threadGoalLoadingByThreadId.value, activeThreadIds)
+    threadGoalErrorByThreadId.value = pruneThreadStateMap(threadGoalErrorByThreadId.value, activeThreadIds)
     const nextQueuedMessages = pruneThreadStateMap(queuedMessagesByThreadId.value, activeThreadIds)
     if (nextQueuedMessages !== queuedMessagesByThreadId.value) {
       queuedMessagesByThreadId.value = nextQueuedMessages
@@ -2631,6 +2857,12 @@ export function useDesktopState() {
     }
     for (const threadId of liveStateRetryByThreadId) {
       if (!activeThreadIds.has(threadId)) liveStateRetryByThreadId.delete(threadId)
+    }
+    for (const threadId of threadGoalMutationVersionByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) threadGoalMutationVersionByThreadId.delete(threadId)
+    }
+    for (const threadId of lastThreadGoalLoadAtByThreadId.keys()) {
+      if (!activeThreadIds.has(threadId)) lastThreadGoalLoadAtByThreadId.delete(threadId)
     }
     const nextPending: Record<string, UiServerRequest[]> = {}
     for (const [threadId, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
@@ -4225,6 +4457,10 @@ export function useDesktopState() {
   }
 
   function applyRealtimeUpdates(notification: RpcNotification): void {
+    if (handleThreadGoalNotification(notification)) {
+      return
+    }
+
     const taskThreadId = extractThreadIdFromNotification(notification)
     const incomingTurnId = extractTurnIdFromNotification(notification)
     const currentTurnId = taskThreadId
@@ -4531,7 +4767,11 @@ export function useDesktopState() {
   }
 
   function queueEventDrivenSync(notification: RpcNotification): void {
-    if (notification.method === 'thread/tokenUsage/updated') return
+    if (
+      notification.method === 'thread/tokenUsage/updated'
+      || notification.method === 'thread/goal/updated'
+      || notification.method === 'thread/goal/cleared'
+    ) return
 
     const method = notification.method
     const shouldRefreshAfterRequestResolution = method === 'server/request/resolved'
@@ -5502,6 +5742,7 @@ export function useDesktopState() {
     try {
       await loadPersistedQueueStateIfNeeded()
       await loadThreads({ force: options.forceThreadRefresh === true })
+      void loadThreadGoal(selectedThreadId.value, { force: options.forceThreadRefresh === true })
       if (includeSelectedThreadMessages) {
         try {
           await loadMessages(selectedThreadId.value)
@@ -5532,6 +5773,7 @@ export function useDesktopState() {
 
   async function selectThread(threadId: string): Promise<SelectThreadResult> {
     setSelectedThreadId(threadId)
+    void loadThreadGoal(threadId)
 
     try {
       await loadMessages(threadId)
@@ -6638,6 +6880,9 @@ export function useDesktopState() {
 
   async function recoverBridgeState(): Promise<void> {
     await loadPendingServerRequestsFromBridge()
+    if (selectedThreadId.value) {
+      void loadThreadGoal(selectedThreadId.value, { force: true })
+    }
     pendingThreadsRefresh = !hasLoadedThreads.value
     if (selectedThreadId.value) {
       // A reconnect/gap means notifications may have been missed even when
@@ -6779,6 +7024,13 @@ export function useDesktopState() {
     liveCommandsByThreadId.value = {}
     liveFileChangeMessagesByThreadId.value = {}
     taskSnapshotsByThreadId.value = {}
+    threadGoalByThreadId.value = {}
+    threadGoalLoadingByThreadId.value = {}
+    threadGoalErrorByThreadId.value = {}
+    threadGoalMutationVersionByThreadId.clear()
+    lastThreadGoalLoadAtByThreadId.clear()
+    threadGoalLoadPromiseByThreadId.clear()
+    isThreadGoalSupported.value = true
     turnIndexByTurnIdByThreadId.value = {}
     turnActivityByThreadId.value = {}
     turnSummaryByThreadId.value = {}
@@ -6892,6 +7144,10 @@ export function useDesktopState() {
     isSelectedThreadInterruptPending,
     selectedThreadServerRequests,
     selectedTaskSnapshot,
+    selectedThreadGoal,
+    isSelectedThreadGoalLoading,
+    selectedThreadGoalError,
+    isThreadGoalSupported,
     taskSnapshotsByThreadId,
     selectedLiveOverlay,
     codexQuota,
@@ -6931,6 +7187,9 @@ export function useDesktopState() {
     forkThreadById,
     forkThreadFromTurn,
     rollbackSelectedThread,
+    loadThreadGoal,
+    updateSelectedThreadGoal,
+    clearSelectedThreadGoal,
 
     sendMessageToSelectedThread,
     sendTaskMessage,

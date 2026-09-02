@@ -14,6 +14,9 @@ import type {
   ModelListResponse,
   ReasoningEffort,
   ThreadForkResponse,
+  ThreadGoal,
+  ThreadGoalGetResponse,
+  ThreadGoalSetResponse,
   ThreadListResponse,
   ThreadReadResponse,
   ThreadResumeResponse,
@@ -2001,6 +2004,20 @@ export async function archiveThread(threadId: string): Promise<void> {
 
 export async function renameThread(threadId: string, threadName: string): Promise<void> {
   await callRpc('thread/name/set', { threadId, name: threadName })
+}
+
+export async function getThreadGoal(threadId: string): Promise<ThreadGoal | null> {
+  const payload = await callRpc<ThreadGoalGetResponse>('thread/goal/get', { threadId })
+  return payload.goal
+}
+
+export async function setThreadGoal(threadId: string, objective: string): Promise<ThreadGoal> {
+  const payload = await callRpc<ThreadGoalSetResponse>('thread/goal/set', { threadId, objective })
+  return payload.goal
+}
+
+export async function clearThreadGoal(threadId: string): Promise<void> {
+  await callRpc('thread/goal/clear', { threadId })
 }
 
 export async function rollbackThread(threadId: string, numTurns: number): Promise<UiMessage[]> {

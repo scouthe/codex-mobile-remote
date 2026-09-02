@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  clearThreadGoal,
   getAvailableModelIds,
   getThreadDetail,
+  getThreadGoal,
   getThreadLiveState,
   listDirectoryComposioConnectors,
   resumeThread,
+  setThreadGoal,
   startThreadTurn,
 } from './codexGateway'
 
@@ -65,6 +68,55 @@ describe('startThreadTurn collaboration mode payloads', () => {
         developer_instructions: null,
       },
     })
+  })
+})
+
+describe('thread goal RPCs', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('reads, sets, and clears the official thread goal without a custom route', async () => {
+    const requests: Array<{ method: string; params: Record<string, unknown> }> = []
+    const goal = {
+      threadId: 'thread-1',
+      objective: 'Ship the mobile client',
+      status: 'active' as const,
+      tokenBudget: null,
+      tokensUsed: 120,
+      timeUsedSeconds: 8,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string'
+        ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
+        : { method: '', params: {} }
+      requests.push(body)
+
+      const result = body.method === 'thread/goal/get'
+        ? { goal }
+        : body.method === 'thread/goal/set'
+          ? { goal: { ...goal, objective: body.params.objective } }
+          : {}
+      return new Response(JSON.stringify({ result }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(getThreadGoal('thread-1')).resolves.toEqual(goal)
+    await expect(setThreadGoal('thread-1', 'Keep clients synchronized')).resolves.toMatchObject({
+      objective: 'Keep clients synchronized',
+    })
+    await expect(clearThreadGoal('thread-1')).resolves.toBeUndefined()
+
+    expect(requests).toEqual([
+      { method: 'thread/goal/get', params: { threadId: 'thread-1' } },
+      { method: 'thread/goal/set', params: { threadId: 'thread-1', objective: 'Keep clients synchronized' } },
+      { method: 'thread/goal/clear', params: { threadId: 'thread-1' } },
+    ])
   })
 })
 

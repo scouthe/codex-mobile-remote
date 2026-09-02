@@ -1060,6 +1060,13 @@
                     :send-with-enter="sendWithEnter" :in-progress-submit-mode="inProgressSendMode"
                     :dictation-click-to-toggle="dictationClickToToggle" :dictation-auto-send="dictationAutoSend"
                     :dictation-language="dictationLanguage"
+                    :goal-thread-id="selectedThreadId"
+                    :thread-goal="selectedThreadGoal"
+                    :is-thread-goal-loading="isSelectedThreadGoalLoading"
+                    :is-thread-goal-supported="isThreadGoalSupported"
+                    :thread-goal-error="selectedThreadGoalError"
+                    :save-thread-goal="updateSelectedThreadGoal"
+                    :clear-thread-goal="clearSelectedThreadGoal"
                     @update:selected-collaboration-mode="onSelectCollaborationMode"
                     @submit="onSubmitThreadMessage" @update:selected-model="onSelectModel"
                     @update:selected-reasoning-effort="onSelectReasoningEffort"
@@ -1441,6 +1448,10 @@ const {
   selectedThreadTerminalOpen,
   selectedThreadServerRequests,
   selectedTaskSnapshot,
+  selectedThreadGoal,
+  isSelectedThreadGoalLoading,
+  selectedThreadGoalError,
+  isThreadGoalSupported,
   selectedLiveOverlay,
   codexQuota,
   selectedThreadId,
@@ -1500,6 +1511,8 @@ const {
   stopPolling,
   primeSelectedThread,
   rollbackSelectedThread,
+  updateSelectedThreadGoal,
+  clearSelectedThreadGoal,
 } = useDesktopState()
 
 const route = useRoute()

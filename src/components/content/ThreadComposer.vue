@@ -162,7 +162,7 @@
             +
           </button>
 
-          <div v-if="isAttachMenuOpen" class="thread-composer-attach-menu">
+          <div v-show="isAttachMenuOpen" class="thread-composer-attach-menu">
             <button
               class="thread-composer-attach-item"
               type="button"
@@ -187,6 +187,18 @@
             >
               {{ t('Take photo') }}
             </button>
+            <ThreadGoalControl
+              v-if="goalThreadId"
+              :thread-id="goalThreadId"
+              :goal="threadGoal ?? null"
+              :loading="isThreadGoalLoading"
+              :supported="isThreadGoalSupported"
+              :error="threadGoalError"
+              :disabled="isInteractionDisabled"
+              :save-goal="onSaveThreadGoal"
+              :clear-goal="onClearThreadGoal"
+              @opened="isAttachMenuOpen = false"
+            />
             <div class="thread-composer-attach-separator" />
             <div class="thread-composer-attach-mode">
               <span class="thread-composer-attach-mode-label">{{ t('In-progress send') }}</span>
@@ -391,6 +403,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import type { ThreadGoal } from '../../api/appServerDtos'
 import type {
   CollaborationModeKind,
   CollaborationModeOption,
@@ -423,6 +436,7 @@ import IconTablerMinimize from '../icons/IconTablerMinimize.vue'
 import IconTablerPlayerStopFilled from '../icons/IconTablerPlayerStopFilled.vue'
 import ComposerDropdown from './ComposerDropdown.vue'
 import ComposerSearchDropdown from './ComposerSearchDropdown.vue'
+import ThreadGoalControl from './ThreadGoalControl.vue'
 
 type SkillSourceBadge = {
   badge: string
@@ -455,6 +469,13 @@ const props = defineProps<{
   dictationClickToToggle?: boolean
   dictationAutoSend?: boolean
   dictationLanguage?: string
+  goalThreadId?: string
+  threadGoal?: ThreadGoal | null
+  isThreadGoalLoading?: boolean
+  isThreadGoalSupported?: boolean
+  threadGoalError?: string
+  saveThreadGoal?: (objective: string) => Promise<boolean>
+  clearThreadGoal?: () => Promise<boolean>
 }>()
 
 export type FileAttachment = { label: string; path: string; fsPath: string }
@@ -491,6 +512,14 @@ const emit = defineEmits<{
   'update:selected-speed-mode': [mode: SpeedMode]
 }>()
 const { t } = useUiLanguage()
+
+async function onSaveThreadGoal(objective: string): Promise<boolean> {
+  return props.saveThreadGoal ? props.saveThreadGoal(objective) : false
+}
+
+async function onClearThreadGoal(): Promise<boolean> {
+  return props.clearThreadGoal ? props.clearThreadGoal() : false
+}
 
 type SelectedImage = {
   id: string

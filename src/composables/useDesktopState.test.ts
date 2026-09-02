@@ -23,6 +23,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getSkillsList: vi.fn(),
   getThreadDetail: vi.fn(),
   getThreadFastDetail: vi.fn(),
+  getThreadGoal: vi.fn(),
   getThreadLiveState: vi.fn(),
   enqueueThreadMessage: vi.fn(),
   removeQueuedThreadMessage: vi.fn(),
@@ -40,6 +41,8 @@ const gatewayMocks = vi.hoisted(() => ({
   revertThreadFileChanges: vi.fn(),
   rollbackThread: vi.fn(),
   setCodexSpeedMode: vi.fn(),
+  setThreadGoal: vi.fn(),
+  clearThreadGoal: vi.fn(),
   setThreadQueueState: vi.fn(),
   setWorkspaceRootsState: vi.fn(),
   startThread: vi.fn(),
@@ -90,6 +93,7 @@ beforeEach(() => {
   gatewayMocks.getThreadFastDetail.mockRejectedValue(new Error('fast snapshot not configured in test'))
   gatewayMocks.getThreadLiveState.mockRejectedValue(new Error('live state not configured in test'))
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
+  gatewayMocks.getThreadGoal.mockResolvedValue(null)
   gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
   gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('no workspace roots state'))
 })
@@ -2483,6 +2487,108 @@ describe('provider model selection', () => {
     await state.ensureThreadMessagesLoaded('missing-thread', { silent: true })
     await state.loadMessages('missing-thread')
     expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+  })
+})
+
+describe('official thread goals', () => {
+  it('keeps the selected goal synchronized through the shared notification stream', async () => {
+    installTestWindow()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    const initialGoal = {
+      threadId: 'goal-thread',
+      objective: 'Keep Desktop and mobile synchronized',
+      status: 'active' as const,
+      tokenBudget: null,
+      tokensUsed: 10,
+      timeUsedSeconds: 2,
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    gatewayMocks.setThreadGoal.mockResolvedValue(initialGoal)
+    gatewayMocks.clearThreadGoal.mockResolvedValue(undefined)
+
+    const state = useDesktopState()
+    state.primeSelectedThread('goal-thread')
+    await state.updateSelectedThreadGoal(initialGoal.objective)
+
+    expect(gatewayMocks.setThreadGoal).toHaveBeenCalledWith('goal-thread', initialGoal.objective)
+    expect(state.selectedThreadGoal.value).toEqual(initialGoal)
+
+    state.startPolling()
+    expect(notificationHandler).toBeDefined()
+    notificationHandler!({
+      method: 'thread/goal/updated',
+      params: {
+        threadId: 'goal-thread',
+        turnId: null,
+        goal: {
+          ...initialGoal,
+          status: 'complete',
+          tokensUsed: 100,
+          updatedAt: 3,
+        },
+      },
+    })
+
+    expect(state.selectedThreadGoal.value).toMatchObject({
+      status: 'complete',
+      tokensUsed: 100,
+    })
+
+    notificationHandler!({
+      method: 'thread/goal/cleared',
+      params: { threadId: 'goal-thread' },
+    })
+    expect(state.selectedThreadGoal.value).toBeNull()
+
+    await state.clearSelectedThreadGoal()
+    expect(gatewayMocks.clearThreadGoal).toHaveBeenCalledWith('goal-thread')
+  })
+
+  it('does not let an older goal read overwrite a newer cross-client notification', async () => {
+    installTestWindow()
+    let notificationHandler: ((notification: { method: string; params?: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler as typeof notificationHandler
+      return vi.fn()
+    })
+    let resolveGoalRead: ((value: null) => void) | undefined
+    gatewayMocks.getThreadGoal.mockReturnValue(new Promise<null>((resolve) => {
+      resolveGoalRead = resolve
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('goal-thread')
+    state.startPolling()
+    const pendingRead = state.loadThreadGoal('goal-thread', { force: true })
+
+    notificationHandler!({
+      method: 'thread/goal/updated',
+      params: {
+        threadId: 'goal-thread',
+        goal: {
+          threadId: 'goal-thread',
+          objective: 'Notification wins',
+          status: 'active',
+          tokenBudget: null,
+          tokensUsed: 42,
+          timeUsedSeconds: 5,
+          createdAt: 1,
+          updatedAt: 3,
+        },
+      },
+    })
+    resolveGoalRead?.(null)
+    await pendingRead
+
+    expect(state.selectedThreadGoal.value).toMatchObject({
+      objective: 'Notification wins',
+      tokensUsed: 42,
+    })
   })
 })
 

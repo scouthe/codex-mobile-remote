@@ -405,6 +405,90 @@
   @apply text-zinc-400;
 }
 
+:root.dark .thread-goal-menu-button {
+  @apply text-zinc-300 hover:bg-zinc-700;
+}
+
+:root.dark .thread-goal-menu-icon {
+  @apply stroke-zinc-400;
+}
+
+:root.dark .thread-goal-menu-label {
+  @apply text-zinc-100;
+}
+
+:root.dark .thread-goal-menu-description {
+  @apply text-zinc-400;
+}
+
+:root.dark .thread-goal-menu-status {
+  @apply bg-zinc-700 text-zinc-300;
+}
+
+:root.dark .thread-goal-menu-status.is-active,
+:root.dark .thread-goal-menu-status.is-complete {
+  @apply bg-emerald-950/70 text-emerald-300;
+}
+
+:root.dark .thread-goal-menu-status.is-blocked,
+:root.dark .thread-goal-menu-status.is-usageLimited,
+:root.dark .thread-goal-menu-status.is-budgetLimited {
+  @apply bg-amber-950/70 text-amber-300;
+}
+
+:root.dark .thread-goal-dialog {
+  @apply border-zinc-700 bg-zinc-900;
+}
+
+:root.dark .thread-goal-dialog-title,
+:root.dark .thread-goal-dialog-field-label {
+  @apply text-zinc-100;
+}
+
+:root.dark .thread-goal-dialog-subtitle,
+:root.dark .thread-goal-dialog-meta {
+  @apply text-zinc-400;
+}
+
+:root.dark .thread-goal-dialog-close {
+  @apply text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100;
+}
+
+:root.dark .thread-goal-dialog-textarea {
+  @apply border-zinc-600 bg-zinc-800 text-zinc-100 placeholder:text-zinc-500 focus:border-zinc-400 focus:ring-zinc-700;
+}
+
+:root.dark .thread-goal-dialog-status {
+  @apply bg-zinc-800 text-zinc-300;
+}
+
+:root.dark .thread-goal-dialog-status.is-active,
+:root.dark .thread-goal-dialog-status.is-complete {
+  @apply bg-emerald-950/70 text-emerald-300;
+}
+
+:root.dark .thread-goal-dialog-status.is-blocked,
+:root.dark .thread-goal-dialog-status.is-usageLimited,
+:root.dark .thread-goal-dialog-status.is-budgetLimited {
+  @apply bg-amber-950/70 text-amber-300;
+}
+
+:root.dark .thread-goal-dialog-error {
+  @apply bg-red-950/60 text-red-300;
+}
+
+:root.dark .thread-goal-dialog-button {
+  @apply border-zinc-600 bg-zinc-800 text-zinc-200 hover:bg-zinc-700;
+}
+
+:root.dark .thread-goal-dialog-button--clear {
+  @apply border-red-900 text-red-300 hover:bg-red-950/60;
+}
+
+:root.dark .thread-goal-dialog-button--primary {
+  @apply border-zinc-100 bg-zinc-100 text-zinc-900 hover:bg-white;
+}
+
 :root.dark .thread-composer-attach-mode-label {
   @apply text-zinc-100;
 }
