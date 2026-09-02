@@ -20,6 +20,7 @@
 #### Expected Results
 
 - The Goal entry appears only for an existing thread, alongside Plan mode in the composer menu.
+- When a goal exists, a status card appears above the composer with the same target icon, objective, elapsed usage time, pause/resume, clear, and edit actions as Codex Desktop.
 - Saving and clearing call the official `thread/goal/*` RPCs; they do not start a turn, enqueue a message, or change the writer/observer state.
 - Goal updates and clears converge in both clients through the existing notification stream.
 - If the connected Codex version does not expose Goal RPCs, the entry is disabled with a clear unsupported-version message.

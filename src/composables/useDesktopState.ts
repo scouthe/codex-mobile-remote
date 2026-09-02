@@ -1821,6 +1821,41 @@ export function useDesktopState() {
     }
   }
 
+  async function setSelectedThreadGoalStatus(status: ThreadGoalStatus): Promise<boolean> {
+    const threadId = selectedThreadId.value.trim()
+    const goal = selectedThreadGoal.value
+    if (!threadId || !goal || !THREAD_GOAL_STATUSES.has(status) || !isThreadGoalSupported.value) return false
+
+    const mutationVersion = nextThreadGoalMutationVersion(threadId)
+    setThreadGoalLoading(threadId, true)
+    setThreadGoalError(threadId, '')
+    try {
+      const updatedGoal = await setThreadGoal(threadId, goal.objective, status)
+      if ((threadGoalMutationVersionByThreadId.get(threadId) ?? 0) === mutationVersion) {
+        setGoalForThread(threadId, updatedGoal)
+        lastThreadGoalLoadAtByThreadId.set(threadId, Date.now())
+      }
+      return true
+    } catch (unknownError) {
+      if (isThreadGoalUnavailableError(unknownError)) {
+        isThreadGoalSupported.value = false
+      }
+      setThreadGoalError(
+        threadId,
+        unknownError instanceof Error ? unknownError.message : 'Failed to update thread goal',
+      )
+      return false
+    } finally {
+      setThreadGoalLoading(threadId, false)
+    }
+  }
+
+  async function toggleSelectedThreadGoalStatus(): Promise<boolean> {
+    const goal = selectedThreadGoal.value
+    if (!goal || (goal.status !== 'active' && goal.status !== 'paused')) return false
+    return setSelectedThreadGoalStatus(goal.status === 'active' ? 'paused' : 'active')
+  }
+
   async function clearSelectedThreadGoal(): Promise<boolean> {
     const threadId = selectedThreadId.value.trim()
     if (!threadId || !isThreadGoalSupported.value) return false
@@ -7189,6 +7224,8 @@ export function useDesktopState() {
     rollbackSelectedThread,
     loadThreadGoal,
     updateSelectedThreadGoal,
+    setSelectedThreadGoalStatus,
+    toggleSelectedThreadGoalStatus,
     clearSelectedThreadGoal,
 
     sendMessageToSelectedThread,

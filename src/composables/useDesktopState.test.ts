@@ -2508,7 +2508,11 @@ describe('official thread goals', () => {
       createdAt: 1,
       updatedAt: 2,
     }
-    gatewayMocks.setThreadGoal.mockResolvedValue(initialGoal)
+    gatewayMocks.setThreadGoal.mockImplementation(async (_threadId: string, objective: string, status?: string) => ({
+      ...initialGoal,
+      objective,
+      status: status === 'paused' ? 'paused' : 'active',
+    }))
     gatewayMocks.clearThreadGoal.mockResolvedValue(undefined)
 
     const state = useDesktopState()
@@ -2517,6 +2521,10 @@ describe('official thread goals', () => {
 
     expect(gatewayMocks.setThreadGoal).toHaveBeenCalledWith('goal-thread', initialGoal.objective)
     expect(state.selectedThreadGoal.value).toEqual(initialGoal)
+
+    await state.toggleSelectedThreadGoalStatus()
+    expect(gatewayMocks.setThreadGoal).toHaveBeenCalledWith('goal-thread', initialGoal.objective, 'paused')
+    expect(state.selectedThreadGoal.value?.status).toBe('paused')
 
     state.startPolling()
     expect(notificationHandler).toBeDefined()

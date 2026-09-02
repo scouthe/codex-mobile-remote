@@ -1,5 +1,64 @@
 <template>
+  <div v-if="variant === 'card' && goal" class="thread-goal-status-card" :class="`is-${goal.status}`">
+    <div class="thread-goal-status-main">
+      <svg class="thread-goal-status-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="8" />
+        <circle cx="12" cy="12" r="3" />
+        <path d="M15 9l5-5m0 0v4m0-4h-4" />
+      </svg>
+      <span class="thread-goal-status-copy">
+        <span class="thread-goal-status-title">{{ goalHeaderLabel }}</span>
+        <span class="thread-goal-status-objective" :title="goal.objective">{{ goal.objective }}</span>
+      </span>
+      <span class="thread-goal-status-separator" aria-hidden="true">•</span>
+      <span class="thread-goal-status-time">{{ formatDuration(liveTimeUsedSeconds) }}</span>
+    </div>
+    <div class="thread-goal-status-actions">
+      <button
+        class="thread-goal-status-action"
+        type="button"
+        :aria-label="t('Clear goal')"
+        :title="t('Clear goal')"
+        :disabled="isBusy"
+        @click="clear"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 7h16m-10 4v6m4-6v6M9 7V4h6v3m-9 0 1 13h10l1-13" />
+        </svg>
+      </button>
+      <button
+        v-if="canTogglePause"
+        class="thread-goal-status-action"
+        type="button"
+        :aria-label="pauseActionLabel"
+        :title="pauseActionLabel"
+        :disabled="isBusy || !togglePause"
+        @click="togglePauseStatus"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <template v-if="goal.status === 'active'">
+            <path d="M8 6v12M16 6v12" />
+          </template>
+          <path v-else d="m9 6 9 6-9 6V6Z" />
+        </svg>
+      </button>
+      <button
+        class="thread-goal-status-action"
+        type="button"
+        :aria-label="t('Edit goal')"
+        :title="t('Edit goal')"
+        :disabled="isBusy"
+        @click="openDialog"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M5 19h4L19 9a2.8 2.8 0 0 0-4-4L5 15v4Zm9-12 3 3" />
+        </svg>
+      </button>
+    </div>
+  </div>
+
   <button
+    v-else
     class="thread-goal-menu-button"
     type="button"
     :disabled="disabled || loading || supported === false"
@@ -113,19 +172,21 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { ThreadGoal } from '../../api/appServerDtos'
 import { useUiLanguage } from '../../composables/useUiLanguage'
 
 const props = defineProps<{
   threadId: string
   goal: ThreadGoal | null
+  variant?: 'menu' | 'card'
   loading?: boolean
   supported?: boolean
   error?: string
   disabled?: boolean
   saveGoal: (objective: string) => Promise<boolean>
   clearGoal: () => Promise<boolean>
+  togglePause?: () => Promise<boolean>
 }>()
 
 const emit = defineEmits<{
@@ -139,9 +200,18 @@ const isSubmitting = ref(false)
 const draft = ref('')
 const initialObjective = ref('')
 const localError = ref('')
+const liveTimeUsedSeconds = ref(0)
+let liveTimeTimer: number | null = null
 
 const isBusy = computed(() => props.loading === true || isSubmitting.value)
 const displayError = computed(() => localError.value || props.error || '')
+const canTogglePause = computed(() => props.goal?.status === 'active' || props.goal?.status === 'paused')
+const goalHeaderLabel = computed(() => {
+  if (props.goal?.status === 'active') return t('Active goal')
+  if (props.goal?.status === 'paused') return t('Paused goal')
+  return t('Goal')
+})
+const pauseActionLabel = computed(() => props.goal?.status === 'active' ? t('Pause goal') : t('Resume goal'))
 const goalDescription = computed(() => {
   if (props.supported === false) return t('Goals are unavailable in this Codex version')
   if (props.loading && !props.goal) return t('Loading goal…')
@@ -166,10 +236,33 @@ function formatDuration(seconds: number): string {
   const normalizedSeconds = Math.max(0, Math.floor(seconds))
   if (normalizedSeconds < 60) return t('{count}s', { count: normalizedSeconds })
   const minutes = Math.floor(normalizedSeconds / 60)
-  if (minutes < 60) return t('{count}m', { count: minutes })
+  const remainderSeconds = normalizedSeconds % 60
+  if (minutes < 60) return remainderSeconds > 0
+    ? t('{minutes}m {seconds}s', { minutes, seconds: remainderSeconds })
+    : t('{count}m', { count: minutes })
   const hours = Math.floor(minutes / 60)
-  const remainder = minutes % 60
-  return remainder > 0 ? t('{hours}h {minutes}m', { hours, minutes: remainder }) : t('{count}h', { count: hours })
+  const remainderMinutes = minutes % 60
+  if (remainderMinutes > 0) return t('{hours}h {minutes}m', { hours, minutes: remainderMinutes })
+  return t('{count}h', { count: hours })
+}
+
+function syncLiveTime(): void {
+  liveTimeUsedSeconds.value = props.goal?.timeUsedSeconds ?? 0
+}
+
+function startLiveTimeTicker(): void {
+  if (liveTimeTimer !== null || typeof window === 'undefined') return
+  liveTimeTimer = window.setInterval(() => {
+    if (props.goal?.status === 'active') {
+      liveTimeUsedSeconds.value += 1
+    }
+  }, 1000)
+}
+
+function stopLiveTimeTicker(): void {
+  if (liveTimeTimer === null || typeof window === 'undefined') return
+  window.clearInterval(liveTimeTimer)
+  liveTimeTimer = null
 }
 
 function openDialog(): void {
@@ -222,6 +315,20 @@ async function clear(): Promise<void> {
   }
 }
 
+async function togglePauseStatus(): Promise<void> {
+  if (!props.togglePause || !canTogglePause.value || isBusy.value) return
+  isSubmitting.value = true
+  localError.value = ''
+  try {
+    const updated = await props.togglePause()
+    if (!updated) {
+      localError.value = props.error || t('Failed to update thread goal')
+    }
+  } finally {
+    isSubmitting.value = false
+  }
+}
+
 watch(
   () => props.threadId,
   () => {
@@ -238,10 +345,69 @@ watch(
     initialObjective.value = nextObjective
   },
 )
+
+watch(
+  () => [props.goal?.threadId, props.goal?.status, props.goal?.timeUsedSeconds] as const,
+  () => syncLiveTime(),
+  { immediate: true },
+)
+
+onMounted(startLiveTimeTicker)
+onBeforeUnmount(stopLiveTimeTicker)
 </script>
 
 <style scoped>
 @reference "tailwindcss";
+
+.thread-goal-status-card {
+  @apply flex min-h-12 items-center justify-between gap-3 rounded-2xl border border-zinc-200 bg-white px-4 py-2.5 shadow-sm;
+}
+
+.thread-goal-status-main {
+  @apply flex min-w-0 items-center gap-2;
+}
+
+.thread-goal-status-icon {
+  @apply h-5 w-5 shrink-0 fill-none stroke-zinc-400;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.thread-goal-status-copy {
+  @apply flex min-w-0 items-baseline gap-1.5;
+}
+
+.thread-goal-status-title {
+  @apply shrink-0 text-sm font-medium text-zinc-800;
+}
+
+.thread-goal-status-objective {
+  @apply min-w-0 truncate text-sm text-zinc-500;
+}
+
+.thread-goal-status-separator {
+  @apply shrink-0 text-zinc-400;
+}
+
+.thread-goal-status-time {
+  @apply shrink-0 text-sm tabular-nums text-zinc-500;
+}
+
+.thread-goal-status-actions {
+  @apply flex shrink-0 items-center gap-1;
+}
+
+.thread-goal-status-action {
+  @apply inline-flex h-8 w-8 items-center justify-center rounded-lg border-0 bg-transparent text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-800 disabled:cursor-not-allowed disabled:opacity-50;
+}
+
+.thread-goal-status-action svg {
+  @apply h-4 w-4 fill-none stroke-current;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 
 .thread-goal-menu-button {
   @apply flex w-full items-center gap-2 rounded-lg border-0 bg-transparent px-3 py-2 text-left transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-400;
@@ -364,6 +530,30 @@ watch(
 }
 
 @media (max-width: 420px) {
+  .thread-goal-status-card {
+    @apply items-start px-3 py-2;
+  }
+
+  .thread-goal-status-main {
+    @apply min-w-0 items-start;
+  }
+
+  .thread-goal-status-copy {
+    @apply min-w-0 flex-col items-start gap-0;
+  }
+
+  .thread-goal-status-separator {
+    @apply hidden;
+  }
+
+  .thread-goal-status-time {
+    @apply mt-0.5 text-xs;
+  }
+
+  .thread-goal-status-actions {
+    @apply gap-0;
+  }
+
   .thread-goal-dialog {
     @apply p-4;
   }

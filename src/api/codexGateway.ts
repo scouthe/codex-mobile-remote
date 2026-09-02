@@ -17,6 +17,7 @@ import type {
   ThreadGoal,
   ThreadGoalGetResponse,
   ThreadGoalSetResponse,
+  ThreadGoalStatus,
   ThreadListResponse,
   ThreadReadResponse,
   ThreadResumeResponse,
@@ -2011,8 +2012,14 @@ export async function getThreadGoal(threadId: string): Promise<ThreadGoal | null
   return payload.goal
 }
 
-export async function setThreadGoal(threadId: string, objective: string): Promise<ThreadGoal> {
-  const payload = await callRpc<ThreadGoalSetResponse>('thread/goal/set', { threadId, objective })
+export async function setThreadGoal(
+  threadId: string,
+  objective: string,
+  status?: ThreadGoalStatus,
+): Promise<ThreadGoal> {
+  const params: Record<string, unknown> = { threadId, objective }
+  if (status) params.status = status
+  const payload = await callRpc<ThreadGoalSetResponse>('thread/goal/set', params)
   return payload.goal
 }
 

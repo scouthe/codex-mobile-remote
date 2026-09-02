@@ -1067,6 +1067,7 @@
                     :thread-goal-error="selectedThreadGoalError"
                     :save-thread-goal="updateSelectedThreadGoal"
                     :clear-thread-goal="clearSelectedThreadGoal"
+                    :toggle-thread-goal-status="toggleSelectedThreadGoalStatus"
                     @update:selected-collaboration-mode="onSelectCollaborationMode"
                     @submit="onSubmitThreadMessage" @update:selected-model="onSelectModel"
                     @update:selected-reasoning-effort="onSelectReasoningEffort"
@@ -1512,6 +1513,7 @@ const {
   primeSelectedThread,
   rollbackSelectedThread,
   updateSelectedThreadGoal,
+  toggleSelectedThreadGoalStatus,
   clearSelectedThreadGoal,
 } = useDesktopState()
 

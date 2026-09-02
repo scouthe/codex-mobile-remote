@@ -409,6 +409,31 @@
   @apply text-zinc-300 hover:bg-zinc-700;
 }
 
+:root.dark .thread-goal-status-card {
+  @apply border-zinc-700 bg-zinc-900;
+}
+
+:root.dark .thread-goal-status-icon {
+  @apply stroke-zinc-500;
+}
+
+:root.dark .thread-goal-status-title {
+  @apply text-zinc-100;
+}
+
+:root.dark .thread-goal-status-objective,
+:root.dark .thread-goal-status-time {
+  @apply text-zinc-400;
+}
+
+:root.dark .thread-goal-status-separator {
+  @apply text-zinc-500;
+}
+
+:root.dark .thread-goal-status-action {
+  @apply text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100;
+}
+
 :root.dark .thread-goal-menu-icon {
   @apply stroke-zinc-400;
 }

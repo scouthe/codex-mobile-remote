@@ -4,6 +4,20 @@
       {{ dictationErrorText }}
     </p>
 
+    <ThreadGoalControl
+      v-if="goalThreadId && threadGoal"
+      variant="card"
+      :thread-id="goalThreadId"
+      :goal="threadGoal"
+      :loading="isThreadGoalLoading"
+      :supported="isThreadGoalSupported"
+      :error="threadGoalError"
+      :disabled="isInteractionDisabled"
+      :save-goal="onSaveThreadGoal"
+      :clear-goal="onClearThreadGoal"
+      :toggle-pause="onToggleThreadGoalStatus"
+    />
+
     <div
       class="thread-composer-shell"
       :class="{
@@ -189,6 +203,7 @@
             </button>
             <ThreadGoalControl
               v-if="goalThreadId"
+              variant="menu"
               :thread-id="goalThreadId"
               :goal="threadGoal ?? null"
               :loading="isThreadGoalLoading"
@@ -197,6 +212,7 @@
               :disabled="isInteractionDisabled"
               :save-goal="onSaveThreadGoal"
               :clear-goal="onClearThreadGoal"
+              :toggle-pause="onToggleThreadGoalStatus"
               @opened="isAttachMenuOpen = false"
             />
             <div class="thread-composer-attach-separator" />
@@ -476,6 +492,7 @@ const props = defineProps<{
   threadGoalError?: string
   saveThreadGoal?: (objective: string) => Promise<boolean>
   clearThreadGoal?: () => Promise<boolean>
+  toggleThreadGoalStatus?: () => Promise<boolean>
 }>()
 
 export type FileAttachment = { label: string; path: string; fsPath: string }
@@ -519,6 +536,10 @@ async function onSaveThreadGoal(objective: string): Promise<boolean> {
 
 async function onClearThreadGoal(): Promise<boolean> {
   return props.clearThreadGoal ? props.clearThreadGoal() : false
+}
+
+async function onToggleThreadGoalStatus(): Promise<boolean> {
+  return props.toggleThreadGoalStatus ? props.toggleThreadGoalStatus() : false
 }
 
 type SelectedImage = {

@@ -107,14 +107,14 @@ describe('thread goal RPCs', () => {
     }))
 
     await expect(getThreadGoal('thread-1')).resolves.toEqual(goal)
-    await expect(setThreadGoal('thread-1', 'Keep clients synchronized')).resolves.toMatchObject({
+    await expect(setThreadGoal('thread-1', 'Keep clients synchronized', 'paused')).resolves.toMatchObject({
       objective: 'Keep clients synchronized',
     })
     await expect(clearThreadGoal('thread-1')).resolves.toBeUndefined()
 
     expect(requests).toEqual([
       { method: 'thread/goal/get', params: { threadId: 'thread-1' } },
-      { method: 'thread/goal/set', params: { threadId: 'thread-1', objective: 'Keep clients synchronized' } },
+      { method: 'thread/goal/set', params: { threadId: 'thread-1', objective: 'Keep clients synchronized', status: 'paused' } },
       { method: 'thread/goal/clear', params: { threadId: 'thread-1' } },
     ])
   })
