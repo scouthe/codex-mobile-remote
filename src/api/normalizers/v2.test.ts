@@ -6,19 +6,39 @@ function threadReadResponseWithContent(content: ThreadReadResponse['thread']['tu
   return {
     thread: {
       id: 'thread-1',
+      extra: null,
+      sessionId: 'thread-1',
+      forkedFromId: null,
+      parentThreadId: null,
       preview: 'Use a skill',
+      ephemeral: false,
+      section: null,
+      sectionEnteredAt: null,
+      projectId: null,
+      historyMode: 'legacy',
       modelProvider: 'openai',
       createdAt: 1,
       updatedAt: 2,
+      recencyAt: 2,
+      status: { type: 'idle' },
       path: null,
       cwd: '/tmp/project',
       cliVersion: 'test',
       source: 'appServer',
+      canAcceptDirectInput: true,
+      threadSource: null,
+      agentNickname: null,
+      agentRole: null,
+      name: null,
       gitInfo: null,
       turns: [{
         id: 'turn-1',
         status: 'completed',
         error: null,
+        itemsView: 'full',
+        startedAt: null,
+        completedAt: null,
+        durationMs: null,
         items: content,
       }],
     },
@@ -30,6 +50,7 @@ describe('normalizeThreadMessagesV2', () => {
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
       type: 'userMessage',
       id: 'user-1',
+      clientId: null,
       content: [
         { type: 'text', text: 'Use the browser skill', text_elements: [] },
         { type: 'skill', name: 'browser-use:browser', path: '/Users/igor/.codex/skills/browser/SKILL.md' },
@@ -49,6 +70,7 @@ describe('normalizeThreadMessagesV2', () => {
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
       type: 'userMessage',
       id: 'user-2',
+      clientId: null,
       content: [
         { type: 'skill', name: 'composio-cli', path: '/Users/igor/.codex/skills/composio-cli/SKILL.md' },
       ],
@@ -68,6 +90,7 @@ describe('normalizeThreadMessagesV2', () => {
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
       type: 'userMessage',
       id: 'automation-user-1',
+      clientId: null,
       content: [{
         type: 'text',
         text: `<heartbeat>
@@ -95,6 +118,7 @@ Reply with &lt;/instructions&gt; and A &amp; B
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
       type: 'userMessage',
       id: 'user-3',
+      clientId: null,
       content: [{ type: 'text', text: 'Paged message', text_elements: [] }],
     }]), 12)
 
@@ -110,6 +134,7 @@ Reply with &lt;/instructions&gt; and A &amp; B
     const response = threadReadResponseWithContent([{
       type: 'userMessage',
       id: 'user-4',
+      clientId: null,
       content: [{ type: 'text', text: 'hi', text_elements: [] }],
     }])
     response.thread.turns[0].status = 'failed'
@@ -117,6 +142,7 @@ Reply with &lt;/instructions&gt; and A &amp; B
       message: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header',
       codexErrorInfo: null,
       additionalDetails: null,
+      misalignment: null,
     }
 
     const messages = normalizeThreadMessagesV2(response)
@@ -142,7 +168,12 @@ Reply with &lt;/instructions&gt; and A &amp; B
           message: 'first failed turn',
           codexErrorInfo: null,
           additionalDetails: null,
+          misalignment: null,
         },
+        itemsView: 'full',
+        startedAt: null,
+        completedAt: null,
+        durationMs: null,
         items: [],
       },
       {
@@ -152,7 +183,12 @@ Reply with &lt;/instructions&gt; and A &amp; B
           message: 'second failed turn',
           codexErrorInfo: null,
           additionalDetails: null,
+          misalignment: null,
         },
+        itemsView: 'full',
+        startedAt: null,
+        completedAt: null,
+        durationMs: null,
         items: [],
       },
     ]

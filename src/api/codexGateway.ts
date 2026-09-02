@@ -30,6 +30,7 @@ import {
 } from './normalizers/v2'
 import type {
   SpeedMode,
+  ReasoningEffort as UiReasoningEffort,
   UiAccountEntry,
   UiAccountQuotaStatus,
   UiAccountUnavailableReason,
@@ -63,7 +64,7 @@ import { getTaskClientHeaders } from './codexRpcClient'
 type CurrentModelConfig = {
   model: string
   providerId: string
-  reasoningEffort: ReasoningEffort | ''
+  reasoningEffort: UiReasoningEffort | ''
   speedMode: SpeedMode
 }
 
@@ -708,10 +709,10 @@ async function enrichThreadMessagesWithFallback(threadId: string, messages: UiMe
   }
 }
 
-function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
-  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
-  return typeof value === 'string' && allowed.includes(value as ReasoningEffort)
-    ? (value as ReasoningEffort)
+function normalizeReasoningEffort(value: unknown): UiReasoningEffort | '' {
+  const allowed: UiReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  return typeof value === 'string' && allowed.includes(value as UiReasoningEffort)
+    ? (value as UiReasoningEffort)
     : ''
 }
 
