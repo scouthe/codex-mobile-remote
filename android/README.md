@@ -24,7 +24,9 @@ approval cards, and live-state stream as the web client.
 The WebView keeps the existing Vue UI and WebSocket/SSE protocol. Native code
 adds the pieces that are awkward or unreliable in a browser:
 
-- remembers the server address;
+- remembers multiple server addresses and their labels;
+- probes LAN, public, and Tailscale addresses in parallel and connects to the
+  fastest reachable endpoint on launch;
 - stores an optional codexapp password in the Android Keystore;
 - restores WebView cookies for a long-lived login session;
 - retries after Tailscale/Wi-Fi transitions with bounded backoff;
@@ -55,13 +57,22 @@ Termux bootstrap, a bundled server asset, or any local Codex runtime helper.
 
 1. Start `codexapp` on the computer and expose it through Tailscale Serve, for
    example `https://my-computer.my-tailnet.ts.net`.
-2. Open **Codex Remote** and enter that complete URL. A host without a scheme
-   is treated as HTTPS.
-3. Optionally enter the codexapp password. It is encrypted with an AES/GCM key
-   held by Android Keystore; it is never put into the URL. Leave it blank when
-   the server trusts the Tailscale identity or when you prefer the in-page
-   login form.
-4. Tap **Connect**. The saved profile is loaded automatically next time.
+2. Open **Codex Remote** and save each address you want to use (for example,
+   `http://192.168.1.20:5900`, a public HTTPS URL, and a Tailscale Serve URL).
+   Give each address a label so it is easy to identify. A host without a
+   scheme is treated as HTTPS.
+3. Optionally enter the codexapp password for each address. It is encrypted
+   with an AES/GCM key held by Android Keystore; it is never put into the URL.
+   Leave it blank when the server trusts the Tailscale identity or when you
+   prefer the in-page login form.
+4. Tap **Save address**, then **Connect fastest**. On the next launch the app
+   probes all saved addresses and selects the one with the lowest response
+   latency. A server response such as 401 still counts as reachable; the saved
+   password (if present) is applied by the WebView afterward.
+
+Open connection settings at any time to add, edit, use, or delete an address.
+The old single-address format is migrated automatically on first launch after
+upgrading.
 
 HTTPS is strongly recommended. An explicit **Allow unencrypted HTTP** checkbox
 is available for a private test network only; never use it for a forwarded or

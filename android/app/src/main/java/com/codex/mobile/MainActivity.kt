@@ -64,9 +64,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var appContent: View
     private lateinit var setupOverlay: View
     private lateinit var configurationForm: LinearLayout
+    private lateinit var profilesContainer: LinearLayout
+    private lateinit var profileLabelInput: EditText
     private lateinit var serverUrlInput: EditText
     private lateinit var passwordInput: EditText
     private lateinit var allowHttpCheckBox: CheckBox
+    private lateinit var newProfileButton: Button
+    private lateinit var saveProfileButton: Button
     private lateinit var connectButton: Button
     private lateinit var retryButton: Button
     private lateinit var cancelButton: Button
@@ -79,7 +83,10 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var connectionStore: RemoteConnectionStore
     private lateinit var connectionManager: RemoteConnectionManager
+    private lateinit var endpointSelector: EndpointSelector
+    private var profiles: List<RemoteConnectionStore.Profile> = emptyList()
     private var currentProfile: RemoteConnectionStore.Profile? = null
+    private var editingProfileId: String? = null
     private var currentBaseUri: Uri? = null
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
     private var mainFrameFailed = false
@@ -145,6 +152,7 @@ class MainActivity : AppCompatActivity() {
             onNetworkAvailable = ::onNetworkAvailable,
             onNetworkLost = ::onNetworkLost,
         )
+        endpointSelector = EndpointSelector()
 
         setupWebView()
         setupControls()
@@ -162,12 +170,12 @@ class MainActivity : AppCompatActivity() {
         })
         collectShareIntent(intent)
 
-        val savedProfile = connectionStore.load()
-        if (savedProfile == null) {
+        profiles = connectionStore.loadProfiles()
+        if (profiles.isEmpty()) {
             showConfiguration()
         } else {
-            fillConfiguration(savedProfile)
-            connect(savedProfile)
+            renderProfiles()
+            autoSelectAndConnect()
         }
     }
 
@@ -197,6 +205,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         connectionManager.stop()
+        endpointSelector.shutdown()
         fileChooserCallback?.onReceiveValue(null)
         fileChooserCallback = null
         webView.apply {
@@ -221,9 +230,13 @@ class MainActivity : AppCompatActivity() {
         appContent = findViewById(R.id.appContent)
         setupOverlay = findViewById(R.id.setupOverlay)
         configurationForm = findViewById(R.id.configurationForm)
+        profilesContainer = findViewById(R.id.profilesContainer)
+        profileLabelInput = findViewById(R.id.profileLabelInput)
         serverUrlInput = findViewById(R.id.serverUrlInput)
         passwordInput = findViewById(R.id.passwordInput)
         allowHttpCheckBox = findViewById(R.id.allowHttpCheckBox)
+        newProfileButton = findViewById(R.id.newProfileButton)
+        saveProfileButton = findViewById(R.id.saveProfileButton)
         connectButton = findViewById(R.id.connectButton)
         retryButton = findViewById(R.id.retryButton)
         cancelButton = findViewById(R.id.cancelButton)
@@ -236,9 +249,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupControls() {
-        connectButton.setOnClickListener { saveAndConnect() }
+        newProfileButton.setOnClickListener { beginNewProfile() }
+        saveProfileButton.setOnClickListener { saveProfile() }
+        connectButton.setOnClickListener { autoSelectAndConnect() }
         retryButton.setOnClickListener {
-            currentProfile?.let(::connect) ?: showConfiguration()
+            if (profiles.isNotEmpty()) autoSelectAndConnect() else showConfiguration()
         }
         cancelButton.setOnClickListener {
             if (pageReady) {
@@ -373,7 +388,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun saveAndConnect() {
+    private fun saveProfile() {
         val raw = serverUrlInput.text.toString().trim()
         val candidate = if (raw.contains("://")) raw else "https://$raw"
         val normalized = RemoteConnectionStore.normalizeUrl(candidate)
@@ -389,17 +404,56 @@ class MainActivity : AppCompatActivity() {
         }
 
         val password = passwordInput.text.toString().takeIf(String::isNotBlank)
+        val profileId = editingProfileId?.trim().takeIf { !it.isNullOrEmpty() }
+            ?: UUID.randomUUID().toString()
+        val profile = RemoteConnectionStore.Profile(
+            id = profileId,
+            label = profileLabelInput.text.toString(),
+            baseUrl = normalized,
+            password = password,
+        )
+        val replacementIndex = profiles.indexOfFirst { it.id == profileId }
+        val nextProfiles = profiles.toMutableList().apply {
+            if (replacementIndex >= 0) {
+                set(replacementIndex, profile)
+            } else {
+                add(profile)
+            }
+        }
         try {
-            connectionStore.save(normalized, password)
+            connectionStore.saveProfiles(nextProfiles)
         } catch (error: Exception) {
             showConfiguration(getString(R.string.error_save_connection, error.message.orEmpty()))
             return
         }
-        connect(RemoteConnectionStore.Profile(normalized, password))
+        profiles = connectionStore.loadProfiles()
+        editingProfileId = profileId
+        renderProfiles()
+        fillConfiguration(profiles.firstOrNull { it.id == profileId } ?: profile)
+        autoSelectAndConnect()
+    }
+
+    private fun autoSelectAndConnect() {
+        if (profiles.isEmpty()) {
+            showConfiguration()
+            return
+        }
+        endpointSelector.cancel()
+        showSelecting(profiles.size)
+        endpointSelector.select(profiles) { selected, results ->
+            if (selected == null) {
+                showConfiguration(getString(R.string.error_connection))
+                return@select
+            }
+            val reachableCount = results.count { it.reachable }
+            Log.d(TAG, "Selected ${selected.label} (${selected.baseUrl}); $reachableCount/${results.size} endpoints reachable")
+            connect(selected)
+        }
     }
 
     private fun connect(profile: RemoteConnectionStore.Profile) {
         currentProfile = profile
+        editingProfileId = profile.id
         currentBaseUri = Uri.parse(profile.baseUrl)
         mainFrameFailed = false
         pageReady = false
@@ -498,7 +552,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showConfiguration(error: String? = null) {
-        currentProfile?.let(::fillConfiguration)
+        endpointSelector.cancel()
+        currentProfile?.let {
+            editingProfileId = it.id
+            fillConfiguration(it)
+        }
+        renderProfiles()
         setupOverlay.visibility = View.VISIBLE
         configurationForm.visibility = View.VISIBLE
         progressBar.visibility = View.GONE
@@ -513,6 +572,17 @@ class MainActivity : AppCompatActivity() {
         cancelButton.visibility = if (pageReady) View.VISIBLE else View.GONE
     }
 
+    private fun showSelecting(profileCount: Int) {
+        setupOverlay.visibility = View.VISIBLE
+        configurationForm.visibility = View.GONE
+        progressBar.visibility = View.VISIBLE
+        statusText.text = getString(R.string.status_selecting_server)
+        statusDetail.text = getString(R.string.status_testing_servers, profileCount)
+        statusDetail.visibility = View.VISIBLE
+        retryButton.visibility = View.GONE
+        cancelButton.visibility = View.GONE
+    }
+
     private fun showConnecting(serverUrl: String, status: String = getString(R.string.status_connecting)) {
         setupOverlay.visibility = View.VISIBLE
         configurationForm.visibility = View.GONE
@@ -525,10 +595,108 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun fillConfiguration(profile: RemoteConnectionStore.Profile) {
+        profileLabelInput.setText(profile.label)
         serverUrlInput.setText(profile.baseUrl)
         passwordInput.setText(profile.password.orEmpty())
         allowHttpCheckBox.isChecked = Uri.parse(profile.baseUrl).scheme.equals("http", true)
+        saveProfileButton.text = getString(R.string.save_profile)
     }
+
+    private fun beginNewProfile() {
+        editingProfileId = null
+        profileLabelInput.text.clear()
+        serverUrlInput.text.clear()
+        passwordInput.text.clear()
+        allowHttpCheckBox.isChecked = false
+        saveProfileButton.text = getString(R.string.add_profile)
+        profileLabelInput.requestFocus()
+    }
+
+    private fun renderProfiles() {
+        if (!::profilesContainer.isInitialized) return
+        profilesContainer.removeAllViews()
+        if (profiles.isEmpty()) {
+            val empty = TextView(this).apply {
+                text = getString(R.string.no_saved_profiles)
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.codex_muted_text))
+                textSize = 12f
+                setPadding(0, dp(4), 0, dp(4))
+            }
+            profilesContainer.addView(empty)
+            return
+        }
+
+        profiles.forEach { profile ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                setPadding(dp(10), dp(6), dp(4), dp(6))
+                setBackgroundResource(R.drawable.remote_input_background)
+            }
+            val summary = TextView(this).apply {
+                text = "${profile.label}\n${profile.baseUrl}"
+                setTextColor(ContextCompat.getColor(this@MainActivity, R.color.codex_primary_text))
+                textSize = 13f
+                maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    editingProfileId = profile.id
+                    fillConfiguration(profile)
+                }
+            }
+            val useButton = Button(this).apply {
+                text = getString(R.string.use_profile)
+                isAllCaps = false
+                minWidth = 0
+                setPadding(dp(8), 0, dp(8), 0)
+                setOnClickListener { connect(profile) }
+            }
+            val deleteButton = Button(this).apply {
+                text = getString(R.string.delete_profile)
+                isAllCaps = false
+                minWidth = 0
+                setPadding(dp(8), 0, dp(8), 0)
+                setOnClickListener { confirmDeleteProfile(profile) }
+            }
+            row.addView(summary)
+            row.addView(useButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(44)))
+            row.addView(deleteButton, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(44)))
+            profilesContainer.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(8)
+            })
+        }
+    }
+
+    private fun confirmDeleteProfile(profile: RemoteConnectionStore.Profile) {
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.delete_profile_title, profile.label))
+            .setMessage(getString(R.string.delete_profile_message))
+            .setPositiveButton(R.string.clear) { _, _ ->
+                val wasCurrent = currentProfile?.id == profile.id
+                profiles = profiles.filterNot { it.id == profile.id }
+                connectionStore.saveProfiles(profiles)
+                if (editingProfileId == profile.id) {
+                    editingProfileId = null
+                    if (profiles.isNotEmpty()) fillConfiguration(profiles.first()) else beginNewProfile()
+                }
+                if (wasCurrent) {
+                    currentProfile = null
+                    currentBaseUri = null
+                    pageReady = false
+                    mainFrameFailed = false
+                    webView.stopLoading()
+                    webView.loadUrl("about:blank")
+                    appContent.visibility = View.GONE
+                }
+                renderProfiles()
+                if (profiles.isEmpty()) showConfiguration()
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private fun setConnectionStatus(connected: Boolean, text: String) {
         connectionStatusDot.setTextColor(
@@ -548,6 +716,8 @@ class MainActivity : AppCompatActivity() {
                 connectionStore.clear()
                 CookieManager.getInstance().removeAllCookies(null)
                 CookieManager.getInstance().flush()
+                profiles = emptyList()
+                editingProfileId = null
                 currentProfile = null
                 currentBaseUri = null
                 pageReady = false
@@ -555,6 +725,7 @@ class MainActivity : AppCompatActivity() {
                 serverUrlInput.text.clear()
                 passwordInput.text.clear()
                 allowHttpCheckBox.isChecked = false
+                renderProfiles()
                 showConfiguration()
             }
             .setNegativeButton(R.string.cancel, null)

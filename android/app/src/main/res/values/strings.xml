@@ -3,7 +3,19 @@
     <string name="app_name">Codex Remote</string>
 
     <string name="setup_title">Connect to Codex</string>
-    <string name="setup_description">Enter the HTTPS address exposed by Tailscale Serve on your computer.</string>
+    <string name="setup_description">Save your LAN, public, and Tailscale addresses. The fastest reachable server is selected automatically.</string>
+    <string name="saved_profiles_label">Saved server addresses</string>
+    <string name="no_saved_profiles">No server addresses saved yet.</string>
+    <string name="add_new_profile">Add a new address</string>
+    <string name="profile_label_label">Address name</string>
+    <string name="profile_label_hint">LAN, Public, or Tailscale</string>
+    <string name="add_profile">Save address</string>
+    <string name="save_profile">Update address</string>
+    <string name="connect_fastest">Connect fastest</string>
+    <string name="use_profile">Use</string>
+    <string name="delete_profile">Delete</string>
+    <string name="delete_profile_title">Delete %1$s?</string>
+    <string name="delete_profile_message">This saved address and its encrypted password will be removed.</string>
     <string name="server_url_label">Server address</string>
     <string name="server_url_hint">https://my-computer.tailnet.ts.net</string>
     <string name="password_label">codexapp password (optional)</string>
@@ -19,6 +31,8 @@
     <string name="connection_dot">●</string>
     <string name="status_connecting">Connecting…</string>
     <string name="status_reconnecting">Reconnecting…</string>
+    <string name="status_selecting_server">Selecting fastest server…</string>
+    <string name="status_testing_servers">Testing %1$d saved addresses</string>
     <string name="status_connecting_short">Connecting</string>
     <string name="status_connected">Connected</string>
     <string name="status_disconnected">Disconnected</string>

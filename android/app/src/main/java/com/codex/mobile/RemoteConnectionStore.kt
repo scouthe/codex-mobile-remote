@@ -3,8 +3,11 @@ package com.codex.mobile
 import android.content.Context
 import android.net.Uri
 import android.util.Base64
+import org.json.JSONArray
+import org.json.JSONObject
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -13,26 +16,31 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 
 /**
- * Persists the remote codexapp address and (optionally) its web password.
+ * Persists remote codexapp addresses and (optionally) their web passwords.
  *
  * The address is not secret. The password is encrypted with an AES/GCM key
  * held by the Android Keystore, so a preferences backup does not contain the
- * password in plaintext. The password is optional because Tailscale Serve
+ * passwords in plaintext. Passwords are optional because Tailscale Serve
  * deployments commonly authenticate at the network layer.
  */
 class RemoteConnectionStore(context: Context) {
 
     data class Profile(
+        val id: String,
+        val label: String,
         val baseUrl: String,
         val password: String?,
     )
 
     companion object {
         private const val PREFS = "codex_remote_connection"
+        private const val PROFILES_KEY = "profiles_json"
         private const val URL_KEY = "base_url"
         private const val PASSWORD_KEY = "password_gcm"
         private const val KEY_ALIAS = "codex_remote_connection_key"
         private const val GCM_TAG_BITS = 128
+        private const val MAX_PROFILES = 16
+        private const val MAX_LABEL_LENGTH = 80
 
         /** Normalize and validate a URL before it is persisted or loaded. */
         fun normalizeUrl(raw: String): String? {
@@ -56,32 +64,101 @@ class RemoteConnectionStore(context: Context) {
             if (uri.query != null || uri.fragment != null) return null
             return value.trimEnd('/')
         }
+
+        private fun defaultLabel(url: String): String {
+            return Uri.parse(url).host?.takeIf { it.isNotBlank() } ?: url
+        }
+
+        private fun normalizeLabel(label: String?, url: String): String {
+            val value = label?.trim()?.take(MAX_LABEL_LENGTH).orEmpty()
+            return value.ifBlank { defaultLabel(url) }
+        }
     }
 
     private val appContext = context.applicationContext
     private val preferences = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    fun load(): Profile? {
-        val url = preferences.getString(URL_KEY, null)?.let(::normalizeUrl) ?: return null
-        val encryptedPassword = preferences.getString(PASSWORD_KEY, null)
-        val password = encryptedPassword?.let { decrypt(it) }
-        return Profile(url, password?.takeIf(String::isNotEmpty))
+    /** Load all saved profiles, migrating the pre-multi-address format once. */
+    fun loadProfiles(): List<Profile> {
+        val encoded = preferences.getString(PROFILES_KEY, null)
+        if (!encoded.isNullOrBlank()) {
+            val parsed = parseProfiles(encoded)
+            if (parsed.isNotEmpty()) return parsed
+        }
+
+        val legacyUrl = preferences.getString(URL_KEY, null)?.let(::normalizeUrl) ?: return emptyList()
+        val legacyPassword = preferences.getString(PASSWORD_KEY, null)
+            ?.let { decrypt(it) }
+            ?.takeIf(String::isNotEmpty)
+        val migrated = Profile(
+            id = "legacy-${legacyUrl.hashCode().toUInt().toString(16)}",
+            label = normalizeLabel(null, legacyUrl),
+            baseUrl = legacyUrl,
+            password = legacyPassword,
+        )
+        saveProfiles(listOf(migrated))
+        return listOf(migrated)
     }
 
-    fun save(baseUrl: String, password: String?) {
-        val normalized = normalizeUrl(baseUrl)
-            ?: throw IllegalArgumentException("Enter a valid http(s) server URL")
-        val editor = preferences.edit().putString(URL_KEY, normalized)
-        if (password.isNullOrBlank()) {
-            editor.remove(PASSWORD_KEY)
-        } else {
-            editor.putString(PASSWORD_KEY, encrypt(password))
-        }
-        editor.apply()
+    fun load(): Profile? = loadProfiles().firstOrNull()
+
+    /** Replace the persisted profile list. Invalid entries are rejected. */
+    fun saveProfiles(profiles: List<Profile>) {
+        val normalizedProfiles = profiles.asSequence()
+            .mapNotNull { profile ->
+                val url = normalizeUrl(profile.baseUrl) ?: return@mapNotNull null
+                Profile(
+                    id = profile.id.trim().ifBlank { UUID.randomUUID().toString() },
+                    label = normalizeLabel(profile.label, url),
+                    baseUrl = url,
+                    password = profile.password?.takeIf(String::isNotBlank),
+                )
+            }
+            .distinctBy { it.id }
+            .take(MAX_PROFILES)
+            .toList()
+
+        val encoded = JSONArray().apply {
+            normalizedProfiles.forEach { profile ->
+                put(JSONObject().apply {
+                    put("id", profile.id)
+                    put("label", profile.label)
+                    put("url", profile.baseUrl)
+                    profile.password?.let { put("passwordGcm", encrypt(it)) }
+                })
+            }
+        }.toString()
+        preferences.edit()
+            .putString(PROFILES_KEY, encoded)
+            // Remove the old keys after the migrated list is safely written.
+            .remove(URL_KEY)
+            .remove(PASSWORD_KEY)
+            .apply()
     }
 
     fun clear() {
         preferences.edit().clear().apply()
+    }
+
+    private fun parseProfiles(encoded: String): List<Profile> {
+        return try {
+            val array = JSONArray(encoded)
+            buildList {
+                for (index in 0 until minOf(array.length(), MAX_PROFILES)) {
+                    val item = array.optJSONObject(index) ?: continue
+                    val url = normalizeUrl(item.optString("url")) ?: continue
+                    val id = item.optString("id").trim().ifBlank { UUID.randomUUID().toString() }
+                    val label = normalizeLabel(item.optString("label"), url)
+                    val password = item.optString("passwordGcm")
+                        .takeIf(String::isNotBlank)
+                        ?.let { decrypt(it) }
+                        ?.takeIf(String::isNotEmpty)
+                    add(Profile(id, label, url, password))
+                }
+            }.distinctBy { it.id }
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     private fun encrypt(value: String): String {
