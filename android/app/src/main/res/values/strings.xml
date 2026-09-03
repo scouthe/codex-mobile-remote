@@ -30,7 +30,6 @@
     <string name="status_connection">Connection status</string>
     <string name="connection_dot">●</string>
     <string name="status_connecting">Connecting…</string>
-    <string name="status_reconnecting">Reconnecting…</string>
     <string name="status_selecting_server">Selecting fastest server…</string>
     <string name="status_testing_servers">Testing %1$d saved addresses</string>
     <string name="status_connecting_short">Connecting</string>
@@ -42,6 +41,7 @@
 
     <string name="error_connection_title">Couldn’t connect</string>
     <string name="error_connection">The remote Codex service could not be reached.</string>
+    <string name="error_no_reachable_servers">None of the saved server addresses could be reached. Choose an address below, edit it, or add a new one.</string>
     <string name="error_tls_certificate">The HTTPS certificate is not trusted. Fix Tailscale Serve or the certificate on the computer; the app will not bypass TLS errors.</string>
     <string name="error_invalid_url">Enter a full HTTP or HTTPS server address</string>
     <string name="error_http_confirmation">Confirm that you accept unencrypted traffic</string>

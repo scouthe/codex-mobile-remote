@@ -8,9 +8,10 @@ import android.os.Handler
 import android.os.Looper
 
 /**
- * Small lifecycle-aware network/retry coordinator for the remote WebView.
+ * Small lifecycle-aware network-state coordinator for the remote WebView.
  * The WebView remains the HTTP/WebSocket client; this class only tells the
- * activity when connectivity changes and bounds automatic reload attempts.
+ * activity when connectivity changes. Connection retries are explicit so the
+ * activity can keep its saved endpoint picker visible after a failure.
  */
 class RemoteConnectionManager(
     context: Context,
@@ -22,8 +23,6 @@ class RemoteConnectionManager(
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile
     private var registered = false
-    private var retryAttempt = 0
-
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             if (registered) mainHandler.post(onNetworkAvailable)
@@ -54,7 +53,7 @@ class RemoteConnectionManager(
     }
 
     fun stop() {
-        cancelReconnect()
+        mainHandler.removeCallbacksAndMessages(null)
         if (!registered) return
         registered = false
         try {
@@ -70,29 +69,4 @@ class RemoteConnectionManager(
         return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
-    /**
-     * Retry immediately, then back off to 30 seconds. Calling this repeatedly
-     * replaces the pending callback, preventing reload fan-out.
-     */
-    fun scheduleReconnect(action: () -> Unit) {
-        mainHandler.removeCallbacksAndMessages(RETRY_TOKEN)
-        val delay = RETRY_DELAYS_MS[retryAttempt.coerceAtMost(RETRY_DELAYS_MS.lastIndex)]
-        retryAttempt = (retryAttempt + 1).coerceAtMost(RETRY_DELAYS_MS.lastIndex)
-        mainHandler.postAtTime(action, RETRY_TOKEN, android.os.SystemClock.uptimeMillis() + delay)
-    }
-
-    fun markConnected() {
-        retryAttempt = 0
-        mainHandler.removeCallbacksAndMessages(RETRY_TOKEN)
-    }
-
-    fun cancelReconnect() {
-        retryAttempt = 0
-        mainHandler.removeCallbacksAndMessages(RETRY_TOKEN)
-    }
-
-    private companion object {
-        private val RETRY_TOKEN = Any()
-        private val RETRY_DELAYS_MS = longArrayOf(0, 1_000, 2_000, 5_000, 10_000, 30_000)
-    }
 }

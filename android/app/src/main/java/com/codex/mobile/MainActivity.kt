@@ -39,6 +39,9 @@ import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.OnApplyWindowInsetsListener
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
 import org.json.JSONArray
 import org.json.JSONObject
@@ -146,6 +149,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         bindViews()
+        applySystemBarInsets()
         connectionStore = RemoteConnectionStore(this)
         connectionManager = RemoteConnectionManager(
             context = this,
@@ -194,7 +198,6 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         dispatchWindowEvent("codex-native-resume")
         requestPendingNotificationPermission()
-        if (mainFrameFailed && connectionManager.isOnline()) scheduleReconnect()
     }
 
     override fun onPause() {
@@ -246,6 +249,19 @@ class MainActivity : AppCompatActivity() {
         connectionStatusDot = findViewById(R.id.connectionStatusDot)
         connectionStatusText = findViewById(R.id.connectionStatusText)
         settingsButton = findViewById(R.id.settingsButton)
+    }
+
+    /** Keep the toolbar and setup form below the Android status bar. */
+    private fun applySystemBarInsets() {
+        val listener = OnApplyWindowInsetsListener { view, insets ->
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(view.paddingLeft, systemBars.top, view.paddingRight, view.paddingBottom)
+            insets
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(appContent, listener)
+        ViewCompat.setOnApplyWindowInsetsListener(setupOverlay, listener)
+        ViewCompat.requestApplyInsets(appContent)
+        ViewCompat.requestApplyInsets(setupOverlay)
     }
 
     private fun setupControls() {
@@ -337,7 +353,7 @@ class MainActivity : AppCompatActivity() {
                 // Never provide a certificate bypass for a remote command UI.
                 handler.cancel()
                 if (isAllowedInWebView(Uri.parse(error.url))) {
-                    onMainFrameFailure(getString(R.string.error_tls_certificate), retry = false)
+                    onMainFrameFailure(getString(R.string.error_tls_certificate))
                 } else {
                     Log.w(TAG, "Rejected certificate for subresource: ${error.url}")
                 }
@@ -446,6 +462,10 @@ class MainActivity : AppCompatActivity() {
                 return@select
             }
             val reachableCount = results.count { it.reachable }
+            if (reachableCount == 0) {
+                showConfiguration(getString(R.string.error_no_reachable_servers))
+                return@select
+            }
             Log.d(TAG, "Selected ${selected.label} (${selected.baseUrl}); $reachableCount/${results.size} endpoints reachable")
             connect(selected)
         }
@@ -458,7 +478,6 @@ class MainActivity : AppCompatActivity() {
         mainFrameFailed = false
         pageReady = false
         passwordAttempted = false
-        connectionManager.cancelReconnect()
         fillConfiguration(profile)
         showConnecting(profile.baseUrl)
         webView.visibility = View.VISIBLE
@@ -510,7 +529,6 @@ class MainActivity : AppCompatActivity() {
     private fun showWebContent() {
         pageReady = true
         mainFrameFailed = false
-        connectionManager.markConnected()
         setupOverlay.visibility = View.GONE
         appContent.visibility = View.VISIBLE
         webView.visibility = View.VISIBLE
@@ -519,27 +537,19 @@ class MainActivity : AppCompatActivity() {
         dispatchPendingShare()
     }
 
-    private fun onMainFrameFailure(message: String, retry: Boolean = true) {
+    private fun onMainFrameFailure(message: String) {
         mainFrameFailed = true
         pageReady = false
         setConnectionStatus(false, getString(R.string.status_disconnected))
         showConfiguration(message)
-        if (retry && connectionManager.isOnline()) scheduleReconnect()
-    }
-
-    private fun scheduleReconnect() {
-        connectionManager.scheduleReconnect {
-            if (!mainFrameFailed || !connectionManager.isOnline()) return@scheduleReconnect
-            val profile = currentProfile ?: return@scheduleReconnect
-            showConnecting(profile.baseUrl, getString(R.string.status_reconnecting))
-            webView.reload()
-        }
+        // Keep the saved endpoint list visible after a failed connection. The
+        // user can choose another address or retry explicitly; automatic
+        // retries used to hide this form behind an endless reconnect loop.
     }
 
     private fun onNetworkAvailable() {
         if (mainFrameFailed) {
-            setConnectionStatus(false, getString(R.string.status_reconnecting))
-            scheduleReconnect()
+            setConnectionStatus(false, getString(R.string.status_disconnected))
         } else if (pageReady) {
             setConnectionStatus(true, currentBaseUri?.host ?: getString(R.string.status_connected))
             dispatchWindowEvent("codex-native-network-online")
