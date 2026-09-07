@@ -3,6 +3,7 @@ import {
   clearThreadGoal,
   getAvailableModelIds,
   getThreadDetail,
+  getThreadFastDetail,
   getThreadGoal,
   getThreadLiveState,
   listDirectoryComposioConnectors,
@@ -265,6 +266,41 @@ describe('getThreadDetail', () => {
   })
 })
 
+describe('getThreadFastDetail', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('does not invent turn indexes when a bounded session tail has an unknown start', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      thread: {
+        id: 'large-thread',
+        turns: [{
+          id: 'turn-tail',
+          status: 'completed',
+          items: [{ id: 'assistant-tail', type: 'agentMessage', text: 'tail answer' }],
+        }],
+      },
+      partial: true,
+      threadTurnStartIndexKnown: false,
+      hasMoreOlder: true,
+      fullHydrationDeferred: true,
+      inProgress: false,
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const detail = await getThreadFastDetail('large-thread')
+
+    expect(detail.messages).toEqual([
+      expect.objectContaining({ id: 'assistant-tail', text: 'tail answer', turnId: 'turn-tail' }),
+    ])
+    expect(detail.messages[0]?.turnIndex).toBeUndefined()
+    expect(detail.turnIndexByTurnId).toEqual({})
+  })
+})
+
 describe('getThreadLiveState', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -301,6 +337,32 @@ describe('getThreadLiveState', () => {
       sessionRevision: 'r12',
       messages: [expect.objectContaining({ text: 'tail answer' })],
     })
+  })
+
+  it('keeps live-tail turn indexes unknown when the server could not read the session prefix', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      thread: {
+        id: 'large-thread',
+        turns: [{
+          id: 'turn-tail',
+          status: 'completed',
+          items: [{ id: 'assistant-tail', type: 'agentMessage', text: 'tail answer' }],
+        }],
+      },
+      partial: true,
+      threadTurnStartIndexKnown: false,
+      hasMoreOlder: true,
+      fullHydrationDeferred: true,
+      isInProgress: false,
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const detail = await getThreadLiveState('large-thread')
+
+    expect(detail.messages[0]?.turnIndex).toBeUndefined()
+    expect(detail.turnIndexByTurnId).toEqual({})
   })
 })
 

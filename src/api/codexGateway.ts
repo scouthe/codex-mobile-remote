@@ -633,6 +633,14 @@ function readThreadTurnStartIndex(payload: ThreadReadResponse): number {
   return Math.max(0, Math.floor(typeof raw === 'number' ? raw : 0))
 }
 
+function omitUnknownTurnIndexes(messages: UiMessage[]): UiMessage[] {
+  return messages.map((message) => {
+    const nextMessage = { ...message }
+    delete nextMessage.turnIndex
+    return nextMessage
+  })
+}
+
 async function fetchThreadFileChangeFallback(threadId: string): Promise<ThreadFileChangeFallbackEntry[]> {
   const response = await fetch(`/codex-api/thread-file-change-fallback?threadId=${encodeURIComponent(threadId)}`)
   if (!response.ok) {
@@ -924,6 +932,7 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
     error?: unknown
     timeline?: unknown
     fullHydrationDeferred?: unknown
+    threadTurnStartIndexKnown?: unknown
   }
   if (!response.ok) {
     throw new Error(`Fast thread state request failed with ${response.status}`)
@@ -932,7 +941,11 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
     throw new Error('Fast thread state response was incomplete')
   }
   const startTurnIndex = readThreadTurnStartIndex(payload)
-  const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
+  const turnStartIndexKnown = payload.threadTurnStartIndexKnown !== false
+  const normalizedWithIndexes = normalizeThreadMessagesV2(payload, startTurnIndex)
+  const normalized = turnStartIndexKnown
+    ? normalizedWithIndexes
+    : omitUnknownTurnIndexes(normalizedWithIndexes)
   const rawThread = asRecord(payload.thread)
   const rawRevision = payload.sessionRevision ?? rawThread?.sessionRevision ?? rawThread?.revision
   const sessionRevision = typeof rawRevision === 'string'
@@ -1023,7 +1036,7 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
     inProgress,
     activeTurnId,
     hasMoreOlder: payload.hasMoreOlder === true || startTurnIndex > 0,
-    turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+    turnIndexByTurnId: turnStartIndexKnown ? buildTurnIndexByTurnId(payload, startTurnIndex) : {},
     ...(sessionRevision ? { sessionRevision } : {}),
     ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
     ...(streamCursor !== undefined ? { streamCursor } : {}),
@@ -1290,11 +1303,15 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
             : undefined
       : undefined
     const threadTurnStartIndex = readThreadTurnStartIndex(threadPayload)
+    const threadTurnStartIndexKnown = record?.threadTurnStartIndexKnown !== false
     const hasMoreOlder = threadTurnStartIndex > 0 || record?.hasMoreOlder === true
+    const normalizedMessages = normalizeThreadMessagesV2(threadPayload, threadTurnStartIndex)
     return {
       model: normalizeThreadModelFromPayload(threadPayload),
       modelProvider: normalizeThreadModelProviderFromPayload(threadPayload),
-      messages: normalizeThreadMessagesV2(threadPayload, threadTurnStartIndex),
+      messages: threadTurnStartIndexKnown
+        ? normalizedMessages
+        : omitUnknownTurnIndexes(normalizedMessages),
       // When the bridge has read the shared session log, its boolean marker
       // is authoritative even when false.  Falling back with `||` would let
       // an old projected in-progress turn resurrect the spinner after the
@@ -1304,7 +1321,9 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       ...(terminalTurnId ? { terminalTurnId } : {}),
       hasMoreOlder,
       ...(record?.partial === true || hasMoreOlder ? { partial: true } : {}),
-      turnIndexByTurnId: buildTurnIndexByTurnId(threadPayload, threadTurnStartIndex),
+      turnIndexByTurnId: threadTurnStartIndexKnown
+        ? buildTurnIndexByTurnId(threadPayload, threadTurnStartIndex)
+        : {},
       ...(sessionRevision ? { sessionRevision } : {}),
       ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
       streamCursor,

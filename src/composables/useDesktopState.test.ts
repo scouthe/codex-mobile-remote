@@ -1111,6 +1111,64 @@ describe('thread selection latency', () => {
     expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('fast-thread')
   })
 
+  it('keeps canonical turn order when full hydration enriches a fast snapshot', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadFastDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [
+        { id: 'user-latest', role: 'user', text: 'is it running?', messageType: 'userMessage', turnIndex: 0 },
+        { id: 'assistant-final', role: 'assistant', text: 'it is still running', messageType: 'agentMessage', turnIndex: 1 },
+      ],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: true,
+      turnIndexByTurnId: {},
+      partial: true,
+      fullHydrationDeferred: true,
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [
+        { id: 'user-latest', role: 'user', text: 'is it running?', messageType: 'userMessage', turnIndex: 122 },
+        {
+          id: 'command-latest',
+          role: 'system',
+          text: 'check status',
+          messageType: 'commandExecution',
+          turnIndex: 123,
+          commandExecution: {
+            command: 'check status',
+            cwd: '/tmp/project',
+            status: 'completed',
+            aggregatedOutput: 'ok',
+            exitCode: 0,
+          },
+        },
+        { id: 'assistant-final', role: 'assistant', text: 'it is still running', messageType: 'agentMessage', turnIndex: 123 },
+      ],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: true,
+      turnIndexByTurnId: {},
+      partial: true,
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('hydration-order-thread')
+    await state.loadMessages('hydration-order-thread')
+    expect(state.messages.value.map((message) => message.id)).toEqual(['user-latest', 'assistant-final'])
+
+    await state.loadMessages('hydration-order-thread', { force: true, fast: false })
+
+    expect(state.messages.value.map((message) => message.id)).toEqual([
+      'user-latest',
+      'command-latest',
+      'assistant-final',
+    ])
+  })
+
   it('does not let a stale plain thread read clear a newer active task snapshot', async () => {
     installTestWindow()
     gatewayMocks.getThreadDetail

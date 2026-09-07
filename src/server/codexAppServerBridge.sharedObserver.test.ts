@@ -465,9 +465,45 @@ describe('shared thread observer HTTP path', () => {
         type: 'response_item',
         payload: {
           type: 'message',
-          id: 'user-fast-1',
+          id: 'response-user-fast-1',
           role: 'user',
           content: [{ type: 'input_text', text: 'hello fast path' }],
+        },
+      },
+      {
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: 'turn-fast-1',
+          item: {
+            type: 'UserMessage',
+            id: 'user-fast-1',
+            content: [{ type: 'text', text: 'hello fast path' }],
+          },
+        },
+      },
+      {
+        timestamp: new Date().toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          id: 'internal-summary-fast-1',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'internal handoff summary' }],
+        },
+      },
+      {
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: 'turn-fast-1',
+          item: {
+            type: 'AgentMessage',
+            id: 'assistant-fast-1',
+            content: [{ type: 'Text', text: 'fast answer' }],
+          },
         },
       },
       {
@@ -525,15 +561,19 @@ describe('shared thread observer HTTP path', () => {
       expect(response.status).toBe(200)
       const payload = await response.json() as {
         partial?: boolean
-        thread?: { turns?: Array<{ id?: string; items?: Array<{ type?: string; text?: string }> }> }
+        threadTurnStartIndex?: number
+        threadTurnStartIndexKnown?: boolean
+        thread?: { turns?: Array<{ id?: string; items?: Array<{ id?: string; type?: string; text?: string }> }> }
       }
       expect(payload.partial).toBe(true)
+      expect(payload.threadTurnStartIndexKnown).toBe(true)
+      expect(payload.threadTurnStartIndex).toBe(0)
       expect(payload.thread?.turns).toContainEqual(expect.objectContaining({
         id: 'turn-fast-1',
-        items: expect.arrayContaining([
-          expect.objectContaining({ type: 'userMessage' }),
-          expect.objectContaining({ type: 'agentMessage', text: 'fast answer' }),
-        ]),
+        items: [
+          expect.objectContaining({ id: 'user-fast-1', type: 'userMessage' }),
+          expect.objectContaining({ id: 'assistant-fast-1', type: 'agentMessage', text: 'fast answer' }),
+        ],
       }))
       expect(originalRpc.some((call) => call.method === 'thread/read')).toBe(true)
       expect(originalRpc.some((call) => call.method === 'thread/read' && (call.params as { includeTurns?: boolean })?.includeTurns === true)).toBe(false)
@@ -592,12 +632,16 @@ describe('shared thread observer HTTP path', () => {
         partial?: boolean
         fullHydrationDeferred?: boolean
         hasMoreOlder?: boolean
+        threadTurnStartIndex?: number
+        threadTurnStartIndexKnown?: boolean
         thread?: { turns?: Array<{ id?: string }> }
       }
       expect(payload.isInProgress).toBe(true)
       expect(payload.partial).toBe(true)
       expect(payload.fullHydrationDeferred).toBe(true)
       expect(payload.hasMoreOlder).toBe(true)
+      expect(payload.threadTurnStartIndexKnown).toBe(false)
+      expect(payload.threadTurnStartIndex).toBeUndefined()
       expect(payload.thread?.turns).toContainEqual(expect.objectContaining({ id: 'turn-large' }))
       expect(fake.calls.some((call) => call.method === 'thread/read' && (call.params as { includeTurns?: boolean })?.includeTurns === true)).toBe(false)
       expect(fake.calls.some((call) => call.method === 'thread/read' && (call.params as { includeTurns?: boolean })?.includeTurns === false)).toBe(true)

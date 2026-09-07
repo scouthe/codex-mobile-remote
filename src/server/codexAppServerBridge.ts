@@ -1158,7 +1158,9 @@ async function readThreadSnapshotForObserver(
       const sessionStat = await stat(sessionPath)
       if (sessionStat.isFile() && sessionStat.size > OBSERVER_FULL_READ_MAX_BYTES) {
         const sessionTail = await readSessionTailForFastThread(sessionPath)
-        const turns = buildFastSessionTurns(sessionTail.raw)
+        const fastProjection = buildFastSessionTurns(sessionTail.raw)
+        const turns = fastProjection.turns
+        const threadTurnStartIndexKnown = sessionTail.start === 0
         const result = metadataRecord && metadataThread
           ? {
             ...metadataRecord,
@@ -1169,7 +1171,10 @@ async function readThreadSnapshotForObserver(
             // The fast projection is intentionally bounded.  Consumers use
             // this marker to keep older-turn pagination available without
             // asking app-server for the full rollout on the hot path.
-            threadTurnStartIndex: turns.length > 0 ? 1 : 0,
+            ...(threadTurnStartIndexKnown
+              ? { threadTurnStartIndex: Math.max(0, fastProjection.parsedTurnCount - turns.length) }
+              : {}),
+            threadTurnStartIndexKnown,
             partial: true,
           }
           : metadataResult
@@ -2197,7 +2202,7 @@ function extractSessionMessageText(content: unknown, fallbackText = ''): string 
     .map((block) => {
       const blockRecord = asRecord(block)
       if (!blockRecord) return ''
-      const type = readNonEmptyString(blockRecord.type)
+      const type = readNonEmptyString(blockRecord.type).toLowerCase()
       if (type !== 'output_text' && type !== 'text' && type !== 'input_text') return ''
       return typeof blockRecord.text === 'string' ? blockRecord.text : ''
     })
@@ -2345,23 +2350,27 @@ type FastSessionTurn = {
  * thread/read hydration that follows fills those in without blocking the
  * first paint after a task switch.
  */
-async function readSessionTailForFastThread(path: string): Promise<{ raw: string; size: number }> {
+async function readSessionTailForFastThread(path: string): Promise<{ raw: string; size: number; start: number }> {
   const metadata = await stat(path)
-  if (!metadata.isFile() || metadata.size <= 0) return { raw: '', size: 0 }
+  if (!metadata.isFile() || metadata.size <= 0) return { raw: '', size: 0, start: 0 }
   const start = Math.max(0, metadata.size - FAST_THREAD_SESSION_TAIL_BYTES)
   const file = await open(path, 'r')
   try {
     const length = metadata.size - start
     const buffer = Buffer.allocUnsafe(length)
     const { bytesRead } = await file.read(buffer, 0, length, start)
-    return { raw: buffer.subarray(0, bytesRead).toString('utf8'), size: metadata.size }
+    return { raw: buffer.subarray(0, bytesRead).toString('utf8'), size: metadata.size, start }
   } finally {
     await file.close()
   }
 }
 
-function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TURN_LIMIT): FastSessionTurn[] {
+function buildFastSessionTurns(
+  sessionLogRaw: string,
+  limit = THREAD_RESPONSE_TURN_LIMIT,
+): { turns: FastSessionTurn[]; parsedTurnCount: number } {
   const turnsById = new Map<string, FastSessionTurn>()
+  const completedMessageIdsByTurnId = new Map<string, Set<string>>()
   const turnOrder: string[] = []
   let currentTurnId = ''
 
@@ -2379,27 +2388,51 @@ function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TU
     return turn
   }
 
-  const addItem = (turn: FastSessionTurn, item: Record<string, unknown>): void => {
+  const addItem = (
+    turn: FastSessionTurn,
+    item: Record<string, unknown>,
+    preferCanonicalId = false,
+  ): void => {
     const itemId = readNonEmptyString(item.id)
     if (itemId && turn.items.some((candidate) => readNonEmptyString(candidate.id) === itemId)) return
     const assistantText = item.type === 'agentMessage' ? readNonEmptyString(item.text) : ''
-    if (assistantText && turn.items.some((candidate) => candidate.type === 'agentMessage' && readNonEmptyString(candidate.text) === assistantText)) return
+    const equivalentAssistantIndex = assistantText
+      ? turn.items.findIndex((candidate) => candidate.type === 'agentMessage' && readNonEmptyString(candidate.text) === assistantText)
+      : -1
+    if (equivalentAssistantIndex >= 0) {
+      if (preferCanonicalId && itemId) turn.items[equivalentAssistantIndex] = item
+      return
+    }
     if (item.type === 'userMessage') {
       const content = Array.isArray(item.content) ? item.content : []
       const userText = content
         .map((block) => readNonEmptyString(asRecord(block)?.text))
         .filter(Boolean)
         .join('\n')
-      if (userText && turn.items.some((candidate) => {
+      const equivalentUserIndex = userText ? turn.items.findIndex((candidate) => {
         if (candidate.type !== 'userMessage') return false
         const candidateContent = Array.isArray(candidate.content) ? candidate.content : []
         return candidateContent
           .map((block) => readNonEmptyString(asRecord(block)?.text))
           .filter(Boolean)
           .join('\n') === userText
-      })) return
+      }) : -1
+      if (equivalentUserIndex >= 0) {
+        if (preferCanonicalId && itemId) turn.items[equivalentUserIndex] = item
+        return
+      }
     }
     turn.items.push(item)
+  }
+
+  const markCompletedMessage = (turnId: string, itemId: string): void => {
+    if (!turnId || !itemId) return
+    const existing = completedMessageIdsByTurnId.get(turnId)
+    if (existing) {
+      existing.add(itemId)
+    } else {
+      completedMessageIdsByTurnId.set(turnId, new Set([itemId]))
+    }
   }
 
   for (const line of sessionLogRaw.split(/\r?\n/u)) {
@@ -2441,6 +2474,33 @@ function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TU
         const turn = ensureTurn(completedTurnId, terminalStatus)
         if (turn) turn.status = terminalStatus
         if (completedTurnId === currentTurnId) currentTurnId = ''
+      } else if (eventType === 'item_completed') {
+        const completedItem = asRecord(payload.item)
+        const completedItemType = readNonEmptyString(completedItem?.type).toLowerCase()
+        const completedItemId = readNonEmptyString(completedItem?.id)
+        const completedTurnId = eventTurnId || currentTurnId
+        const turn = ensureTurn(completedTurnId)
+        if (turn && completedItem && completedItemType === 'usermessage') {
+          const content = normalizeSessionUserContent(completedItem.content)
+          if (content.length > 0) {
+            addItem(turn, {
+              id: completedItemId || `${turn.id}-session-user-${turn.items.length}`,
+              type: 'userMessage',
+              content,
+            }, Boolean(completedItemId))
+            markCompletedMessage(turn.id, completedItemId)
+          }
+        } else if (turn && completedItem && completedItemType === 'agentmessage') {
+          const text = extractSessionMessageText(completedItem.content, readNonEmptyString(completedItem.text))
+          if (text) {
+            addItem(turn, {
+              id: completedItemId || `${turn.id}-session-agent-${turn.items.length}`,
+              type: 'agentMessage',
+              text,
+            }, Boolean(completedItemId))
+            markCompletedMessage(turn.id, completedItemId)
+          }
+        }
       } else if (eventType === 'agent_message') {
         const text = readNonEmptyString(payload.message)
         const turn = ensureTurn(eventTurnId || currentTurnId)
@@ -2479,7 +2539,7 @@ function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TU
           id: payloadId || `${turn.id}-session-agent-${turn.items.length}`,
           type: 'agentMessage',
           text,
-        })
+        }, Boolean(payloadId))
       }
     } else if (role === 'user') {
       const content = normalizeSessionUserContent(payload.content)
@@ -2488,15 +2548,26 @@ function buildFastSessionTurns(sessionLogRaw: string, limit = THREAD_RESPONSE_TU
           id: payloadId || `${turn.id}-session-user-${turn.items.length}`,
           type: 'userMessage',
           content,
-        })
+        }, Boolean(payloadId))
       }
     }
   }
 
-  return turnOrder
-    .slice(-Math.max(1, limit))
-    .map((turnId) => turnsById.get(turnId))
-    .filter((turn): turn is FastSessionTurn => Boolean(turn))
+  return {
+    turns: turnOrder
+      .slice(-Math.max(1, limit))
+      .map((turnId) => turnsById.get(turnId))
+      .filter((turn): turn is FastSessionTurn => Boolean(turn))
+      .map((turn) => {
+        const completedMessageIds = completedMessageIdsByTurnId.get(turn.id)
+        if (!completedMessageIds || completedMessageIds.size === 0) return turn
+        return {
+          ...turn,
+          items: turn.items.filter((item) => completedMessageIds.has(readNonEmptyString(item.id))),
+        }
+      }),
+    parsedTurnCount: turnOrder.length,
+  }
 }
 
 function mergeSessionProjectionFallbackIntoTurns(
@@ -10033,7 +10104,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
           const sessionActivity = await appServer.getSessionActivityReader().read(sessionPath)
           const sessionTail = await readSessionTailForFastThread(sessionPath)
-          const turns = buildFastSessionTurns(sessionTail.raw)
+          const fastProjection = buildFastSessionTurns(sessionTail.raw)
+          const turns = fastProjection.turns
+          const threadTurnStartIndexKnown = sessionTail.start === 0
           const queueState = await readThreadQueueState()
           const currentStatus = asRecord(summaryThread.status)
           const inProgress = sessionActivity.known
@@ -10065,6 +10138,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             ...summaryRecord,
             thread: mergedThread,
             partial: true,
+            ...(threadTurnStartIndexKnown
+              ? { threadTurnStartIndex: Math.max(0, fastProjection.parsedTurnCount - turns.length) }
+              : {}),
+            threadTurnStartIndexKnown,
             // A full app-server hydration of a large rollout is deliberately
             // deferred.  The client should keep the bounded projection as
             // the live view instead of immediately issuing a multi-megabyte
@@ -10257,6 +10334,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             sessionActivity,
             resolveTaskWriterClient(threadId, sessionActivity, appServer, threadBroker),
           )
+          const threadTurnStartIndexKnown = rawThreadRecord?.threadTurnStartIndexKnown !== false
+          const threadTurnStartIndex = typeof rawThreadRecord?.threadTurnStartIndex === 'number'
+            ? Math.max(0, Math.trunc(rawThreadRecord.threadTurnStartIndex))
+            : 0
 
           const responseData = {
             threadId,
@@ -10272,9 +10353,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             // a complete conversation, so a later live refresh could replace
             // loaded history with only the recent turns.
             partial: rawThreadRecord?.partial === true || typeof rawThreadRecord?.threadTurnStartIndex === 'number',
-            threadTurnStartIndex: typeof rawThreadRecord?.threadTurnStartIndex === 'number'
-              ? Math.max(0, Math.trunc(rawThreadRecord.threadTurnStartIndex))
-              : 0,
+            ...(threadTurnStartIndexKnown ? { threadTurnStartIndex } : {}),
+            threadTurnStartIndexKnown,
             hasMoreOlder: (typeof rawThreadRecord?.threadTurnStartIndex === 'number'
               && Math.trunc(rawThreadRecord.threadTurnStartIndex) > 0)
               || sessionSize > FAST_THREAD_SESSION_TAIL_BYTES

@@ -704,7 +704,6 @@ function mergeMessages(
   options: { preserveMissing?: boolean; preserveOnlyOlder?: boolean } = {},
 ): UiMessage[] {
   const previousById = new Map(previous.map((message) => [message.id, message]))
-  const incomingById = new Map(incoming.map((message) => [message.id, message]))
 
   const mergedIncoming = incoming.map((incomingMessage) => {
     const previousMessage = previousById.get(incomingMessage.id)
@@ -731,23 +730,60 @@ function mergeMessages(
     return typeof turnIndex !== 'number' || !Number.isFinite(turnIndex) || turnIndex < earliestIncomingTurnIndex
   }
 
-  const mergedFromPrevious = previous
-    .map((previousMessage) => {
-      const nextMessage = incomingById.get(previousMessage.id)
-      if (!nextMessage) {
-        return shouldPreserveMissingMessage(previousMessage) ? previousMessage : null
-      }
-      if (areMessageFieldsEqual(previousMessage, nextMessage)) {
-        return previousMessage
-      }
-      return nextMessage
-    })
-    .filter((message): message is UiMessage => Boolean(message))
-    .filter((message) => !isOptimisticUserMessage(message) || !hasEquivalentUserMessage(message, incoming))
+  const incomingIndexById = new Map(mergedIncoming.map((message, index) => [message.id, index]))
+  const nextIncomingAnchorByPreviousIndex: Array<number | null> = new Array(previous.length).fill(null)
+  let nextIncomingAnchor: number | null = null
+  for (let index = previous.length - 1; index >= 0; index -= 1) {
+    nextIncomingAnchorByPreviousIndex[index] = nextIncomingAnchor
+    const incomingIndex = incomingIndexById.get(previous[index].id)
+    if (incomingIndex !== undefined) nextIncomingAnchor = incomingIndex
+  }
 
-  const previousIdSet = new Set(previous.map((message) => message.id))
-  const appended = mergedIncoming.filter((message) => !previousIdSet.has(message.id))
-  const merged = [...mergedFromPrevious, ...appended]
+  const preservedByIncomingBoundary = Array.from(
+    { length: mergedIncoming.length + 1 },
+    () => [] as UiMessage[],
+  )
+  let previousIncomingAnchor: number | null = null
+  for (let previousIndex = 0; previousIndex < previous.length; previousIndex += 1) {
+    const previousMessage = previous[previousIndex]
+    const matchingIncomingIndex = incomingIndexById.get(previousMessage.id)
+    if (matchingIncomingIndex !== undefined) {
+      previousIncomingAnchor = matchingIncomingIndex
+      continue
+    }
+    if (!shouldPreserveMissingMessage(previousMessage)) continue
+    if (isOptimisticUserMessage(previousMessage) && hasEquivalentUserMessage(previousMessage, incoming)) continue
+
+    const turnIndex = previousMessage.turnIndex
+    let boundary: number
+    if (
+      earliestIncomingTurnIndex !== null
+      && typeof turnIndex === 'number'
+      && Number.isFinite(turnIndex)
+      && turnIndex < earliestIncomingTurnIndex
+    ) {
+      boundary = 0
+    } else if (nextIncomingAnchorByPreviousIndex[previousIndex] !== null) {
+      boundary = nextIncomingAnchorByPreviousIndex[previousIndex] as number
+    } else if (previousIncomingAnchor !== null) {
+      boundary = previousIncomingAnchor + 1
+    } else {
+      // With no shared anchor, retain the previous snapshot before the new
+      // projection. This keeps an optimistic prompt ahead of an assistant
+      // response while the persisted user row is still catching up.
+      boundary = 0
+    }
+    preservedByIncomingBoundary[Math.min(boundary, mergedIncoming.length)].push(previousMessage)
+  }
+
+  // The incoming projection is authoritative for the order of the turns it
+  // contains. Keeping the previous snapshot as the base and appending newly
+  // hydrated commands would move those commands after the final response.
+  const merged: UiMessage[] = []
+  for (let boundary = 0; boundary <= mergedIncoming.length; boundary += 1) {
+    merged.push(...preservedByIncomingBoundary[boundary])
+    if (boundary < mergedIncoming.length) merged.push(mergedIncoming[boundary])
+  }
 
   return areMessageArraysEqual(previous, merged) ? previous : merged
 }
