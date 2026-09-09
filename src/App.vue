@@ -223,6 +223,10 @@
                   </div>
                 </template>
               </div>
+              <button class="sidebar-settings-row" type="button" :title="t('Configure public relay access')" @click="openStarbridgePanel">
+                <span class="sidebar-settings-label">{{ t('Xuanji StarBridge') }}</span>
+                <span class="sidebar-settings-value">{{ starbridgeStatusLabel }}</span>
+              </button>
               <button class="sidebar-settings-row" type="button" :title="SETTINGS_HELP.sendWithEnter" @click="toggleSendWithEnter">
                 <span class="sidebar-settings-label">{{ t('Require ⌘ + enter to send') }}</span>
                 <span class="sidebar-settings-toggle" :class="{ 'is-on': !sendWithEnter }" />
@@ -1191,6 +1195,58 @@
       </div>
     </form>
   </div>
+  <div v-if="isStarbridgeOpen" class="starbridge-modal-backdrop" role="presentation" @click.self="closeStarbridgePanel">
+    <section class="starbridge-modal" role="dialog" aria-modal="true" :aria-label="t('Xuanji StarBridge')" @click.stop>
+      <div class="starbridge-modal-header">
+        <div>
+          <h2 class="starbridge-modal-title">{{ t('Xuanji StarBridge') }}</h2>
+          <p class="starbridge-modal-subtitle">{{ t('Expose this Linux Codex host through your authorized relay.') }}</p>
+        </div>
+        <button class="starbridge-modal-close" type="button" :aria-label="t('Close')" @click="closeStarbridgePanel">×</button>
+      </div>
+      <div class="starbridge-status-card" :data-state="starbridgeStatus.state" role="status" aria-live="polite">
+        <span class="starbridge-status-dot" aria-hidden="true" />
+        <div>
+          <strong>{{ starbridgeStatusLabel }}</strong>
+          <p v-if="starbridgeStatus.domain" class="starbridge-status-domain">{{ starbridgeStatus.domain }}</p>
+          <p v-if="starbridgeStatus.subscription.expiresAt" class="starbridge-status-meta">{{ t('Expires') }}: {{ formatStarbridgeDate(starbridgeStatus.subscription.expiresAt) }}</p>
+          <p v-if="starbridgeStatus.lastError" class="starbridge-status-error">{{ starbridgeStatus.lastError }}</p>
+        </div>
+        <button v-if="starbridgeStatus.domain" class="starbridge-status-copy" type="button" @click="copyStarbridgeUrl">{{ starbridgeCopyLabel }}</button>
+      </div>
+      <form class="starbridge-form" @submit.prevent="submitStarbridgeActivation">
+        <label class="starbridge-field">
+          <span>{{ t('Control plane URL') }}</span>
+          <input v-model="starbridgeControlUrl" type="url" inputmode="url" autocomplete="off" placeholder="https://relay.example.com" :disabled="starbridgeBusy">
+        </label>
+        <label class="starbridge-field">
+          <span>{{ t('Activation code') }}</span>
+          <input v-model="starbridgeActivationCode" type="password" autocomplete="off" :placeholder="t('Paste the one-time code from your administrator')" :disabled="starbridgeBusy">
+        </label>
+        <label class="starbridge-field">
+          <span>{{ t('Device name') }}</span>
+          <input v-model="starbridgeDeviceName" type="text" autocomplete="off" :placeholder="t('This Linux host')" :disabled="starbridgeBusy">
+        </label>
+        <p class="starbridge-help">{{ t('Your device secret stays on this Linux host. The browser never receives FRPC credentials.') }}</p>
+        <p v-if="starbridgeError" class="starbridge-form-error" role="alert">{{ starbridgeError }}</p>
+        <div class="starbridge-actions">
+          <button class="starbridge-secondary" type="button" :disabled="starbridgeBusy" @click="refreshStarbridgeStatus">{{ t('Refresh') }}</button>
+          <button class="starbridge-primary" type="submit" :disabled="starbridgeBusy || !starbridgeControlUrl.trim() || !starbridgeActivationCode.trim()">{{ starbridgeBusy ? t('Activating…') : t('Activate') }}</button>
+        </div>
+      </form>
+      <div v-if="starbridgeStatus.state !== 'unconfigured'" class="starbridge-renew-section">
+        <label class="starbridge-field">
+          <span>{{ t('Renewal code') }}</span>
+          <input v-model="starbridgeRenewalCode" type="password" autocomplete="off" :placeholder="t('Optional renewal code')" :disabled="starbridgeBusy">
+        </label>
+        <div class="starbridge-actions">
+          <button class="starbridge-secondary" type="button" :disabled="starbridgeBusy || !starbridgeRenewalCode.trim()" @click="submitStarbridgeRenewal">{{ t('Renew') }}</button>
+          <button class="starbridge-secondary" type="button" :disabled="starbridgeBusy" @click="restartStarbridgeConnection">{{ t('Restart connection') }}</button>
+          <button class="starbridge-danger" type="button" :disabled="starbridgeBusy" @click="disconnectStarbridgeConnection">{{ t('Stop public access') }}</button>
+        </div>
+      </div>
+    </section>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -1239,6 +1295,11 @@ import {
   getTelegramConfig,
   getProjectRootSuggestion,
   getTelegramStatus,
+  activateStarbridge,
+  disconnectStarbridge,
+  getStarbridgeStatus,
+  renewStarbridge,
+  restartStarbridge,
   getThreadTerminalQuickCommands,
   getThreadTerminalStatus,
   getWorkspaceRootsState,
@@ -1255,7 +1316,7 @@ import {
 } from './api/codexGateway'
 import type { ReasoningEffort, SpeedMode, UiAccountEntry, UiRateLimitWindow, UiServerRequest, UiServerRequestReply, UiThreadAutomation, UiThreadTokenUsage } from './types/codex'
 import type { ComposerDraftPayload, ThreadComposerExposed } from './components/content/ThreadComposer.vue'
-import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, TelegramStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
+import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, StarbridgeStatus, TelegramStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
@@ -1706,6 +1767,27 @@ const customEndpointWireApi = ref<'responses' | 'chat'>('responses')
 const openRouterWireApi = ref<'responses' | 'chat'>('responses')
 const opencodeZenKey = ref('')
 const isTelegramConfigOpen = ref(false)
+const isStarbridgeOpen = ref(false)
+const starbridgeBusy = ref(false)
+const starbridgeError = ref('')
+const starbridgeControlUrl = ref('')
+const starbridgeActivationCode = ref('')
+const starbridgeRenewalCode = ref('')
+const starbridgeDeviceName = ref('')
+const starbridgeCopyLabel = ref('')
+const starbridgeStatus = ref<StarbridgeStatus>({
+  state: 'unconfigured',
+  controlUrl: null,
+  domain: null,
+  subdomain: null,
+  clientId: null,
+  subscription: { plan: null, status: null, expiresAt: null },
+  frpcVersion: null,
+  serviceActive: false,
+  passwordProtected: false,
+  lastError: null,
+  updatedAt: null,
+})
 const telegramBotTokenDraft = ref('')
 const telegramAllowedUserIdsDraft = ref('')
 const telegramConfigError = ref('')
@@ -1744,6 +1826,7 @@ const visibleFeedbackErrors = [
   accountActionError,
   providerError,
   telegramConfigError,
+  starbridgeError,
   createFolderError,
   projectSetupError,
   existingFolderError,
@@ -2790,6 +2873,117 @@ async function saveTelegramConfig(): Promise<void> {
   }
 }
 
+const starbridgeStatusLabel = computed(() => {
+  const labels: Record<StarbridgeStatus['state'], string> = {
+    unconfigured: t('Not configured'),
+    configured: t('Configured'),
+    starting: t('Starting…'),
+    online: t('Online'),
+    stopped: t('Stopped'),
+    expired: t('Subscription expired'),
+    error: t('Error'),
+  }
+  return labels[starbridgeStatus.value.state]
+})
+
+function formatStarbridgeDate(seconds: number): string {
+  if (!Number.isFinite(seconds)) return ''
+  return new Date(seconds * 1000).toLocaleString()
+}
+
+function openStarbridgePanel(): void {
+  isStarbridgeOpen.value = true
+  starbridgeCopyLabel.value = t('Copy URL')
+  starbridgeError.value = ''
+  void refreshStarbridgeStatus()
+}
+
+async function copyStarbridgeUrl(): Promise<void> {
+  const domain = starbridgeStatus.value.domain
+  if (!domain) return
+  try {
+    await copyTextToClipboard(`https://${domain}`)
+    starbridgeCopyLabel.value = t('Copied')
+  } catch {
+    starbridgeCopyLabel.value = t('Copy failed')
+  }
+}
+
+function closeStarbridgePanel(): void {
+  if (starbridgeBusy.value) return
+  isStarbridgeOpen.value = false
+  starbridgeActivationCode.value = ''
+  starbridgeRenewalCode.value = ''
+}
+
+async function refreshStarbridgeStatus(): Promise<void> {
+  try {
+    const status = await getStarbridgeStatus()
+    starbridgeStatus.value = status
+    if (status.controlUrl) starbridgeControlUrl.value = status.controlUrl
+  } catch (error) {
+    starbridgeError.value = error instanceof Error ? error.message : t('Failed to load StarBridge status')
+  }
+}
+
+async function submitStarbridgeActivation(): Promise<void> {
+  if (starbridgeBusy.value) return
+  starbridgeBusy.value = true
+  starbridgeError.value = ''
+  try {
+    starbridgeStatus.value = await activateStarbridge(
+      starbridgeControlUrl.value.trim(),
+      starbridgeActivationCode.value.trim(),
+      starbridgeDeviceName.value.trim() || undefined,
+    )
+    starbridgeActivationCode.value = ''
+  } catch (error) {
+    starbridgeError.value = error instanceof Error ? error.message : t('StarBridge activation failed')
+  } finally {
+    starbridgeBusy.value = false
+  }
+}
+
+async function submitStarbridgeRenewal(): Promise<void> {
+  if (starbridgeBusy.value || !starbridgeRenewalCode.value.trim()) return
+  starbridgeBusy.value = true
+  starbridgeError.value = ''
+  try {
+    starbridgeStatus.value = await renewStarbridge(starbridgeRenewalCode.value.trim())
+    starbridgeRenewalCode.value = ''
+  } catch (error) {
+    starbridgeError.value = error instanceof Error ? error.message : t('StarBridge renewal failed')
+  } finally {
+    starbridgeBusy.value = false
+  }
+}
+
+async function restartStarbridgeConnection(): Promise<void> {
+  if (starbridgeBusy.value) return
+  starbridgeBusy.value = true
+  starbridgeError.value = ''
+  try {
+    starbridgeStatus.value = await restartStarbridge()
+  } catch (error) {
+    starbridgeError.value = error instanceof Error ? error.message : t('StarBridge restart failed')
+  } finally {
+    starbridgeBusy.value = false
+  }
+}
+
+async function disconnectStarbridgeConnection(): Promise<void> {
+  if (starbridgeBusy.value) return
+  starbridgeBusy.value = true
+  starbridgeError.value = ''
+  try {
+    starbridgeStatus.value = await disconnectStarbridge()
+  } catch (error) {
+    starbridgeError.value = error instanceof Error ? error.message : t('Failed to stop StarBridge')
+  } finally {
+    starbridgeBusy.value = false
+  }
+}
+
 function toggleSidebarSearch(): void {
   isSidebarSearchVisible.value = !isSidebarSearchVisible.value
   if (isSidebarSearchVisible.value) {
@@ -3549,6 +3743,10 @@ function setSidebarCollapsed(nextValue: boolean): void {
 
 function onWindowKeyDown(event: KeyboardEvent): void {
   if (event.defaultPrevented) return
+  if (event.key === 'Escape' && isStarbridgeOpen.value) {
+    closeStarbridgePanel()
+    return
+  }
   if (event.key === 'Escape' && isSettingsOpen.value) {
     isSettingsOpen.value = false
     return
@@ -6164,6 +6362,55 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 .sidebar-settings-telegram-actions {
   @apply mt-3 flex items-center justify-end;
 }
+
+.starbridge-modal-backdrop {
+  @apply fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4;
+}
+
+.starbridge-modal {
+  @apply max-h-[min(90vh,46rem)] w-full max-w-lg overflow-y-auto rounded-2xl border border-zinc-200 bg-white p-5 shadow-2xl;
+}
+
+.starbridge-modal-header {
+  @apply mb-4 flex items-start justify-between gap-4;
+}
+
+.starbridge-modal-title {
+  @apply text-lg font-semibold text-zinc-900;
+}
+
+.starbridge-modal-subtitle {
+  @apply mt-1 text-xs leading-5 text-zinc-500;
+}
+
+.starbridge-modal-close {
+  @apply inline-flex h-8 w-8 items-center justify-center rounded-full border-0 bg-transparent text-xl text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900;
+}
+
+.starbridge-status-card {
+  @apply mb-4 flex items-start gap-3 rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-3 text-sm text-zinc-800;
+}
+
+.starbridge-status-card[data-state='online'] { @apply border-emerald-200 bg-emerald-50; }
+.starbridge-status-card[data-state='expired'], .starbridge-status-card[data-state='error'] { @apply border-rose-200 bg-rose-50; }
+.starbridge-status-dot { @apply mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full bg-zinc-400; }
+.starbridge-status-card[data-state='online'] .starbridge-status-dot { @apply bg-emerald-500; }
+.starbridge-status-card[data-state='starting'] .starbridge-status-dot { @apply animate-pulse bg-amber-500; }
+.starbridge-status-card[data-state='expired'] .starbridge-status-dot, .starbridge-status-card[data-state='error'] .starbridge-status-dot { @apply bg-rose-500; }
+.starbridge-status-domain { @apply mt-1 break-all font-mono text-xs text-zinc-600; }
+.starbridge-status-meta { @apply mt-1 text-xs text-zinc-500; }
+.starbridge-status-error, .starbridge-form-error { @apply mt-2 break-words text-xs text-rose-700; }
+.starbridge-status-copy { @apply ml-auto shrink-0 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-700 hover:bg-zinc-50; }
+.starbridge-form { @apply space-y-3; }
+.starbridge-field { @apply flex flex-col gap-1.5 text-xs font-medium text-zinc-700; }
+.starbridge-field input { @apply rounded-lg border border-zinc-200 bg-white px-3 py-2.5 text-sm font-normal text-zinc-900 outline-none focus:border-zinc-400 focus:ring-2 focus:ring-zinc-200; }
+.starbridge-help { @apply text-xs leading-5 text-zinc-500; }
+.starbridge-actions { @apply flex flex-wrap items-center justify-end gap-2; }
+.starbridge-primary, .starbridge-secondary, .starbridge-danger { @apply rounded-lg border px-3 py-2 text-xs font-medium transition disabled:cursor-default disabled:opacity-50; }
+.starbridge-primary { @apply border-zinc-900 bg-zinc-900 text-white hover:bg-zinc-700; }
+.starbridge-secondary { @apply border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50; }
+.starbridge-danger { @apply border-rose-200 bg-white text-rose-700 hover:bg-rose-50; }
+.starbridge-renew-section { @apply mt-4 border-t border-zinc-200 pt-4; }
 
 .sidebar-settings-telegram-save {
   @apply rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 transition hover:bg-zinc-50 disabled:cursor-default disabled:opacity-60;

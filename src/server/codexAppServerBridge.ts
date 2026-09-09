@@ -25,6 +25,8 @@ import { callRpcWithRateLimitDecodeRecovery } from './rateLimitDecodeRecovery.js
 import { handleReviewRoutes } from './reviewGit.js'
 import { handleSkillsRoutes, initializeSkillsSyncOnStartup } from './skillsRoutes.js'
 import { TelegramThreadBridge } from './telegramThreadBridge.js'
+import { StarbridgeManager } from './starbridge/starbridgeManager.js'
+import type { StarbridgeActivateInput, StarbridgeRenewInput } from './starbridge/types.js'
 import {
   getRandomFreeKey,
   getFreeKeyCount,
@@ -9359,8 +9361,9 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
   return { docsById }
 }
 
-export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
+export function createCodexBridgeMiddleware(options: { passwordConfigured?: boolean } = {}): CodexBridgeMiddleware {
   const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor, threadBroker } = getSharedBridgeState()
+  const starbridge = new StarbridgeManager(options.passwordConfigured === true)
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 
@@ -9437,6 +9440,66 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       }
 
       const url = new URL(req.url, 'http://localhost')
+
+      if (url.pathname === '/codex-api/starbridge/status' && req.method === 'GET') {
+        setJson(res, 200, { data: await starbridge.status() })
+        return
+      }
+
+      if (url.pathname === '/codex-api/starbridge/activate' && req.method === 'POST') {
+        let body: Record<string, unknown> | null = null
+        try {
+          body = asRecord(await readJsonBody(req))
+        } catch {
+          setJson(res, 400, { error: '请求体必须是有效 JSON。' })
+          return
+        }
+        const input: StarbridgeActivateInput = {
+          controlUrl: typeof body?.controlUrl === 'string' ? body.controlUrl : '',
+          redemptionCode: typeof body?.redemptionCode === 'string' ? body.redemptionCode : '',
+          deviceName: typeof body?.deviceName === 'string' ? body.deviceName : undefined,
+        }
+        try {
+          setJson(res, 200, { data: await starbridge.activate(input) })
+        } catch (error) {
+          setJson(res, 409, { error: getErrorMessage(error, '星桥激活失败') })
+        }
+        return
+      }
+
+      if (url.pathname === '/codex-api/starbridge/renew' && req.method === 'POST') {
+        let body: Record<string, unknown> | null = null
+        try {
+          body = asRecord(await readJsonBody(req))
+        } catch {
+          setJson(res, 400, { error: '请求体必须是有效 JSON。' })
+          return
+        }
+        const input: StarbridgeRenewInput = {
+          redemptionCode: typeof body?.redemptionCode === 'string' ? body.redemptionCode : '',
+        }
+        try {
+          setJson(res, 200, { data: await starbridge.renew(input) })
+        } catch (error) {
+          setJson(res, 409, { error: getErrorMessage(error, '星桥续费失败') })
+        }
+        return
+      }
+
+      if (url.pathname === '/codex-api/starbridge/restart' && req.method === 'POST') {
+        try {
+          setJson(res, 200, { data: await starbridge.restart() })
+        } catch (error) {
+          setJson(res, 409, { error: getErrorMessage(error, '星桥重启失败') })
+        }
+        return
+      }
+
+      if (url.pathname === '/codex-api/starbridge/disconnect' && req.method === 'POST') {
+        await starbridge.disconnect()
+        setJson(res, 200, { data: await starbridge.status() })
+        return
+      }
 
       if (url.pathname === '/codex-api/zen-proxy/v1/responses' && req.method === 'POST') {
         if (!isLoopbackRemoteAddress(req.socket.remoteAddress)) {
@@ -11974,6 +12037,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
   middleware.dispose = () => {
     threadSearchIndex = null
     telegramBridge.stop()
+    starbridge.dispose()
     terminalManager.dispose()
     backendQueueProcessor.dispose()
     threadBroker.clearWriterState()

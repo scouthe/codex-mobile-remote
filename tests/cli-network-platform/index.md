@@ -27,3 +27,4 @@ Return to the [manual test index](../../tests.md).
 | [Startup welcome log uses repository GitHub URL](startup-welcome-log-uses-repository-github-url.md) |
 | [Home route no longer crashes on dev startup](home-route-no-longer-crashes-on-dev-startup.md) |
 | [Shared app-server socket fails closed during Desktop reconnect](shared-app-server-socket-fails-closed.md) |
+| [StarBridge user client activation](starbridge-user-client.md) |

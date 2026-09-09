@@ -211,6 +211,25 @@ The APK is written to
 `android/app/build/outputs/apk/debug/app-debug.apk`. For setup, security notes,
 and the native bridge contract, see [`android/README.md`](./android/README.md).
 
+## Xuanji StarBridge user client (Linux)
+
+The web Settings panel includes an optional **Xuanji StarBridge** entry for
+users who have received an administrator-issued activation code. It activates
+the Linux host that runs Codex, installs the pinned official FRPC release after
+SHA256 verification, writes a per-device OIDC configuration with private file
+permissions, and manages FRPC through a systemd user unit (with a detached
+process fallback on minimal Linux).
+
+The browser only sends the one-time code to the local codexapp server and
+receives the assigned public domain and subscription status. Device secrets and
+the FRPC configuration remain on the Linux host. Codexapp must have a web
+password before public relay access can be activated. The control plane should
+use HTTPS in production; private HTTP addresses are accepted only for LAN
+testing. Renewal, restart, and stop controls are available in the same panel.
+If GitHub downloads are slow in your region, an administrator can provide an
+HTTPS mirror by setting `CODEXUI_FRPC_DOWNLOAD_BASE_URL`; the client still
+verifies the official release checksum before installing the binary.
+
 ---
 
 ## Tailscale Serve deployment (private remote access)
