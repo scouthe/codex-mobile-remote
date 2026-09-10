@@ -28,9 +28,7 @@ export type StarbridgeStatus = {
 }
 
 export type StarbridgeActivateInput = {
-  controlUrl: string
   redemptionCode: string
-  deviceName?: string
 }
 
 export type StarbridgeRenewInput = {

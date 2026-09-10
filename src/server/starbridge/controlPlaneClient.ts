@@ -1,5 +1,7 @@
 import type { StarbridgeSubscription } from './types.js'
 
+export const DEFAULT_STARBRIDGE_CONTROL_URL = 'https://auth.xingqiao.xuanjishu.site'
+
 export type ControlPlaneCredential = {
   user?: { username?: string }
   device?: { domain?: string; subdomain?: string }

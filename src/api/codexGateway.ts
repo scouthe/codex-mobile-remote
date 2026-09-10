@@ -450,8 +450,8 @@ export function getStarbridgeStatus(): Promise<StarbridgeStatus> {
   return starbridgeRequest('status')
 }
 
-export function activateStarbridge(controlUrl: string, redemptionCode: string, deviceName?: string): Promise<StarbridgeStatus> {
-  return starbridgeRequest('activate', { controlUrl, redemptionCode, deviceName })
+export function activateStarbridge(redemptionCode: string): Promise<StarbridgeStatus> {
+  return starbridgeRequest('activate', { redemptionCode })
 }
 
 export function renewStarbridge(redemptionCode: string): Promise<StarbridgeStatus> {

@@ -9455,9 +9455,7 @@ export function createCodexBridgeMiddleware(options: { passwordConfigured?: bool
           return
         }
         const input: StarbridgeActivateInput = {
-          controlUrl: typeof body?.controlUrl === 'string' ? body.controlUrl : '',
           redemptionCode: typeof body?.redemptionCode === 'string' ? body.redemptionCode : '',
-          deviceName: typeof body?.deviceName === 'string' ? body.deviceName : undefined,
         }
         try {
           setJson(res, 200, { data: await starbridge.activate(input) })

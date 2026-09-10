@@ -1206,32 +1206,30 @@
       </div>
       <div class="starbridge-status-card" :data-state="starbridgeStatus.state" role="status" aria-live="polite">
         <span class="starbridge-status-dot" aria-hidden="true" />
-        <div>
+        <div class="starbridge-status-main">
           <strong>{{ starbridgeStatusLabel }}</strong>
-          <p v-if="starbridgeStatus.domain" class="starbridge-status-domain">{{ starbridgeStatus.domain }}</p>
+          <a
+            v-if="starbridgeStatus.domain"
+            class="starbridge-status-domain"
+            :href="`https://${starbridgeStatus.domain}`"
+            target="_blank"
+            rel="noopener noreferrer"
+          >https://{{ starbridgeStatus.domain }}</a>
           <p v-if="starbridgeStatus.subscription.expiresAt" class="starbridge-status-meta">{{ t('Expires') }}: {{ formatStarbridgeDate(starbridgeStatus.subscription.expiresAt) }}</p>
           <p v-if="starbridgeStatus.lastError" class="starbridge-status-error">{{ starbridgeStatus.lastError }}</p>
         </div>
         <button v-if="starbridgeStatus.domain" class="starbridge-status-copy" type="button" @click="copyStarbridgeUrl">{{ starbridgeCopyLabel }}</button>
       </div>
-      <form class="starbridge-form" @submit.prevent="submitStarbridgeActivation">
-        <label class="starbridge-field">
-          <span>{{ t('Control plane URL') }}</span>
-          <input v-model="starbridgeControlUrl" type="url" inputmode="url" autocomplete="off" placeholder="https://relay.example.com" :disabled="starbridgeBusy">
-        </label>
+      <form v-if="starbridgeStatus.state === 'unconfigured' || starbridgeStatus.state === 'error'" class="starbridge-form" @submit.prevent="submitStarbridgeActivation">
         <label class="starbridge-field">
           <span>{{ t('Activation code') }}</span>
           <input v-model="starbridgeActivationCode" type="password" autocomplete="off" :placeholder="t('Paste the one-time code from your administrator')" :disabled="starbridgeBusy">
         </label>
-        <label class="starbridge-field">
-          <span>{{ t('Device name') }}</span>
-          <input v-model="starbridgeDeviceName" type="text" autocomplete="off" :placeholder="t('This Linux host')" :disabled="starbridgeBusy">
-        </label>
-        <p class="starbridge-help">{{ t('Your device secret stays on this Linux host. The browser never receives FRPC credentials.') }}</p>
+        <p class="starbridge-help">{{ t('A public URL is assigned automatically after activation. Your device secret stays on this Linux host.') }}</p>
         <p v-if="starbridgeError" class="starbridge-form-error" role="alert">{{ starbridgeError }}</p>
         <div class="starbridge-actions">
           <button class="starbridge-secondary" type="button" :disabled="starbridgeBusy" @click="refreshStarbridgeStatus">{{ t('Refresh') }}</button>
-          <button class="starbridge-primary" type="submit" :disabled="starbridgeBusy || !starbridgeControlUrl.trim() || !starbridgeActivationCode.trim()">{{ starbridgeBusy ? t('Activating…') : t('Activate') }}</button>
+          <button class="starbridge-primary" type="submit" :disabled="starbridgeBusy || !starbridgeActivationCode.trim()">{{ starbridgeBusy ? t('Activating…') : t('Activate') }}</button>
         </div>
       </form>
       <div v-if="starbridgeStatus.state !== 'unconfigured'" class="starbridge-renew-section">
@@ -1770,10 +1768,8 @@ const isTelegramConfigOpen = ref(false)
 const isStarbridgeOpen = ref(false)
 const starbridgeBusy = ref(false)
 const starbridgeError = ref('')
-const starbridgeControlUrl = ref('')
 const starbridgeActivationCode = ref('')
 const starbridgeRenewalCode = ref('')
-const starbridgeDeviceName = ref('')
 const starbridgeCopyLabel = ref('')
 const starbridgeStatus = ref<StarbridgeStatus>({
   state: 'unconfigured',
@@ -2920,7 +2916,6 @@ async function refreshStarbridgeStatus(): Promise<void> {
   try {
     const status = await getStarbridgeStatus()
     starbridgeStatus.value = status
-    if (status.controlUrl) starbridgeControlUrl.value = status.controlUrl
   } catch (error) {
     starbridgeError.value = error instanceof Error ? error.message : t('Failed to load StarBridge status')
   }
@@ -2931,11 +2926,7 @@ async function submitStarbridgeActivation(): Promise<void> {
   starbridgeBusy.value = true
   starbridgeError.value = ''
   try {
-    starbridgeStatus.value = await activateStarbridge(
-      starbridgeControlUrl.value.trim(),
-      starbridgeActivationCode.value.trim(),
-      starbridgeDeviceName.value.trim() || undefined,
-    )
+    starbridgeStatus.value = await activateStarbridge(starbridgeActivationCode.value.trim())
     starbridgeActivationCode.value = ''
   } catch (error) {
     starbridgeError.value = error instanceof Error ? error.message : t('StarBridge activation failed')
@@ -6397,7 +6388,9 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 .starbridge-status-card[data-state='online'] .starbridge-status-dot { @apply bg-emerald-500; }
 .starbridge-status-card[data-state='starting'] .starbridge-status-dot { @apply animate-pulse bg-amber-500; }
 .starbridge-status-card[data-state='expired'] .starbridge-status-dot, .starbridge-status-card[data-state='error'] .starbridge-status-dot { @apply bg-rose-500; }
-.starbridge-status-domain { @apply mt-1 break-all font-mono text-xs text-zinc-600; }
+.starbridge-status-main { @apply min-w-0 flex-1; }
+.starbridge-status-main strong { @apply block; }
+.starbridge-status-domain { @apply mt-1 block break-all font-mono text-xs leading-5 text-zinc-600 underline-offset-2 hover:underline; }
 .starbridge-status-meta { @apply mt-1 text-xs text-zinc-500; }
 .starbridge-status-error, .starbridge-form-error { @apply mt-2 break-words text-xs text-rose-700; }
 .starbridge-status-copy { @apply ml-auto shrink-0 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-700 hover:bg-zinc-50; }

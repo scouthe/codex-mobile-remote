@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import { hostname } from 'node:os'
 import {
   clearActivationAttempt,
   getStarbridgePaths,
@@ -10,7 +11,7 @@ import {
   type StarbridgeDevice,
   type StarbridgePaths,
 } from './credentialStore.js'
-import { normalizeStarbridgeControlUrl, redeemActivation, redeemRenewal } from './controlPlaneClient.js'
+import { DEFAULT_STARBRIDGE_CONTROL_URL, normalizeStarbridgeControlUrl, redeemActivation, redeemRenewal } from './controlPlaneClient.js'
 import { ensureFrpcInstalled } from './frpcInstaller.js'
 import { isFrpcActive, startFrpc, stopFrpc } from './frpcRuntime.js'
 import type { StarbridgeActivateInput, StarbridgeRenewInput, StarbridgeStatus } from './types.js'
@@ -101,12 +102,14 @@ export class StarbridgeManager {
     if (!this.passwordConfigured) throw new Error('请先为 codexapp 设置访问密码，再启用公网访问。')
     const redemptionCode = input.redemptionCode.trim()
     if (!redemptionCode.startsWith('xj_act_') || redemptionCode.length > 160) throw new Error('激活码格式无效。')
-    const controlUrl = normalizeStarbridgeControlUrl(input.controlUrl)
+    const controlUrl = normalizeStarbridgeControlUrl(
+      process.env.CODEXUI_STARBRIDGE_CONTROL_URL?.trim() || DEFAULT_STARBRIDGE_CONTROL_URL,
+    )
     const existing = await readDevice(this.paths)
     if (existing) throw new Error('本机已经激活星桥，请使用续费码或重启连接。')
     const pendingAttempt = await readActivationAttempt(this.paths)
     const secret = pendingAttempt?.deviceSecret || deviceSecret()
-    const name = input.deviceName?.trim() || pendingAttempt?.deviceName || 'codexapp'
+    const name = pendingAttempt?.deviceName || hostname().trim().slice(0, 80) || 'codexapp'
     if (name.length > 80) throw new Error('设备名称不能超过 80 个字符。')
     try {
       await writeActivationAttempt({ deviceName: name, deviceSecret: secret, controlUrl, updatedAt: Date.now() }, this.paths)

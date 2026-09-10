@@ -13,6 +13,7 @@ const tempDirectories: string[] = []
 afterEach(async () => {
   await Promise.all(tempDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })))
   delete process.env.CODEXUI_STARBRIDGE_HOME
+  delete process.env.CODEXUI_STARBRIDGE_CONTROL_URL
 })
 
 describe('StarBridge host module', () => {
@@ -53,6 +54,7 @@ describe('StarBridge host module', () => {
   it('persists one device secret before redemption and reuses it after a lost response', async () => {
     const root = await mkdtemp(join(tmpdir(), 'codexapp-starbridge-retry-'))
     tempDirectories.push(root)
+    process.env.CODEXUI_STARBRIDGE_CONTROL_URL = 'https://relay.example.com'
     const paths = getStarbridgePaths(root)
     const observedSecrets: string[] = []
     let failRequest = true
@@ -74,11 +76,11 @@ describe('StarBridge host module', () => {
       isFrpcActive: async () => true,
     })
 
-    await expect(manager.activate({ controlUrl: 'https://relay.example.com', redemptionCode: 'xj_act_once' })).rejects.toThrow('lost response')
+    await expect(manager.activate({ redemptionCode: 'xj_act_once' })).rejects.toThrow('lost response')
     const pending = await readActivationAttempt(paths)
     expect(pending?.deviceSecret).toMatch(/^xj_dev_/u)
     failRequest = false
-    const status = await manager.activate({ controlUrl: 'https://relay.example.com', redemptionCode: 'xj_act_once' })
+    const status = await manager.activate({ redemptionCode: 'xj_act_once' })
     expect(status.state).toBe('online')
     expect(observedSecrets).toEqual([pending?.deviceSecret, pending?.deviceSecret])
     expect(await readActivationAttempt(paths)).toBeNull()
@@ -95,7 +97,7 @@ describe('StarBridge host module', () => {
       const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/starbridge/activate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ controlUrl: 'https://relay.example.com', redemptionCode: 'xj_act_test' }),
+        body: JSON.stringify({ redemptionCode: 'xj_act_test' }),
       })
       expect(response.status).toBe(409)
       expect((await response.json() as { error?: string }).error).toMatch(/访问密码/u)
