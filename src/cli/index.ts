@@ -23,7 +23,7 @@ import {
   parseSandboxMode,
 } from '../server/appServerRuntimeConfig.js'
 import { createServer as createApp } from '../server/httpServer.js'
-import { generatePassword } from '../server/password.js'
+import { persistWebPassword, persistWebPasswordSkip, resolveWebPassword } from '../server/passwordSetupStore.js'
 import { spawnSyncCommand } from '../utils/commandInvocation.js'
 
 const program = new Command().name('codexui').description('Web interface for Codex app-server')
@@ -250,34 +250,6 @@ function ensureCodexInstalled(): string | null {
     console.log('\nCodex CLI installed.\n')
   }
   return codexCommand
-}
-
-type PasswordResolution = {
-  password: string | undefined
-  generated: boolean
-}
-
-function resolvePassword(input: string | boolean): PasswordResolution {
-  if (input === false) {
-    return { password: undefined, generated: false }
-  }
-  if (typeof input === 'string') {
-    return { password: input, generated: false }
-  }
-  return { password: generatePassword(), generated: true }
-}
-
-function getGeneratedPasswordPath(): string {
-  return join(getCodexHomePath(), 'codexui-password')
-}
-
-async function persistGeneratedPassword(password: string): Promise<string> {
-  const codexHome = getCodexHomePath()
-  mkdirSync(codexHome, { recursive: true })
-  const passwordPath = getGeneratedPasswordPath()
-  await writeFile(passwordPath, `${password}\n`, { encoding: 'utf8', mode: 0o600 })
-  chmodSync(passwordPath, 0o600)
-  return passwordPath
 }
 
 function printTermuxKeepAlive(lines: string[]): void {
@@ -541,12 +513,16 @@ async function startServer(options: {
     console.log('\nCodex is not logged in. You can log in later via settings or run `codexui login`.\n')
   }
   const requestedPort = parseInt(options.port, 10)
-  const passwordResolution = resolvePassword(options.password)
+  const codexHome = getCodexHomePath()
+  const passwordResolution = resolveWebPassword(options.password, codexHome)
   const password = passwordResolution.password
-  const generatedPasswordPath = password && passwordResolution.generated
-    ? await persistGeneratedPassword(password)
-    : null
-  const { app, dispose, attachWebSocket } = createApp({ password })
+  const { app, dispose, attachWebSocket } = createApp({
+    password,
+    passwordSetupRequired: passwordResolution.setupRequired,
+    lanOnly: passwordResolution.source === 'skipped',
+    persistPassword: (nextPassword) => persistWebPassword(nextPassword, codexHome),
+    persistPasswordSkip: () => persistWebPasswordSkip(codexHome),
+  })
   const server = createServer(app)
   attachWebSocket(server)
   const port = await listenWithFallback(server, requestedPort)
@@ -590,9 +566,10 @@ async function startServer(options: {
     lines.push(`  Requested port ${String(requestedPort)} was unavailable; using ${String(port)}.`)
   }
 
-  if (generatedPasswordPath) {
-    lines.push(`  Generated password file: ${generatedPasswordPath}`)
-    lines.push('  Use that file to retrieve the password for untrusted origins.')
+  if (passwordResolution.setupRequired) {
+    lines.push('  First-run setup: open the web UI to choose password-protected or LAN-only access.')
+  } else if (passwordResolution.source === 'stored') {
+    lines.push(`  Password file: ${join(codexHome, 'codexui-password')}`)
   }
 
   const tunnelQrUrl = tunnelUrl ? buildTunnelAutologinUrl(tunnelUrl, password) : null

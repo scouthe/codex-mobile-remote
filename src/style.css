@@ -229,6 +229,10 @@
   @apply border-zinc-700;
 }
 
+:root.dark .web-password-success {
+  @apply text-emerald-300;
+}
+
 :root.dark .sidebar-skills-link {
   @apply border-emerald-900/70 bg-[linear-gradient(135deg,_rgba(6,78,59,0.42),_rgba(24,24,27,0.96))] text-zinc-100 hover:border-emerald-700 hover:bg-emerald-950;
 }

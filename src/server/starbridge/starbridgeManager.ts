@@ -71,16 +71,16 @@ function validateFrpcConfig(config: string, expectedSubdomain: string): void {
 export class StarbridgeManager {
   private readonly paths: StarbridgePaths
   private readonly dependencies: StarbridgeManagerDependencies
-  private readonly passwordConfigured: boolean
+  private readonly passwordConfigured: () => boolean
   private lastError: string | null = null
   private mutation: Promise<void> = Promise.resolve()
 
   constructor(
-    passwordConfigured: boolean,
+    passwordConfigured: boolean | (() => boolean),
     paths = getStarbridgePaths(),
     dependencies: Partial<StarbridgeManagerDependencies> = {},
   ) {
-    this.passwordConfigured = passwordConfigured
+    this.passwordConfigured = typeof passwordConfigured === 'function' ? passwordConfigured : () => passwordConfigured
     this.paths = paths
     this.dependencies = {
       redeemActivation,
@@ -99,7 +99,7 @@ export class StarbridgeManager {
 
   private async activateUnlocked(input: StarbridgeActivateInput): Promise<StarbridgeStatus> {
     if (process.platform !== 'linux') throw new Error('星桥用户端目前仅支持 Linux 主机。')
-    if (!this.passwordConfigured) throw new Error('请先为 codexapp 设置访问密码，再启用公网访问。')
+    if (!this.passwordConfigured()) throw new Error('请先为 codexapp 设置访问密码，再启用公网访问。')
     const redemptionCode = input.redemptionCode.trim()
     if (!redemptionCode.startsWith('xj_act_') || redemptionCode.length > 160) throw new Error('激活码格式无效。')
     const controlUrl = normalizeStarbridgeControlUrl(
@@ -160,7 +160,7 @@ export class StarbridgeManager {
   }
 
   private async renewUnlocked(input: StarbridgeRenewInput): Promise<StarbridgeStatus> {
-    if (!this.passwordConfigured) throw new Error('请先为 codexapp 设置访问密码，再续费公网访问。')
+    if (!this.passwordConfigured()) throw new Error('请先为 codexapp 设置访问密码，再续费公网访问。')
     const redemptionCode = input.redemptionCode.trim()
     if (!redemptionCode.startsWith('xj_renew_') || redemptionCode.length > 160) throw new Error('续费码格式无效。')
     const current = await readDevice(this.paths)
@@ -231,13 +231,13 @@ export class StarbridgeManager {
       return {
         state: 'unconfigured', controlUrl: null, domain: null, subdomain: null,
         clientId: null, subscription: emptySubscription(), frpcVersion: null,
-        serviceActive: false, passwordProtected: this.passwordConfigured,
+        serviceActive: false, passwordProtected: this.passwordConfigured(),
         lastError: this.lastError, updatedAt: null,
       }
     }
     const serviceActive = await this.dependencies.isFrpcActive(this.paths, current.pid)
     const expired = isExpired(current.subscription)
-    const securityError = this.passwordConfigured ? null : '请先为 codexapp 设置访问密码，公网访问才能安全启用。'
+    const securityError = this.passwordConfigured() ? null : '请先为 codexapp 设置访问密码，公网访问才能安全启用。'
     return {
       state: securityError ? 'error' : expired ? 'expired' : serviceActive ? 'online' : this.lastError ? 'error' : 'stopped',
       controlUrl: current.controlUrl,
@@ -247,7 +247,7 @@ export class StarbridgeManager {
       subscription: current.subscription,
       frpcVersion: current.frpcVersion,
       serviceActive,
-      passwordProtected: this.passwordConfigured,
+      passwordProtected: this.passwordConfigured(),
       lastError: securityError || this.lastError,
       updatedAt: current.updatedAt,
     }

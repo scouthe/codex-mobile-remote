@@ -227,6 +227,10 @@
                 <span class="sidebar-settings-label">{{ t('Xuanji StarBridge') }}</span>
                 <span class="sidebar-settings-value">{{ starbridgeStatusLabel }}</span>
               </button>
+              <button class="sidebar-settings-row" type="button" :title="t('Set or change the web access password')" @click="openWebPasswordPanel">
+                <span class="sidebar-settings-label">{{ t('Web access password') }}</span>
+                <span class="sidebar-settings-value">{{ t('Manage') }}</span>
+              </button>
               <button class="sidebar-settings-row" type="button" :title="SETTINGS_HELP.sendWithEnter" @click="toggleSendWithEnter">
                 <span class="sidebar-settings-label">{{ t('Require ⌘ + enter to send') }}</span>
                 <span class="sidebar-settings-toggle" :class="{ 'is-on': !sendWithEnter }" />
@@ -1245,6 +1249,41 @@
       </div>
     </section>
   </div>
+  <div v-if="isWebPasswordOpen" class="starbridge-modal-backdrop" role="presentation" @click.self="closeWebPasswordPanel">
+    <section class="starbridge-modal" role="dialog" aria-modal="true" :aria-label="t('Web access password')" @click.stop>
+      <div class="starbridge-modal-header">
+        <div>
+          <h2 class="starbridge-modal-title">{{ t('Web access password') }}</h2>
+          <p class="starbridge-modal-subtitle">{{ t('A password is required before enabling public remote access.') }}</p>
+        </div>
+        <button class="starbridge-modal-close" type="button" :aria-label="t('Close')" @click="closeWebPasswordPanel">×</button>
+      </div>
+      <div v-if="webAuthStatus" class="starbridge-status-card" :data-state="webAuthStatus.passwordProtected ? 'online' : 'stopped'" role="status">
+        <span class="starbridge-status-dot" aria-hidden="true" />
+        <div class="starbridge-status-main">
+          <strong>{{ webAuthStatus.passwordProtected ? t('Password protected') : t('LAN only') }}</strong>
+          <p class="starbridge-status-meta">{{ webAuthStatus.passwordProtected ? t('Public relay access can be enabled.') : t('Public relay access remains disabled until a password is set.') }}</p>
+        </div>
+      </div>
+      <form class="starbridge-form" @submit.prevent="submitWebPassword">
+        <label class="starbridge-field">
+          <span>{{ webAuthStatus?.passwordProtected ? t('New password') : t('Password') }}</span>
+          <input v-model="webPasswordDraft" type="password" autocomplete="new-password" minlength="8" maxlength="128" :disabled="webPasswordBusy">
+        </label>
+        <label class="starbridge-field">
+          <span>{{ t('Confirm password') }}</span>
+          <input v-model="webPasswordConfirm" type="password" autocomplete="new-password" minlength="8" maxlength="128" :disabled="webPasswordBusy">
+        </label>
+        <p class="starbridge-help">{{ t('Use 8 to 128 characters. The password is stored only on this Linux host.') }}</p>
+        <p v-if="webPasswordError" class="starbridge-form-error" role="alert">{{ webPasswordError }}</p>
+        <p v-if="webPasswordSaved" class="web-password-success" role="status">{{ t('Password saved. This browser remains signed in.') }}</p>
+        <div class="starbridge-actions">
+          <button class="starbridge-secondary" type="button" :disabled="webPasswordBusy" @click="closeWebPasswordPanel">{{ t('Cancel') }}</button>
+          <button class="starbridge-primary" type="submit" :disabled="webPasswordBusy || webPasswordDraft.length < 8 || !webPasswordConfirm">{{ webPasswordBusy ? t('Saving…') : t('Save password') }}</button>
+        </div>
+      </form>
+    </section>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -1294,6 +1333,8 @@ import {
   getProjectRootSuggestion,
   getTelegramStatus,
   activateStarbridge,
+  getWebAuthStatus,
+  setWebAuthPassword,
   disconnectStarbridge,
   getStarbridgeStatus,
   renewStarbridge,
@@ -1314,7 +1355,7 @@ import {
 } from './api/codexGateway'
 import type { ReasoningEffort, SpeedMode, UiAccountEntry, UiRateLimitWindow, UiServerRequest, UiServerRequestReply, UiThreadAutomation, UiThreadTokenUsage } from './types/codex'
 import type { ComposerDraftPayload, ThreadComposerExposed } from './components/content/ThreadComposer.vue'
-import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, StarbridgeStatus, TelegramStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
+import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, StarbridgeStatus, TelegramStatus, ThreadTerminalQuickCommand, WebAuthStatus, WorktreeBranchOption } from './api/codexGateway'
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
@@ -1766,6 +1807,13 @@ const openRouterWireApi = ref<'responses' | 'chat'>('responses')
 const opencodeZenKey = ref('')
 const isTelegramConfigOpen = ref(false)
 const isStarbridgeOpen = ref(false)
+const isWebPasswordOpen = ref(false)
+const webPasswordBusy = ref(false)
+const webPasswordError = ref('')
+const webPasswordDraft = ref('')
+const webPasswordConfirm = ref('')
+const webPasswordSaved = ref(false)
+const webAuthStatus = ref<WebAuthStatus | null>(null)
 const starbridgeBusy = ref(false)
 const starbridgeError = ref('')
 const starbridgeActivationCode = ref('')
@@ -2885,6 +2933,57 @@ const starbridgeStatusLabel = computed(() => {
 function formatStarbridgeDate(seconds: number): string {
   if (!Number.isFinite(seconds)) return ''
   return new Date(seconds * 1000).toLocaleString()
+}
+
+function openWebPasswordPanel(): void {
+  isWebPasswordOpen.value = true
+  webPasswordError.value = ''
+  webPasswordSaved.value = false
+  webPasswordDraft.value = ''
+  webPasswordConfirm.value = ''
+  void refreshWebAuthStatus()
+}
+
+function closeWebPasswordPanel(): void {
+  if (webPasswordBusy.value) return
+  isWebPasswordOpen.value = false
+  webPasswordDraft.value = ''
+  webPasswordConfirm.value = ''
+  webPasswordError.value = ''
+}
+
+async function refreshWebAuthStatus(): Promise<void> {
+  try {
+    webAuthStatus.value = await getWebAuthStatus()
+  } catch (error) {
+    webPasswordError.value = error instanceof Error ? error.message : t('Failed to load password status')
+  }
+}
+
+async function submitWebPassword(): Promise<void> {
+  if (webPasswordBusy.value) return
+  webPasswordError.value = ''
+  webPasswordSaved.value = false
+  if (webPasswordDraft.value !== webPasswordConfirm.value) {
+    webPasswordError.value = t('Passwords do not match.')
+    return
+  }
+  if (webPasswordDraft.value.length < 8 || webPasswordDraft.value.length > 128) {
+    webPasswordError.value = t('Password must contain 8 to 128 characters.')
+    return
+  }
+  webPasswordBusy.value = true
+  try {
+    webAuthStatus.value = await setWebAuthPassword(webPasswordDraft.value)
+    webPasswordDraft.value = ''
+    webPasswordConfirm.value = ''
+    webPasswordSaved.value = true
+    await refreshStarbridgeStatus()
+  } catch (error) {
+    webPasswordError.value = error instanceof Error ? error.message : t('Failed to save password')
+  } finally {
+    webPasswordBusy.value = false
+  }
 }
 
 function openStarbridgePanel(): void {
@@ -6393,6 +6492,7 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 .starbridge-status-domain { @apply mt-1 block break-all font-mono text-xs leading-5 text-zinc-600 underline-offset-2 hover:underline; }
 .starbridge-status-meta { @apply mt-1 text-xs text-zinc-500; }
 .starbridge-status-error, .starbridge-form-error { @apply mt-2 break-words text-xs text-rose-700; }
+.web-password-success { @apply mt-2 text-xs text-emerald-700; }
 .starbridge-status-copy { @apply ml-auto shrink-0 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs text-zinc-700 hover:bg-zinc-50; }
 .starbridge-form { @apply space-y-3; }
 .starbridge-field { @apply flex flex-col gap-1.5 text-xs font-medium text-zinc-700; }

@@ -9361,9 +9361,9 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
   return { docsById }
 }
 
-export function createCodexBridgeMiddleware(options: { passwordConfigured?: boolean } = {}): CodexBridgeMiddleware {
+export function createCodexBridgeMiddleware(options: { passwordConfigured?: boolean | (() => boolean) } = {}): CodexBridgeMiddleware {
   const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor, threadBroker } = getSharedBridgeState()
-  const starbridge = new StarbridgeManager(options.passwordConfigured === true)
+  const starbridge = new StarbridgeManager(options.passwordConfigured ?? false)
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 

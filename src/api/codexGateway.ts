@@ -402,6 +402,35 @@ export type StarbridgeStatus = {
   updatedAt: number | null
 }
 
+export type WebAuthStatus = {
+  passwordProtected: boolean
+  lanOnly: boolean
+}
+
+export async function getWebAuthStatus(): Promise<WebAuthStatus> {
+  const response = await fetch('/auth/status')
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) throw new Error(getErrorMessageFromPayload(payload, '无法读取访问密码状态'))
+  return {
+    passwordProtected: payload.passwordProtected === true,
+    lanOnly: payload.lanOnly === true,
+  }
+}
+
+export async function setWebAuthPassword(password: string): Promise<WebAuthStatus> {
+  const response = await fetch('/auth/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+  })
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) throw new Error(getErrorMessageFromPayload(payload, '密码保存失败'))
+  return {
+    passwordProtected: payload.passwordProtected === true,
+    lanOnly: payload.lanOnly === true,
+  }
+}
+
 function normalizeStarbridgePayload(payload: unknown): StarbridgeStatus {
   const root = payload && typeof payload === 'object' && !Array.isArray(payload)
     ? payload as Record<string, unknown>
