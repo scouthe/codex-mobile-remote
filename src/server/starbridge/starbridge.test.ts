@@ -107,6 +107,29 @@ describe('StarBridge host module', () => {
     }
   })
 
+  it('does not restart StarBridge when the local Codex web server has no password', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'codexapp-starbridge-restart-auth-'))
+    tempDirectories.push(root)
+    const paths = getStarbridgePaths(root)
+    await writeDevice({
+      deviceName: 'alice-host', deviceSecret: 'xj_dev_test', controlUrl: 'https://relay.example.com',
+      clientId: 'device-alice', domain: 'alice.relay.example.com', subdomain: 'alice', username: 'alice',
+      subscription: { plan: 'monthly', status: 'active', expiresAt: 2_000_000_000 },
+      frpcConfig: 'auth.method = "oidc"\n[[proxies]]\ntype = "http"\nlocalIP = "127.0.0.1"\nlocalPort = 5900\nsubdomain = "alice"\n',
+      frpcVersion: '0.71.0', updatedAt: Date.now(),
+    }, paths)
+    let started = false
+    const manager = new StarbridgeManager(false, paths, {
+      startFrpc: async () => {
+        started = true
+        return { active: true, mode: 'systemd' }
+      },
+    })
+
+    await expect(manager.restart()).rejects.toThrow(/访问密码/u)
+    expect(started).toBe(false)
+  })
+
   it('rejects unsafe replacement configuration returned during renewal', async () => {
     const root = await mkdtemp(join(tmpdir(), 'codexapp-starbridge-renew-'))
     tempDirectories.push(root)

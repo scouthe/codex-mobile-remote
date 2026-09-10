@@ -201,6 +201,7 @@ export class StarbridgeManager {
   }
 
   private async restartUnlocked(): Promise<StarbridgeStatus> {
+    if (!this.passwordConfigured()) throw new Error('请先为 codexapp 设置访问密码，再重启公网访问。')
     const current = await readDevice(this.paths)
     if (!current) throw new Error('本机尚未激活星桥设备。')
     const runtime = await this.dependencies.startFrpc(this.paths, current.pid)
