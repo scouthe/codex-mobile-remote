@@ -224,7 +224,7 @@
                 </template>
               </div>
               <button class="sidebar-settings-row" type="button" :title="t('Configure public relay access')" @click="openStarbridgePanel">
-                <span class="sidebar-settings-label">{{ t('Xuanji StarBridge') }}</span>
+                <span class="sidebar-settings-label">{{ t('StarBridge') }}</span>
                 <span class="sidebar-settings-value">{{ starbridgeStatusLabel }}</span>
               </button>
               <button class="sidebar-settings-row" type="button" :title="t('Set or change the web access password')" @click="openWebPasswordPanel">
@@ -1200,10 +1200,10 @@
     </form>
   </div>
   <div v-if="isStarbridgeOpen" class="starbridge-modal-backdrop" role="presentation" @click.self="closeStarbridgePanel">
-    <section class="starbridge-modal" role="dialog" aria-modal="true" :aria-label="t('Xuanji StarBridge')" @click.stop>
+    <section class="starbridge-modal" role="dialog" aria-modal="true" :aria-label="t('StarBridge')" @click.stop>
       <div class="starbridge-modal-header">
         <div>
-          <h2 class="starbridge-modal-title">{{ t('Xuanji StarBridge') }}</h2>
+          <h2 class="starbridge-modal-title">{{ t('StarBridge') }}</h2>
           <p class="starbridge-modal-subtitle">{{ t('Expose this Linux Codex host through your authorized relay.') }}</p>
         </div>
         <button class="starbridge-modal-close" type="button" :aria-label="t('Close')" @click="closeStarbridgePanel">×</button>

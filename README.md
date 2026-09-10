@@ -211,9 +211,9 @@ The APK is written to
 `android/app/build/outputs/apk/debug/app-debug.apk`. For setup, security notes,
 and the native bridge contract, see [`android/README.md`](./android/README.md).
 
-## Xuanji StarBridge user client (Linux)
+## StarBridge user client (Linux)
 
-The web Settings panel includes an optional **Xuanji StarBridge** entry for
+The web Settings panel includes an optional **StarBridge** entry for
 users who have received an administrator-issued activation code. It activates
 the Linux host that runs Codex, installs the pinned official FRPC release after
 SHA256 verification, writes a per-device OIDC configuration with private file

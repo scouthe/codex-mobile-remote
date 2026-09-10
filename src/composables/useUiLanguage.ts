@@ -23,7 +23,7 @@ const zhCN: Record<string, string> = {
   'Expand accounts': '展开账户',
   'Collapse accounts': '折叠账户',
   'Accounts': '账户',
-  'Xuanji StarBridge': '璇玑星桥',
+  'StarBridge': '星桥',
   'Configure public relay access': '配置公网中转访问',
   'Web access password': '网页访问密码',
   'Set or change the web access password': '设置或修改网页访问密码',

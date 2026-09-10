@@ -264,7 +264,7 @@ button{width:100%;padding:.72rem;margin-top:.75rem;border-radius:9px;font-size:.
   <p class="intro">选择适合你的访问方式。设置完成后会进入 Codex 页面。</p>
   <section class="choice">
     <h2>设置访问密码</h2>
-    <p>如果你准备通过璇玑星桥或其他方式从公网访问，必须先设置密码。</p>
+    <p>如果你准备通过星桥或其他方式从公网访问，必须先设置密码。</p>
     <form id="password-form">
       <label for="password">密码</label>
       <input id="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>

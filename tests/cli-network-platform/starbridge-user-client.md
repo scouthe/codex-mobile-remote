@@ -9,7 +9,7 @@
 
 ## Steps
 
-1. Open the codexapp web UI and open Settings → Xuanji StarBridge.
+1. Open the codexapp web UI and open Settings → StarBridge.
 2. Confirm that the activation form contains only one user-editable field: Activation code. Control-plane URL and device-name fields must not be shown.
 3. Enter the administrator-issued activation code. The client uses the built-in control-plane URL and derives the device name from the Linux hostname.
 4. Click Activate and wait for the status to become Online.
