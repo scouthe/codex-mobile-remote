@@ -382,6 +382,119 @@ export type TelegramConfig = {
   allowedUserIds: Array<number | '*'>
 }
 
+export type StarbridgeSubscription = {
+  plan: string | null
+  status: string | null
+  expiresAt: number | null
+}
+
+export type StarbridgeStatus = {
+  state: 'unconfigured' | 'configured' | 'starting' | 'online' | 'stopped' | 'expired' | 'error'
+  controlUrl: string | null
+  domain: string | null
+  subdomain: string | null
+  clientId: string | null
+  subscription: StarbridgeSubscription
+  frpcVersion: string | null
+  serviceActive: boolean
+  passwordProtected: boolean
+  lastError: string | null
+  updatedAt: number | null
+}
+
+export type WebAuthStatus = {
+  passwordProtected: boolean
+  lanOnly: boolean
+}
+
+export async function getWebAuthStatus(): Promise<WebAuthStatus> {
+  const response = await fetch('/auth/status')
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) throw new Error(getErrorMessageFromPayload(payload, '无法读取访问密码状态'))
+  return {
+    passwordProtected: payload.passwordProtected === true,
+    lanOnly: payload.lanOnly === true,
+  }
+}
+
+export async function setWebAuthPassword(password: string): Promise<WebAuthStatus> {
+  const response = await fetch('/auth/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+  })
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) throw new Error(getErrorMessageFromPayload(payload, '密码保存失败'))
+  return {
+    passwordProtected: payload.passwordProtected === true,
+    lanOnly: payload.lanOnly === true,
+  }
+}
+
+function normalizeStarbridgePayload(payload: unknown): StarbridgeStatus {
+  const root = payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : {}
+  const raw = root.data && typeof root.data === 'object' && !Array.isArray(root.data)
+    ? root.data as Record<string, unknown>
+    : root
+  const subscription = raw.subscription && typeof raw.subscription === 'object' && !Array.isArray(raw.subscription)
+    ? raw.subscription as Record<string, unknown>
+    : {}
+  const states = new Set<StarbridgeStatus['state']>(['unconfigured', 'configured', 'starting', 'online', 'stopped', 'expired', 'error'])
+  const state = typeof raw.state === 'string' && states.has(raw.state as StarbridgeStatus['state'])
+    ? raw.state as StarbridgeStatus['state']
+    : 'unconfigured'
+  return {
+    state,
+    controlUrl: typeof raw.controlUrl === 'string' ? raw.controlUrl : null,
+    domain: typeof raw.domain === 'string' ? raw.domain : null,
+    subdomain: typeof raw.subdomain === 'string' ? raw.subdomain : null,
+    clientId: typeof raw.clientId === 'string' ? raw.clientId : null,
+    subscription: {
+      plan: typeof subscription.plan === 'string' ? subscription.plan : null,
+      status: typeof subscription.status === 'string' ? subscription.status : null,
+      expiresAt: typeof subscription.expiresAt === 'number' ? subscription.expiresAt : null,
+    },
+    frpcVersion: typeof raw.frpcVersion === 'string' ? raw.frpcVersion : null,
+    serviceActive: raw.serviceActive === true,
+    passwordProtected: raw.passwordProtected === true,
+    lastError: typeof raw.lastError === 'string' ? raw.lastError : null,
+    updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : null,
+  }
+}
+
+async function starbridgeRequest(path: string, body?: Record<string, unknown>): Promise<StarbridgeStatus> {
+  const response = await fetch(`/codex-api/starbridge/${path}`, {
+    method: body ? 'POST' : 'GET',
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  const payload = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(getErrorMessageFromPayload(payload, '星桥请求失败'))
+  return normalizeStarbridgePayload(payload)
+}
+
+export function getStarbridgeStatus(): Promise<StarbridgeStatus> {
+  return starbridgeRequest('status')
+}
+
+export function activateStarbridge(redemptionCode: string): Promise<StarbridgeStatus> {
+  return starbridgeRequest('activate', { redemptionCode })
+}
+
+export function renewStarbridge(redemptionCode: string): Promise<StarbridgeStatus> {
+  return starbridgeRequest('renew', { redemptionCode })
+}
+
+export function restartStarbridge(): Promise<StarbridgeStatus> {
+  return starbridgeRequest('restart', {})
+}
+
+export function disconnectStarbridge(): Promise<StarbridgeStatus> {
+  return starbridgeRequest('disconnect', {})
+}
+
 export type LocalDirectoryEntry = {
   name: string
   path: string

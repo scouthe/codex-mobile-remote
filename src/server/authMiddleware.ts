@@ -73,6 +73,24 @@ function isTrustedTailscaleRemote(remote: string): boolean {
   return isTrustedTailscaleIPv4(remote) || isTrustedTailscaleIPv6(remote)
 }
 
+function isTrustedPrivateRemote(remote: string): boolean {
+  const normalized = remote.startsWith('::ffff:') ? remote.slice('::ffff:'.length) : remote.toLowerCase()
+  if (normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80:')) return true
+  const parts = normalized.split('.')
+  if (parts.length !== 4 || !parts.every(isIPv4Octet)) return false
+  const first = Number.parseInt(parts[0] ?? '', 10)
+  const second = Number.parseInt(parts[1] ?? '', 10)
+  return first === 10
+    || (first === 172 && second >= 16 && second <= 31)
+    || (first === 192 && second === 168)
+}
+
+function isTrustedLanRequest(remoteAddress: string | undefined, hostHeader: string | undefined): boolean {
+  const remote = remoteAddress ?? ''
+  if (isLocalhostRemote(remote)) return isLocalhostHost(hostHeader ?? '')
+  return isTrustedPrivateRemote(remote) || isTrustedTailscaleRemote(remote)
+}
+
 function getCodexHomeDir(): string {
   const codexHome = process.env.CODEX_HOME?.trim()
   return codexHome && codexHome.length > 0 ? codexHome : join(homedir(), '.codex')
@@ -212,6 +230,89 @@ form.addEventListener('submit',async e=>{
 </body>
 </html>`
 
+const FIRST_RUN_SETUP_HTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Remote · 首次使用设置</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;background:#f4f4f5;color:#18181b;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:1rem}
+.card{background:#fff;border:1px solid #e4e4e7;border-radius:18px;padding:1.5rem;width:100%;max-width:440px;box-shadow:0 20px 50px rgba(0,0,0,.12)}
+.eyebrow{color:#71717a;font-size:.75rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;margin-bottom:.65rem}
+h1{font-size:1.4rem;font-weight:650;color:#18181b}
+.intro{color:#52525b;font-size:.9rem;line-height:1.6;margin-top:.65rem}
+.choice{border:1px solid #e4e4e7;border-radius:14px;padding:1rem;margin-top:1.1rem}
+.choice h2{font-size:1rem;margin-bottom:.4rem}
+.choice p{color:#71717a;font-size:.82rem;line-height:1.55}
+label{display:block;font-size:.82rem;font-weight:600;color:#3f3f46;margin:1rem 0 .4rem}
+input{width:100%;padding:.7rem .8rem;background:#fff;border:1px solid #d4d4d8;border-radius:9px;color:#18181b;font-size:1rem;outline:none}
+input:focus{border-color:#18181b;box-shadow:0 0 0 3px rgba(24,24,27,.1)}
+button{width:100%;padding:.72rem;margin-top:.75rem;border-radius:9px;font-size:.9rem;font-weight:600;cursor:pointer}
+.primary{background:#18181b;color:#fff;border:1px solid #18181b}
+.secondary{background:#fff;color:#3f3f46;border:1px solid #d4d4d8}
+.warning{color:#b45309!important;margin-top:.5rem}
+.error{color:#dc2626;font-size:.8rem;margin-top:.65rem;display:none}
+@media(prefers-color-scheme:dark){body{background:#09090b;color:#f4f4f5}.card{background:#18181b;border-color:#3f3f46}.eyebrow,.choice p{color:#a1a1aa}h1,.choice h2{color:#fafafa}.intro{color:#d4d4d8}.choice{border-color:#3f3f46}label{color:#d4d4d8}input{background:#09090b;border-color:#52525b;color:#fafafa}.primary{background:#fafafa;border-color:#fafafa;color:#18181b}.secondary{background:#27272a;border-color:#52525b;color:#e4e4e7}}
+</style>
+</head>
+<body>
+<main class="card">
+  <p class="eyebrow">Codex Remote</p>
+  <h1>首次使用设置</h1>
+  <p class="intro">选择适合你的访问方式。设置完成后会进入 Codex 页面。</p>
+  <section class="choice">
+    <h2>设置访问密码</h2>
+    <p>如果你准备通过星桥或其他方式从公网访问，必须先设置密码。</p>
+    <form id="password-form">
+      <label for="password">密码</label>
+      <input id="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+      <label for="confirm-password">确认密码</label>
+      <input id="confirm-password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+      <button class="primary" type="submit">设置密码并继续</button>
+      <p class="error" id="password-error"></p>
+    </form>
+  </section>
+  <section class="choice">
+    <h2>仅局域网使用</h2>
+    <p>不设置密码，直接在当前电脑和可信局域网中使用。</p>
+    <p class="warning">不设置密码时无法启用公网远程访问。</p>
+    <button class="secondary" id="skip-password" type="button">暂不设置，仅局域网使用</button>
+  </section>
+</main>
+<script>
+const form=document.getElementById('password-form');
+const passwordInput=document.getElementById('password');
+const confirmInput=document.getElementById('confirm-password');
+const errorElement=document.getElementById('password-error');
+const skipButton=document.getElementById('skip-password');
+function showError(message){errorElement.textContent=message;errorElement.style.display='block'}
+function setBusy(busy){for(const element of document.querySelectorAll('button,input'))element.disabled=busy}
+async function post(path,body){
+  const response=await fetch(path,{method:'POST',headers:body?{'Content-Type':'application/json'}:undefined,body:body?JSON.stringify(body):undefined});
+  const payload=await response.json().catch(()=>({}));
+  if(!response.ok)throw new Error(typeof payload.error==='string'?payload.error:'设置失败，请重试。');
+}
+form.addEventListener('submit',async event=>{
+  event.preventDefault();errorElement.style.display='none';
+  if(passwordInput.value!==confirmInput.value){showError('两次输入的密码不一致。');confirmInput.focus();return}
+  setBusy(true);
+  try{await post('/auth/setup',{password:passwordInput.value});window.location.reload()}
+  catch(error){setBusy(false);showError(error instanceof Error?error.message:'设置失败，请重试。')}
+});
+skipButton.addEventListener('click',async()=>{
+  if(!window.confirm('确认仅在本机和局域网使用？未设置密码时无法启用公网远程访问。'))return;
+  errorElement.style.display='none';setBusy(true);
+  try{await post('/auth/setup/skip');window.location.reload()}
+  catch(error){setBusy(false);showError(error instanceof Error?error.message:'设置失败，请重试。')}
+});
+</script>
+</body>
+</html>`
+
+const LAN_ONLY_DENIED_HTML = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex Remote</title></head><body><h1>已禁止公网访问</h1><p>未设置访问密码，仅允许从本机或局域网访问。</p></body></html>`
+
 export function createAuthMiddleware(password: string): RequestHandler {
   return createAuthSession(password).middleware
 }
@@ -219,20 +320,143 @@ export function createAuthMiddleware(password: string): RequestHandler {
 export type AuthSession = {
   middleware: RequestHandler
   isRequestAuthorized: (req: IncomingMessage) => boolean
+  hasPassword: () => boolean
 }
 
-export function createAuthSession(password: string): AuthSession {
-  const validTokens = readPersistedSessions()
+export type AuthSessionOptions = {
+  password?: string
+  setupRequired?: boolean
+  persistPassword?: (password: string) => Promise<void>
+  persistPasswordSkip?: () => Promise<void>
+  lanOnly?: boolean
+}
+
+export function createAuthSession(passwordOrOptions: string | AuthSessionOptions): AuthSession {
+  const options = typeof passwordOrOptions === 'string' ? { password: passwordOrOptions } : passwordOrOptions
+  let password = options.password ?? ''
+  let setupRequired = options.setupRequired === true
+  let lanOnly = options.lanOnly === true
+  const validTokens = password ? readPersistedSessions() : new Map<string, number>()
   if (pruneExpiredSessions(validTokens)) {
     tryPersistSessions(validTokens)
   }
 
+  function createSignedInSession(res: Response): void {
+    validTokens.clear()
+    const token = randomBytes(32).toString('hex')
+    const expiresAt = Date.now() + SESSION_TTL_MS
+    validTokens.set(token, expiresAt)
+    tryPersistSessions(validTokens)
+    res.setHeader('Set-Cookie', buildSessionCookie(token, expiresAt))
+  }
+
+  function handlePasswordUpdate(req: Request, res: Response): void {
+    let body = ''
+    let bodyTooLarge = false
+    req.setEncoding('utf8')
+    req.on('data', (chunk: string) => {
+      if (bodyTooLarge) return
+      body += chunk
+      if (body.length > 4096) bodyTooLarge = true
+    })
+    req.on('end', () => {
+      void (async () => {
+        if (bodyTooLarge) {
+          res.status(413).json({ error: '请求内容过大。' })
+          return
+        }
+        let parsed: { password?: string }
+        try {
+          parsed = JSON.parse(body) as { password?: string }
+        } catch {
+          res.status(400).json({ error: '请求内容无效。' })
+          return
+        }
+        const nextPassword = typeof parsed.password === 'string' ? parsed.password : ''
+        if (nextPassword.length < 8 || nextPassword.length > 128) {
+          res.status(400).json({ error: '密码长度需要在 8 到 128 个字符之间。' })
+          return
+        }
+        if (!options.persistPassword) {
+          res.status(500).json({ error: '当前启动方式不支持保存密码。' })
+          return
+        }
+        try {
+          await options.persistPassword(nextPassword)
+          password = nextPassword
+          setupRequired = false
+          lanOnly = false
+          createSignedInSession(res)
+          res.json({ ok: true, passwordProtected: true, lanOnly: false })
+        } catch {
+          res.status(500).json({ error: '密码保存失败，请检查 Codex 配置目录权限。' })
+        }
+      })()
+    })
+  }
+
+  function handleAuthorizedSecurityRoute(req: Request, res: Response): boolean {
+    if (req.method === 'GET' && req.path === '/auth/status') {
+      res.json({ passwordProtected: password.length > 0, lanOnly })
+      return true
+    }
+    if (req.method === 'POST' && req.path === '/auth/password') {
+      handlePasswordUpdate(req, res)
+      return true
+    }
+    return false
+  }
+
   const middleware: RequestHandler = (req: Request, res: Response, next: NextFunction): void => {
-    if (pruneExpiredSessions(validTokens)) {
+    if (password && pruneExpiredSessions(validTokens)) {
       tryPersistSessions(validTokens)
     }
 
+    if (setupRequired) {
+      if (!isTrustedLanRequest(req.socket.remoteAddress, req.headers.host)) {
+        res.status(403).type('text/html; charset=utf-8').send(LAN_ONLY_DENIED_HTML)
+        return
+      }
+      if (req.method === 'POST' && req.path === '/auth/setup/skip') {
+        if (!options.persistPasswordSkip) {
+          res.status(500).json({ error: '当前启动方式不支持跳过密码设置。' })
+          return
+        }
+        void options.persistPasswordSkip()
+          .then(() => {
+            setupRequired = false
+            password = ''
+            lanOnly = true
+            validTokens.clear()
+            tryPersistSessions(validTokens)
+            res.json({ ok: true, passwordProtected: false })
+          })
+          .catch(() => {
+            res.status(500).json({ error: '使用模式保存失败，请检查 Codex 配置目录权限。' })
+          })
+        return
+      }
+      if (req.method === 'POST' && req.path === '/auth/setup') {
+        handlePasswordUpdate(req, res)
+        return
+      }
+      res.setHeader('Content-Type', 'text/html; charset=utf-8')
+      res.status(200).send(FIRST_RUN_SETUP_HTML)
+      return
+    }
+
+    if (!password) {
+      if (lanOnly && !isTrustedLanRequest(req.socket.remoteAddress, req.headers.host)) {
+        res.status(403).type('text/html; charset=utf-8').send(LAN_ONLY_DENIED_HTML)
+        return
+      }
+      if (handleAuthorizedSecurityRoute(req, res)) return
+      next()
+      return
+    }
+
     if (isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)) {
+      if (handleAuthorizedSecurityRoute(req, res)) return
       next()
       return
     }
@@ -292,8 +516,11 @@ export function createAuthSession(password: string): AuthSession {
 
   return {
     middleware,
-    isRequestAuthorized: (req: IncomingMessage) => (
-      isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)
-    ),
+    isRequestAuthorized: (req: IncomingMessage) => setupRequired
+      ? false
+      : password
+        ? isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)
+        : !lanOnly || isTrustedLanRequest(req.socket.remoteAddress, req.headers.host),
+    hasPassword: () => password.length > 0,
   }
 }

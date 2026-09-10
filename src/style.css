@@ -175,6 +175,64 @@
   @apply bg-zinc-900;
 }
 
+:root.dark .starbridge-modal {
+  @apply border-zinc-700 bg-zinc-800;
+}
+
+:root.dark .starbridge-modal-title {
+  @apply text-zinc-100;
+}
+
+:root.dark .starbridge-modal-subtitle,
+:root.dark .starbridge-help,
+:root.dark .starbridge-status-meta {
+  @apply text-zinc-400;
+}
+
+:root.dark .starbridge-modal-close {
+  @apply text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100;
+}
+
+:root.dark .starbridge-status-card {
+  @apply border-zinc-700 bg-zinc-900/70 text-zinc-200;
+}
+
+:root.dark .starbridge-status-card[data-state='online'] {
+  @apply border-emerald-800 bg-emerald-950/40;
+}
+
+:root.dark .starbridge-status-card[data-state='expired'],
+:root.dark .starbridge-status-card[data-state='error'] {
+  @apply border-rose-800 bg-rose-950/40;
+}
+
+:root.dark .starbridge-status-domain,
+:root.dark .starbridge-field {
+  @apply text-zinc-300;
+}
+
+:root.dark .starbridge-field input {
+  @apply border-zinc-600 bg-zinc-900 text-zinc-100 focus:border-zinc-400 focus:ring-zinc-700;
+}
+
+:root.dark .starbridge-secondary,
+:root.dark .starbridge-status-copy,
+:root.dark .starbridge-danger {
+  @apply border-zinc-600 bg-zinc-700 text-zinc-200 hover:bg-zinc-600;
+}
+
+:root.dark .starbridge-danger {
+  @apply border-rose-800 text-rose-200 hover:bg-rose-950/60;
+}
+
+:root.dark .starbridge-renew-section {
+  @apply border-zinc-700;
+}
+
+:root.dark .web-password-success {
+  @apply text-emerald-300;
+}
+
 :root.dark .sidebar-skills-link {
   @apply border-emerald-900/70 bg-[linear-gradient(135deg,_rgba(6,78,59,0.42),_rgba(24,24,27,0.96))] text-zinc-100 hover:border-emerald-700 hover:bg-emerald-950;
 }

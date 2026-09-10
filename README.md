@@ -32,6 +32,209 @@ Codex 会话，而不是把项目变成另一个独立的多模型平台。
 - **兼容原有功能**：保留上游的项目管理、Skills、文件浏览、导入导出、Telegram 和隧道能力；
   账号刷新所需的临时隔离 app-server 仍然保留。
 
+## 本地部署教程（源码方式）
+
+下面的流程适用于把 `codex-mobile-remote` 部署在运行 Codex CLI 的 Linux
+电脑上。网页端、手机浏览器和 Android 客户端都连接这台电脑上的
+`codexapp:5900`；Codex CLI、官方 app-server 和项目文件不会被复制到手机上。
+
+### 1. 准备环境
+
+需要准备：
+
+- Linux、macOS 或 Windows；
+- Node.js 18 或更高版本；
+- `pnpm` 10；
+- 已安装并能正常运行的官方 Codex CLI。
+
+先确认版本：
+
+```bash
+node --version
+pnpm --version
+codex --version
+```
+
+如果本机还没有 `pnpm`，可以使用 Node.js 自带的 Corepack：
+
+```bash
+corepack enable
+corepack prepare pnpm@10 --activate
+```
+
+首次使用 Codex CLI 时先完成登录；已经配置好第三方兼容 API 的用户可以
+沿用自己的 Codex 配置，不需要在 `codexapp` 里重复配置模型：
+
+```bash
+codex login
+```
+
+### 2. 获取源码并构建
+
+```bash
+git clone https://github.com/scouthe/codex-mobile-remote.git
+cd codex-mobile-remote
+pnpm install
+pnpm run build
+```
+
+更新已有部署时，使用：
+
+```bash
+git pull --ff-only
+pnpm install
+pnpm run build
+```
+
+### 3. 启动本地服务
+
+首次启动建议不要传 `--password` 或 `--no-password`，让网页端完成访问方式
+设置：
+
+```bash
+node dist-cli/index.js --no-tunnel --port 5900
+```
+
+打开终端中显示的地址，通常是：
+
+```text
+本机：      http://127.0.0.1:5900
+局域网：    http://<这台电脑的局域网 IP>:5900
+```
+
+首次打开时可以选择：
+
+- **设置访问密码**：适合公网中转、反向代理、Cloudflare Tunnel 或其他不完全可信的网络；
+- **仅局域网使用**：不设置密码，只允许本机、私有局域网和受信任的 Tailscale 地址访问。
+
+`--no-password` 会直接关闭网页认证，只适合完全可信且不会被转发到公网的环境。
+启用星桥公网访问前，必须设置网页访问密码。
+
+### 4. 确认连接的是官方 app-server
+
+这个项目默认复用官方 Codex app-server，不会为网页端创建第二套会话服务。
+确认本机使用的是同一个 `CODEX_HOME` 和官方 socket：
+
+```bash
+curl -fsS http://127.0.0.1:5900/codex-api/app-server/status
+```
+
+正常响应应包含：
+
+```json
+{
+  "mode": "shared-proxy"
+}
+```
+
+默认 socket 是：
+
+```text
+$CODEX_HOME/app-server-control/app-server-control.sock
+```
+
+如果官方 app-server 尚未启动，codexapp 会在首次请求时按官方命令自动引导；
+也可以手动指定其他官方 socket：
+
+```bash
+node dist-cli/index.js \
+  --no-tunnel \
+  --port 5900 \
+  --app-server-socket "${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
+```
+
+如果要和其他 Codex 客户端同步，所有客户端最终都必须连接同一台运行 Codex
+的主机，并使用同一个 `CODEX_HOME` 和官方 app-server。
+
+### 5. 让服务在后台常驻（Linux）
+
+源码构建完成后，可以安装仓库提供的用户级 systemd 示例：
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 deploy/systemd/codexapp-5900.service \
+  ~/.config/systemd/user/codexapp-5900.service
+```
+
+安装后先编辑这个文件，至少检查以下项目：
+
+- `WorkingDirectory` 是否指向当前仓库目录；
+- `ExecStart` 使用的 Node.js 是否是本机实际路径；
+- `CODEX_HOME` 是否和官方 Codex CLI 使用的目录一致；
+- 如果需要首次密码设置或公网访问，删除 `ExecStart` 中的 `--no-password`。
+
+然后启动：
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now codexapp-5900.service
+systemctl --user status codexapp-5900.service --no-pager
+```
+
+查看日志或重启：
+
+```bash
+journalctl --user -u codexapp-5900.service -f
+systemctl --user restart codexapp-5900.service
+```
+
+如果希望退出 SSH 后服务仍然运行，可以为用户会话开启 linger：
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+### 6. 配置手机或其他客户端
+
+在同一局域网内，手机浏览器直接访问：
+
+```text
+http://<Linux 主机的局域网 IP>:5900
+```
+
+Android 原生客户端需要填写完整的 `codexapp` 地址，例如：
+
+```text
+http://192.168.1.148:5900
+```
+
+如果使用 Tailscale，请先让手机和 Linux 主机加入同一个 tailnet，再按照
+[Tailscale Serve 部署教程](#tailscale-serve-deployment-private-remote-access)
+发布 `5900`。如果使用星桥公网中转，在网页 Settings → StarBridge 中输入
+管理员发放的激活码；设备密钥和 FRPC 配置只保存在 Linux 主机上。
+
+### 7. 常见问题
+
+`5900` 已被占用：
+
+```bash
+ss -ltnp | rg ':5900'
+```
+
+停止旧的 systemd 实例后再启动：
+
+```bash
+systemctl --user stop codexapp-5900.service
+```
+
+页面提示前端资源缺失：
+
+```bash
+pnpm run build
+```
+
+页面能打开但 Codex 请求失败，先检查：
+
+```bash
+curl -fsS http://127.0.0.1:5900/codex-api/app-server/status
+echo "$CODEX_HOME"
+ls -l "${CODEX_HOME:-$HOME/.codex}/app-server-control/"
+```
+
+重点确认服务进程和官方 Codex CLI 使用同一个 Linux 用户、`CODEX_HOME` 及
+app-server socket。不要再额外启动一个独立的 app-server，否则会产生不同的
+会话状态和 writer 冲突。
+
 ### 推荐的源码启动方式
 
 ```bash
@@ -210,6 +413,25 @@ cd android
 The APK is written to
 `android/app/build/outputs/apk/debug/app-debug.apk`. For setup, security notes,
 and the native bridge contract, see [`android/README.md`](./android/README.md).
+
+## StarBridge user client (Linux)
+
+The web Settings panel includes an optional **StarBridge** entry for
+users who have received an administrator-issued activation code. It activates
+the Linux host that runs Codex, installs the pinned official FRPC release after
+SHA256 verification, writes a per-device OIDC configuration with private file
+permissions, and manages FRPC through a systemd user unit (with a detached
+process fallback on minimal Linux).
+
+The browser only sends the one-time code to the local codexapp server and
+receives the assigned public domain and subscription status. Device secrets and
+the FRPC configuration remain on the Linux host. Codexapp must have a web
+password before public relay access can be activated. The control plane should
+use HTTPS in production; private HTTP addresses are accepted only for LAN
+testing. Renewal, restart, and stop controls are available in the same panel.
+If GitHub downloads are slow in your region, an administrator can provide an
+HTTPS mirror by setting `CODEXUI_FRPC_DOWNLOAD_BASE_URL`; the client still
+verifies the official release checksum before installing the binary.
 
 ---
 

@@ -15,6 +15,10 @@ const spaEntryFile = join(distDir, 'index.html')
 
 export type ServerOptions = {
   password?: string
+  passwordSetupRequired?: boolean
+  persistPassword?: (password: string) => Promise<void>
+  persistPasswordSkip?: () => Promise<void>
+  lanOnly?: boolean
 }
 
 export type ServerInstance = {
@@ -74,13 +78,17 @@ function readWildcardPathParam(value: unknown): string {
 
 export function createServer(options: ServerOptions = {}): ServerInstance {
   const app = express()
-  const bridge = createCodexBridgeMiddleware()
-  const authSession = options.password ? createAuthSession(options.password) : null
+  const authSession = createAuthSession({
+    password: options.password,
+    setupRequired: options.passwordSetupRequired,
+    persistPassword: options.persistPassword,
+    persistPasswordSkip: options.persistPasswordSkip,
+    lanOnly: options.lanOnly,
+  })
+  const bridge = createCodexBridgeMiddleware({ passwordConfigured: () => authSession.hasPassword() })
 
-  // 1. Auth middleware (if password is set)
-  if (authSession) {
-    app.use(authSession.middleware)
-  }
+  // 1. Authentication, first-run setup, and explicit LAN-only access policy.
+  app.use(authSession.middleware)
 
   // 2. Bridge middleware for /codex-api/*
   app.use(bridge)
@@ -261,7 +269,7 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
           return
         }
 
-        if (authSession && !authSession.isRequestAuthorized(req)) {
+        if (!authSession.isRequestAuthorized(req)) {
           socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
           socket.destroy()
           return
