@@ -1549,6 +1549,26 @@ function onSelect(threadId: string): void {
   emit('select', threadId)
 }
 
+/** Select the first thread currently visible after a sidebar search. */
+function selectFirstVisibleThread(): void {
+  const candidates: UiThread[] = []
+  if (isPinnedSectionExpanded.value) candidates.push(...pinnedThreads.value)
+  if (isChronologicalView.value) {
+    candidates.push(...globalThreads.value)
+  } else {
+    candidates.push(...filteredGroups.value.flatMap((group) => group.threads))
+    if (isChatsSectionExpanded.value) candidates.push(...chatThreads.value)
+  }
+
+  const seen = new Set<string>()
+  const first = candidates.find((thread) => {
+    if (seen.has(thread.id)) return false
+    seen.add(thread.id)
+    return true
+  })
+  if (first) onSelect(first.id)
+}
+
 function threadHasAutomation(threadId: string): boolean {
   return threadAutomationCount(threadId) > 0
 }
@@ -2162,6 +2182,7 @@ function getProjectDisplayName(projectName: string): string {
 defineExpose({
   openAutomationEditorFromPanel,
   openAutomationCreatorFromPanel,
+  selectFirstVisibleThread,
 })
 
 function isPathLikeProjectName(value: string): boolean {

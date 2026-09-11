@@ -20,7 +20,7 @@
               type="button"
               :aria-pressed="isSidebarSearchVisible"
               :aria-label="t('Search threads')"
-              :title="t('Search threads')"
+              :title="t('Search threads (Ctrl+K)')"
               @click="toggleSidebarSearch"
             >
               <IconTablerSearch class="sidebar-search-toggle-icon" />
@@ -1370,6 +1370,7 @@ import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, Starbri
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
+import { isThreadQuickJumpShortcut } from './utils/threadQuickJump'
 import {
   CODEX_ANDROID_EVENTS,
   parseSharePayload,
@@ -1636,6 +1637,7 @@ const isAndroidApp = computed(() => androidBridge.nativeAvailable.value)
 type SidebarThreadTreeExposed = {
   openAutomationEditorFromPanel: (payload: AutomationEditRequest) => void
   openAutomationCreatorFromPanel: () => void
+  selectFirstVisibleThread: () => void
 }
 type AutomationsPanelExposed = {
   loadAutomations: () => Promise<void>
@@ -2788,6 +2790,10 @@ watch(sidebarSearchQuery, (value) => {
     return
   }
 
+  // Do not let results for the previous query hide locally matching rows while
+  // the debounced server search is in flight.
+  serverMatchedThreadIds.value = null
+
   threadSearchTimer = setTimeout(() => {
     void searchThreads(query, 1000)
       .then((result) => {
@@ -3100,6 +3106,15 @@ function toggleSidebarSearch(): void {
   }
 }
 
+function openSidebarQuickJump(): void {
+  if (isSidebarCollapsed.value) setSidebarCollapsed(false)
+  isSidebarSearchVisible.value = true
+  nextTick(() => {
+    sidebarSearchInputRef.value?.focus()
+    sidebarSearchInputRef.value?.select()
+  })
+}
+
 function clearSidebarSearch(): void {
   sidebarSearchQuery.value = ''
   sidebarSearchInputRef.value?.focus()
@@ -3160,6 +3175,11 @@ function onSidebarSearchKeydown(event: KeyboardEvent): void {
   if (event.key === 'Escape') {
     isSidebarSearchVisible.value = false
     sidebarSearchQuery.value = ''
+    return
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    sidebarThreadTreeRef.value?.selectFirstVisibleThread()
   }
 }
 
@@ -3860,6 +3880,11 @@ function onWindowKeyDown(event: KeyboardEvent): void {
   }
   if (!event.ctrlKey && !event.metaKey) return
   if (event.shiftKey || event.altKey) return
+  if (isThreadQuickJumpShortcut(event)) {
+    event.preventDefault()
+    openSidebarQuickJump()
+    return
+  }
   const key = event.key.toLowerCase()
   if (key === 'b') {
     event.preventDefault()
