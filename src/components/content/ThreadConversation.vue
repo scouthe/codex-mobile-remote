@@ -756,20 +756,20 @@
       <li ref="bottomAnchorRef" class="conversation-bottom-anchor" />
     </ul>
 
+    <button
+      v-if="isMobile && mobilePreviewAnchor"
+      type="button"
+      class="conversation-turn-mobile-preview"
+      :aria-label="mobilePreviewAnchor.preview"
+      @click="confirmMobileConversationTurn"
+    >
+      {{ mobilePreviewAnchor.preview }}
+    </button>
     <nav
       v-if="!isLoading && conversationTurnAnchors.length > 0"
       class="conversation-turn-nav"
       aria-label="Conversation prompts"
     >
-      <button
-        v-if="isMobile && mobilePreviewAnchor"
-        type="button"
-        class="conversation-turn-mobile-preview"
-        :aria-label="mobilePreviewAnchor.preview"
-        @click="confirmMobileConversationTurn"
-      >
-        {{ mobilePreviewAnchor.preview }}
-      </button>
       <button
         v-for="anchor in conversationTurnAnchors"
         :key="`turn-nav:${anchor.id}`"
@@ -4354,7 +4354,7 @@ function confirmMobileConversationTurn(): void {
 function dismissMobileConversationTurnPreview(event: PointerEvent): void {
   if (!mobilePreviewAnchorId.value) return
   const target = event.target
-  if (target instanceof Element && target.closest('.conversation-turn-nav')) return
+  if (target instanceof Element && target.closest('.conversation-turn-nav, .conversation-turn-mobile-preview')) return
   mobilePreviewAnchorId.value = ''
 }
 
@@ -4598,7 +4598,7 @@ onBeforeUnmount(() => {
 }
 
 .conversation-turn-nav {
-  @apply absolute right-2 top-1/2 z-10 flex max-h-[60%] -translate-y-1/2 flex-col items-end gap-1 overflow-y-auto px-1 py-2;
+  @apply absolute right-2 top-1/2 z-20 flex max-h-[60%] -translate-y-1/2 flex-col items-end gap-1 overflow-y-auto px-1 py-2;
   scrollbar-width: none;
 }
 
@@ -4634,7 +4634,7 @@ onBeforeUnmount(() => {
 }
 
 .conversation-turn-mobile-preview {
-  @apply absolute right-9 top-1/2 max-h-28 w-[min(17rem,calc(100vw-4.5rem))] -translate-y-1/2 overflow-hidden rounded-md border border-slate-200 bg-white px-3 py-2 text-left text-xs leading-5 text-slate-800 shadow-lg;
+  @apply absolute right-9 top-1/2 z-30 max-h-28 w-[min(17rem,calc(100vw-4.5rem))] -translate-y-1/2 overflow-hidden rounded-md border border-slate-200 bg-white px-3 py-2 text-left text-xs leading-5 text-slate-800 shadow-lg;
 }
 
 :global(:root.dark) .conversation-turn-mobile-preview {
