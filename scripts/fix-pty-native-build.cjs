@@ -53,7 +53,10 @@ for (const name of PTY_PACKAGES) {
   const buildDir = join(root, 'build')
   const makefile = join(buildDir, 'Makefile')
   const binary = join(buildDir, 'Release', 'pty.node')
-  if (!existsSync(makefile) || !isBrokenSymlink(binary)) continue
+  // Some Linux installs have no matching prebuild and pnpm may skip the
+  // optional dependency lifecycle hook. In that case the binary is simply
+  // absent (not a broken symlink), so build it just like the repair path.
+  if (!existsSync(makefile) || (existsSync(binary) && !isBrokenSymlink(binary))) continue
 
   try {
     patchMakefile(makefile)
