@@ -922,6 +922,7 @@ import type { UiFileChange, UiLiveOverlay, UiMessage, UiPlanStep, UiServerReques
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { useMobile } from '../../composables/useMobile'
+import { shouldAutoLoadPersistedAbove } from '../../task/olderMessageLoading'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
@@ -4432,7 +4433,7 @@ function onConversationScroll(): void {
   if (!container || props.isLoading) return
   autoFollowOutput.value = isAtBottom(container)
   if (
-    !props.deferAutoLoadPersistedAbove
+    shouldAutoLoadPersistedAbove(isMobile.value, props.deferAutoLoadPersistedAbove)
     && hasMoreAbove.value
     && !isLoadingMore.value
     && container.scrollTop < LOAD_MORE_SCROLL_THRESHOLD_PX
