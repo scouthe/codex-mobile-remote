@@ -1461,7 +1461,9 @@ const isLoadingMore = ref(false)
 
 const visibleMessages = computed(() => props.messages.slice(renderWindowStart.value))
 const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
-const conversationTurnAnchors = computed(() => buildConversationTurnAnchors(props.messages))
+// Keep the rail bounded with the same render window as the conversation. As
+// older pages enter the window, their prompt markers appear automatically.
+const conversationTurnAnchors = computed(() => buildConversationTurnAnchors(visibleMessages.value))
 const activeTurnMessageId = ref('')
 
 const showJumpToLatestButton = computed(
@@ -4301,9 +4303,6 @@ async function loadMoreAbove(): Promise<void> {
 }
 
 async function jumpToConversationTurn(anchor: ConversationTurnAnchor): Promise<void> {
-  if (anchor.messageIndex < renderWindowStart.value) {
-    renderWindowStart.value = Math.max(0, anchor.messageIndex - 2)
-  }
   activeTurnMessageId.value = anchor.id
   await nextTick()
   const target = document.getElementById(`conversation-message-${anchor.id}`)
