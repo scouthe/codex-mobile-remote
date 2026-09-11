@@ -1,18 +1,29 @@
 <template>
   <section v-if="visible" class="task-timeline" aria-label="Task activity">
-    <div class="task-timeline-current" :data-state="snapshot.state" role="status" aria-live="polite">
+    <button
+      class="task-timeline-current"
+      :class="{ 'is-expandable': events.length > 0 }"
+      :data-state="snapshot.state"
+      type="button"
+      role="status"
+      aria-live="polite"
+      :aria-expanded="eventsVisible"
+      :aria-label="events.length > 0 ? 'Toggle task activity history' : undefined"
+      @click="toggleEvents"
+    >
       <span class="task-timeline-spinner" :class="{ 'is-spinning': isActive }" aria-hidden="true" />
       <div class="task-timeline-current-copy">
         <strong>{{ currentLabel }}<span v-if="snapshot.writerClient" class="task-timeline-writer"> · {{ snapshot.writerClient.label }} writer</span></strong>
         <span v-if="currentDetails.length > 0">{{ currentDetails.join(' · ') }}</span>
       </div>
       <span class="task-timeline-state">{{ stateLabel }}</span>
-    </div>
-    <ol v-if="events.length > 0" class="task-timeline-events">
+      <span v-if="events.length > 0" class="task-timeline-chevron" :class="{ 'is-open': eventsVisible }" aria-hidden="true">▶</span>
+    </button>
+    <ol v-if="eventsVisible" class="task-timeline-events">
       <li v-for="event in events" :key="event.id" class="task-timeline-event" :data-type="event.type">
         <span class="task-timeline-event-dot" aria-hidden="true" />
         <div class="task-timeline-event-copy">
-          <span>{{ event.label }}</span>
+          <span>{{ event.label }}<small v-if="event.repeatCount && event.repeatCount > 1"> · ×{{ event.repeatCount }}</small></span>
           <small v-if="event.details.length > 0">{{ event.details.join(' · ') }}</small>
         </div>
         <time :datetime="event.atIso">{{ formatTime(event.atIso) }}</time>
@@ -22,8 +33,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import type { TaskSnapshot } from '../../types/task'
+import { compactTaskTimelineEvents } from '../../task/taskTimeline'
+import { useMobile } from '../../composables/useMobile'
 
 const props = defineProps<{ snapshot: TaskSnapshot | null }>()
 
@@ -36,10 +49,18 @@ const snapshot = computed(() => props.snapshot ?? {
 const activeStates = new Set(['queued', 'starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'])
 const isActive = computed(() => activeStates.has(snapshot.value.state))
 const visible = computed(() => Boolean(props.snapshot && (isActive.value || snapshot.value.timeline.length > 0)))
-const events = computed(() => snapshot.value.timeline.slice(-8).reverse())
+const { isMobile } = useMobile()
+const timelineExpanded = ref(false)
+const events = computed(() => compactTaskTimelineEvents(snapshot.value.timeline).slice(-8).reverse())
+const eventsVisible = computed(() => events.value.length > 0 && (!isMobile.value || timelineExpanded.value))
 const currentLabel = computed(() => snapshot.value.currentActivity.label || 'Task')
 const currentDetails = computed(() => snapshot.value.currentActivity.details)
 const stateLabel = computed(() => snapshot.value.state.replace(/_/g, ' '))
+
+function toggleEvents(): void {
+  if (!isMobile.value || events.value.length === 0) return
+  timelineExpanded.value = !timelineExpanded.value
+}
 
 function formatTime(value: string): string {
   const date = new Date(value)
@@ -57,7 +78,12 @@ function formatTime(value: string): string {
 }
 
 .task-timeline-current {
-  @apply flex items-center gap-2 border-b border-slate-200 px-3 py-2;
+  @apply flex w-full items-center gap-2 border-b border-slate-200 bg-transparent px-3 py-2 text-left;
+  appearance: none;
+}
+
+.task-timeline-current.is-expandable {
+  @apply cursor-pointer hover:bg-slate-100/80;
 }
 
 .task-timeline-current[data-state='failed'] {
@@ -91,6 +117,14 @@ function formatTime(value: string): string {
 
 .task-timeline-state {
   @apply shrink-0 capitalize opacity-70;
+}
+
+.task-timeline-chevron {
+  @apply shrink-0 text-[9px] text-slate-400 transition-transform duration-150;
+}
+
+.task-timeline-chevron.is-open {
+  transform: rotate(90deg);
 }
 
 .task-timeline-events {
@@ -131,5 +165,9 @@ function formatTime(value: string): string {
 
 :global(:root.dark) .task-timeline-current {
   @apply border-zinc-700;
+}
+
+:global(:root.dark) .task-timeline-current.is-expandable {
+  @apply hover:bg-zinc-800/80;
 }
 </style>
