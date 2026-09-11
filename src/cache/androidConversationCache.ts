@@ -21,7 +21,9 @@ const DATABASE_NAME = 'codex-remote-android'
 const DATABASE_VERSION = 1
 const STORE_NAME = 'conversation-snapshots'
 const MAX_CACHED_THREADS = 20
-const MAX_CACHED_MESSAGES = 50
+// Keep several render-window pages locally so mobile history can expand from
+// IndexedDB before it needs another network round trip.
+const MAX_CACHED_MESSAGES = 200
 const MAX_TEXT_LENGTH = 64_000
 const MAX_RAW_PAYLOAD_LENGTH = 16_000
 const MAX_COMMAND_OUTPUT_LENGTH = 32_000

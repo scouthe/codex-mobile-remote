@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  ANDROID_CONVERSATION_CACHE_LIMITS,
   isAndroidConversationCacheEnabled,
   readAndroidConversationCache,
   writeAndroidConversationCache,
@@ -15,6 +16,10 @@ afterEach(() => {
 })
 
 describe('android conversation cache', () => {
+  it('keeps enough cached rows for several mobile history pages', () => {
+    expect(ANDROID_CONVERSATION_CACHE_LIMITS.maxMessagesPerThread).toBe(200)
+  })
+
   it('stays disabled in ordinary browsers', async () => {
     globalScope.window = { location: { origin: 'https://example.test' } }
 

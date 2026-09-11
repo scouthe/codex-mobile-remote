@@ -1168,7 +1168,7 @@ async function getThreadFastDetailV2(threadId: string): Promise<{
   }
 }
 
-async function getOlderThreadMessagesV2(threadId: string, beforeTurnId: string, limit = 10): Promise<ThreadTurnPage> {
+async function getOlderThreadMessagesV2(threadId: string, beforeTurnId: string, limit = 30): Promise<ThreadTurnPage> {
   const params = new URLSearchParams({
     threadId,
     beforeTurnId,
@@ -1457,7 +1457,7 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
   }
 }
 
-export async function getOlderThreadMessages(threadId: string, beforeTurnId: string, limit?: number): Promise<ThreadTurnPage> {
+export async function getOlderThreadMessages(threadId: string, beforeTurnId: string, limit = 30): Promise<ThreadTurnPage> {
   try {
     return await getOlderThreadMessagesV2(threadId, beforeTurnId, limit)
   } catch (error) {

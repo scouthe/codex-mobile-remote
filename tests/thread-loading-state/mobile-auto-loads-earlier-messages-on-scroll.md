@@ -20,6 +20,8 @@ loads older messages instead of requiring a **Load earlier messages** tap.
 #### Expected Results
 
 - Older messages load automatically when the top threshold is reached.
+- On Android, cached history is revealed first when available, reducing network
+  round trips; subsequent pages request up to 30 turns at once.
 - The scroll position remains anchored around the messages already visible;
   the viewport does not jump to the bottom.
 - A loading state prevents duplicate requests while one older page is pending.

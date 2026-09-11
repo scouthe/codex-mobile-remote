@@ -23,6 +23,8 @@
 
 - The Android app can paint the most recently cached bounded conversation
   without waiting for a complete `thread/read` request.
+- When history is expanded, up to 200 cached messages can be revealed locally
+  before another older-page network request is needed.
 - `sessionRevision` changes cause a server refresh; cached data never replaces
   newer server messages or task state.
 - The cache is isolated by server origin and stores no passwords, tokens, or
