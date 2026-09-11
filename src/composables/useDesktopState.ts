@@ -75,6 +75,11 @@ import type {
 } from '../types/task'
 import { reduceTaskSnapshot } from '../task/taskStateReducer'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
+import {
+  readAndroidConversationCache,
+  writeAndroidConversationCache,
+  type AndroidConversationCacheRecord,
+} from '../cache/androidConversationCache'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -1480,6 +1485,11 @@ export function useDesktopState() {
   const sourceGroups = ref<UiProjectGroup[]>([])
   const selectedThreadId = ref(loadSelectedThreadId())
   const persistedMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
+  // Android restores a bounded local snapshot for the first paint, then
+  // validates it against the server revision before deciding whether a full
+  // thread/read is still required. Ordinary browsers never populate this map.
+  const androidCacheRestoreAttemptedByThreadId = new Set<string>()
+  const androidCacheWriteTimerByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
   const livePlanMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveAgentMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveReasoningTextByThreadId = ref<Record<string, string>>({})
@@ -3204,6 +3214,24 @@ export function useDesktopState() {
       ...persistedMessagesByThreadId.value,
       [threadId]: nextMessages,
     }
+    // The cache is strictly a startup/read optimization. Never persist an
+    // optimistic message because it has not been accepted by Codex yet.
+    if (!nextMessages.some((message) => message.messageType !== 'userMessage.optimistic')) return
+    const previousTimer = androidCacheWriteTimerByThreadId.get(threadId)
+    if (previousTimer) clearTimeout(previousTimer)
+    // Streaming assistant events can update this array dozens of times per
+    // second. Coalesce them into one best-effort IndexedDB write after the
+    // current burst, keeping the cache optimization from adding I/O pressure.
+    const timer = setTimeout(() => {
+      androidCacheWriteTimerByThreadId.delete(threadId)
+      void writeAndroidConversationCache(threadId, {
+        sessionRevision: loadedSessionRevisionByThreadId.value[threadId] ?? currentThreadSessionRevision(threadId),
+        updatedAtIso: currentThreadVersion(threadId),
+        hasMoreOlder: hasMoreOlderMessagesByThreadId.value[threadId] === true,
+        messages: persistedMessagesByThreadId.value[threadId] ?? nextMessages,
+      })
+    }, 350)
+    androidCacheWriteTimerByThreadId.set(threadId, timer)
   }
 
   function appendOptimisticUserMessage(
@@ -5358,14 +5386,43 @@ export function useDesktopState() {
       return
     }
 
-    const alreadyLoaded = loadedMessagesByThreadId.value[threadId] === true
-    const shouldShowLoading = options.silent !== true && !alreadyLoaded
+    const hadLoadedMessagesBeforeCache = loadedMessagesByThreadId.value[threadId] === true
+    const shouldShowLoading = options.silent !== true && !hadLoadedMessagesBeforeCache
     if (shouldShowLoading) {
       isLoadingMessages.value = true
     }
 
     const loadPromise = (async () => {
       try {
+        let restoredAndroidCache: AndroidConversationCacheRecord | null = null
+        if (!androidCacheRestoreAttemptedByThreadId.has(threadId)) {
+          androidCacheRestoreAttemptedByThreadId.add(threadId)
+          restoredAndroidCache = await readAndroidConversationCache(threadId)
+          if (restoredAndroidCache && (persistedMessagesByThreadId.value[threadId] ?? []).length === 0) {
+            // Restore only persisted conversation rows. Live overlays, task
+            // state, queues, and pending requests always come from the server.
+            persistedMessagesByThreadId.value = {
+              ...persistedMessagesByThreadId.value,
+              [threadId]: restoredAndroidCache.messages,
+            }
+            loadedMessagesByThreadId.value = {
+              ...loadedMessagesByThreadId.value,
+              [threadId]: true,
+            }
+            loadedVersionByThreadId.value = {
+              ...loadedVersionByThreadId.value,
+              [threadId]: restoredAndroidCache.updatedAtIso,
+            }
+            loadedSessionRevisionByThreadId.value = {
+              ...loadedSessionRevisionByThreadId.value,
+              [threadId]: restoredAndroidCache.sessionRevision,
+            }
+            hasMoreOlderMessagesByThreadId.value = {
+              ...hasMoreOlderMessagesByThreadId.value,
+              [threadId]: restoredAndroidCache.hasMoreOlder,
+            }
+          }
+        }
       const version = currentThreadVersion(threadId)
       const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
       const sessionRevision = currentThreadSessionRevision(threadId)
@@ -5375,9 +5432,15 @@ export function useDesktopState() {
       const hasSessionRevisionChange = Boolean(
         sessionRevision && sessionRevision !== loadedSessionRevision,
       )
+      const cacheRevisionMatches = restoredAndroidCache === null || (
+        Boolean(sessionRevision && restoredAndroidCache.sessionRevision)
+          ? sessionRevision === restoredAndroidCache.sessionRevision
+          : Boolean(version && restoredAndroidCache.updatedAtIso && version === restoredAndroidCache.updatedAtIso)
+      )
       const shouldPreferLiveState = options.preferLiveState === true
       const canReuseLoadedMessages =
-        options.force !== true && !hasSessionRevisionChange && alreadyLoaded &&
+        options.force !== true && cacheRevisionMatches && !hasSessionRevisionChange
+        && loadedMessagesByThreadId.value[threadId] === true &&
         (
           loadedRecently ||
           (
@@ -7089,6 +7152,9 @@ export function useDesktopState() {
     activeReasoningItemId = ''
     shouldAutoScrollOnNextAgentEvent = false
     persistedMessagesByThreadId.value = {}
+    androidCacheRestoreAttemptedByThreadId.clear()
+    for (const timer of androidCacheWriteTimerByThreadId.values()) clearTimeout(timer)
+    androidCacheWriteTimerByThreadId.clear()
     livePlanMessagesByThreadId.value = {}
     liveAgentMessagesByThreadId.value = {}
     liveReasoningTextByThreadId.value = {}
