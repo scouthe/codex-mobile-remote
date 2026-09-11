@@ -25,3 +25,4 @@ Return to the [manual test index](../../tests.md).
 | [Terminal focus does not fullscreen panel](terminal-focus-does-not-fullscreen-panel.md) |
 | [Terminal quick commands from project files](terminal-quick-commands-from-project-files.md) |
 | [Mobile terminal command dropdown stays on screen](mobile-terminal-command-dropdown-stays-on-screen.md) |
+| [Mobile task timeline collapses repeated activity](mobile-task-timeline-collapses-repeated-activity.md) |
