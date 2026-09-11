@@ -21,10 +21,12 @@ const DATABASE_NAME = 'codex-remote-android'
 const DATABASE_VERSION = 1
 const STORE_NAME = 'conversation-snapshots'
 const MAX_CACHED_THREADS = 20
-const MAX_CACHED_MESSAGES = 120
-const MAX_TEXT_LENGTH = 200_000
-const MAX_RAW_PAYLOAD_LENGTH = 64_000
-const MAX_COMMAND_OUTPUT_LENGTH = 128_000
+const MAX_CACHED_MESSAGES = 50
+const MAX_TEXT_LENGTH = 64_000
+const MAX_RAW_PAYLOAD_LENGTH = 16_000
+const MAX_COMMAND_OUTPUT_LENGTH = 32_000
+const MAX_CACHED_BYTES_PER_THREAD = 4 * 1024 * 1024
+let lastPruneAt = 0
 
 type StoredRecord = AndroidConversationCacheRecord & { key: string; origin: string }
 
@@ -59,6 +61,28 @@ function sanitizeMessage(message: UiMessage): UiMessage {
     }
   }
   return sanitized
+}
+
+function boundSnapshotMessages(messages: UiMessage[]): UiMessage[] {
+  const bounded = messages
+    .filter((message) => message.messageType !== 'userMessage.optimistic')
+    .slice(-MAX_CACHED_MESSAGES)
+    .map(sanitizeMessage)
+  // A single unusually large thread should not consume an unbounded portion
+  // of WebView storage. Drop the oldest cached rows until the serialized
+  // snapshot is within the per-thread budget; the server remains authoritative
+  // for anything omitted here.
+  while (bounded.length > 1) {
+    let serializedLength = 0
+    try {
+      serializedLength = JSON.stringify(bounded).length
+    } catch {
+      break
+    }
+    if (serializedLength <= MAX_CACHED_BYTES_PER_THREAD) break
+    bounded.shift()
+  }
+  return bounded
 }
 
 function openDatabase(): Promise<IDBDatabase | null> {
@@ -144,10 +168,7 @@ export async function writeAndroidConversationCache(
 
   const database = await openDatabase()
   if (!database) return
-  const messages = snapshot.messages
-    .filter((message) => message.messageType !== 'userMessage.optimistic')
-    .slice(-MAX_CACHED_MESSAGES)
-    .map(sanitizeMessage)
+  const messages = boundSnapshotMessages(snapshot.messages)
   const record: StoredRecord = {
     key: cacheKey(origin, normalizedThreadId),
     origin,
@@ -173,7 +194,11 @@ export async function writeAndroidConversationCache(
     }
   })
 
-  // Keep storage bounded across threads. Failure to prune is harmless.
+  // Keep storage bounded across threads. A prune is intentionally throttled;
+  // scanning all records after every streamed write defeats the cache's
+  // startup-performance purpose.
+  if (Date.now() - lastPruneAt < 30_000) return
+  lastPruneAt = Date.now()
   const pruneDatabase = await openDatabase()
   if (!pruneDatabase) return
   await new Promise<void>((resolve) => {

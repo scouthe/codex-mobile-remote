@@ -76,6 +76,7 @@ import type {
 import { reduceTaskSnapshot } from '../task/taskStateReducer'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 import {
+  isAndroidConversationCacheEnabled,
   readAndroidConversationCache,
   writeAndroidConversationCache,
   type AndroidConversationCacheRecord,
@@ -3216,7 +3217,8 @@ export function useDesktopState() {
     }
     // The cache is strictly a startup/read optimization. Never persist an
     // optimistic message because it has not been accepted by Codex yet.
-    if (!nextMessages.some((message) => message.messageType !== 'userMessage.optimistic')) return
+    if (!isAndroidConversationCacheEnabled()
+      || !nextMessages.some((message) => message.messageType !== 'userMessage.optimistic')) return
     const previousTimer = androidCacheWriteTimerByThreadId.get(threadId)
     if (previousTimer) clearTimeout(previousTimer)
     // Streaming assistant events can update this array dozens of times per
