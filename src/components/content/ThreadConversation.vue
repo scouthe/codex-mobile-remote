@@ -26,6 +26,8 @@
         class="conversation-item"
         :data-role="message.role"
         :data-message-type="message.messageType || ''"
+        :data-message-id="message.id"
+        :id="`conversation-message-${message.id}`"
       >
         <div v-if="isCommandMessage(message)" class="message-row" data-role="system">
           <div class="message-stack" data-role="system">
@@ -754,6 +756,23 @@
       <li ref="bottomAnchorRef" class="conversation-bottom-anchor" />
     </ul>
 
+    <nav
+      v-if="!isLoading && conversationTurnAnchors.length > 0"
+      class="conversation-turn-nav"
+      aria-label="Conversation prompts"
+    >
+      <button
+        v-for="anchor in conversationTurnAnchors"
+        :key="`turn-nav:${anchor.id}`"
+        type="button"
+        class="conversation-turn-marker"
+        :class="{ 'is-active': activeTurnMessageId === anchor.id }"
+        :aria-label="anchor.preview"
+        :title="anchor.preview"
+        @click="jumpToConversationTurn(anchor)"
+      />
+    </nav>
+
     <button
       v-if="showJumpToLatestButton"
       type="button"
@@ -923,6 +942,7 @@ import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { useMobile } from '../../composables/useMobile'
 import { shouldAutoLoadPersistedAbove } from '../../task/olderMessageLoading'
+import { buildConversationTurnAnchors, type ConversationTurnAnchor } from '../../task/conversationTurnNavigator'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
@@ -1441,6 +1461,8 @@ const isLoadingMore = ref(false)
 
 const visibleMessages = computed(() => props.messages.slice(renderWindowStart.value))
 const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
+const conversationTurnAnchors = computed(() => buildConversationTurnAnchors(props.messages))
+const activeTurnMessageId = ref('')
 
 const showJumpToLatestButton = computed(
   () => !autoFollowOutput.value && (props.messages.length > 0 || props.pendingRequests.length > 0 || Boolean(props.liveOverlay)),
@@ -4278,6 +4300,18 @@ async function loadMoreAbove(): Promise<void> {
   }
 }
 
+async function jumpToConversationTurn(anchor: ConversationTurnAnchor): Promise<void> {
+  if (anchor.messageIndex < renderWindowStart.value) {
+    renderWindowStart.value = Math.max(0, anchor.messageIndex - 2)
+  }
+  activeTurnMessageId.value = anchor.id
+  await nextTick()
+  const target = document.getElementById(`conversation-message-${anchor.id}`)
+  if (target && conversationListRef.value && !conversationListRef.value.contains(target)) return
+  target?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  autoFollowOutput.value = false
+}
+
 defineExpose({
   jumpToLatest,
 })
@@ -4418,6 +4452,7 @@ watch(
     autoFollowOutput.value = true
     modalImageUrl.value = ''
     isLoadingMore.value = false
+    activeTurnMessageId.value = ''
     fileChangeActionState.value = {}
     fileChangeActionError.value = {}
     fileChangeRedoPatchIds.value = {}
@@ -4432,6 +4467,7 @@ function onConversationScroll(): void {
   const container = conversationListRef.value
   if (!container || props.isLoading) return
   autoFollowOutput.value = isAtBottom(container)
+  updateActiveTurnMarker(container)
   if (
     shouldAutoLoadPersistedAbove(isMobile.value, props.deferAutoLoadPersistedAbove)
     && hasMoreAbove.value
@@ -4440,6 +4476,18 @@ function onConversationScroll(): void {
   ) {
     void loadMoreAbove()
   }
+}
+
+function updateActiveTurnMarker(container: HTMLElement): void {
+  const rows = Array.from(container.querySelectorAll<HTMLElement>('[data-role="user"][data-message-id]'))
+  if (rows.length === 0) return
+  const markerLine = container.scrollTop + Math.max(24, container.clientHeight * 0.22)
+  let active = rows[0]
+  for (const row of rows) {
+    if (row.offsetTop <= markerLine) active = row
+    else break
+  }
+  activeTurnMessageId.value = active.dataset.messageId ?? activeTurnMessageId.value
 }
 
 const failedMarkdownImages = ref(new Set<string>())
@@ -4498,6 +4546,35 @@ onBeforeUnmount(() => {
 
 .conversation-root {
   @apply relative flex-1 min-h-0 min-w-0 p-0 flex flex-col overflow-y-hidden overflow-x-hidden bg-transparent border-none rounded-none;
+}
+
+.conversation-turn-nav {
+  @apply absolute right-2 top-1/2 z-10 flex max-h-[60%] -translate-y-1/2 flex-col items-end gap-1 overflow-y-auto px-1 py-2;
+  scrollbar-width: none;
+}
+
+.conversation-turn-nav::-webkit-scrollbar {
+  display: none;
+}
+
+.conversation-turn-marker {
+  @apply h-1 w-4 shrink-0 rounded-full border-0 bg-slate-300/80 p-0 transition-all duration-150;
+}
+
+.conversation-turn-marker:hover,
+.conversation-turn-marker:focus-visible,
+.conversation-turn-marker.is-active {
+  @apply w-7 bg-slate-600 outline-none;
+}
+
+:global(:root.dark) .conversation-turn-marker {
+  @apply bg-zinc-600/80;
+}
+
+:global(:root.dark) .conversation-turn-marker:hover,
+:global(:root.dark) .conversation-turn-marker:focus-visible,
+:global(:root.dark) .conversation-turn-marker.is-active {
+  @apply bg-zinc-200;
 }
 
 .conversation-loading {

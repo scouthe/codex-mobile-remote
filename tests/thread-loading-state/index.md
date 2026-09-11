@@ -36,3 +36,4 @@ Return to the [manual test index](../../tests.md).
 | [Missing thread route errors render in chat](missing-thread-route-errors-render-in-chat.md) |
 | [Non-thread startup selection priming](non-thread-startup-selection-priming.md) |
 | [Mobile conversation auto-loads earlier messages](mobile-auto-loads-earlier-messages-on-scroll.md) |
+| [Conversation prompt navigation rail](conversation-prompt-navigation-rail.md) |
