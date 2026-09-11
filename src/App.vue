@@ -231,6 +231,16 @@
                 <span class="sidebar-settings-label">{{ t('Web access password') }}</span>
                 <span class="sidebar-settings-value">{{ t('Manage') }}</span>
               </button>
+              <button
+                v-if="isAndroidApp"
+                class="sidebar-settings-row"
+                type="button"
+                :title="t('Remove locally cached Android conversations')"
+                @click="clearAndroidConversationCacheAction"
+              >
+                <span class="sidebar-settings-label">{{ t('Clear App conversation cache') }}</span>
+                <span class="sidebar-settings-value">{{ t('Clear') }}</span>
+              </button>
               <button class="sidebar-settings-row" type="button" :title="SETTINGS_HELP.sendWithEnter" @click="toggleSendWithEnter">
                 <span class="sidebar-settings-label">{{ t('Require ⌘ + enter to send') }}</span>
                 <span class="sidebar-settings-toggle" :class="{ 'is-on': !sendWithEnter }" />
@@ -1310,6 +1320,7 @@ import { useMobile } from './composables/useMobile'
 import { ANDROID_SHARED_BATCH_LIMIT_BYTES, useAndroidBridge } from './composables/useAndroidBridge'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
+import { clearAndroidConversationCache } from './cache/androidConversationCache'
 import {
   checkoutGitBranch,
   cloneGithubRepository,
@@ -1621,6 +1632,7 @@ const route = useRoute()
 const router = useRouter()
 const { isMobile } = useMobile()
 const androidBridge = useAndroidBridge()
+const isAndroidApp = computed(() => androidBridge.nativeAvailable.value)
 type SidebarThreadTreeExposed = {
   openAutomationEditorFromPanel: (payload: AutomationEditRequest) => void
   openAutomationCreatorFromPanel: () => void
@@ -2632,6 +2644,11 @@ function onAndroidReady(event: CustomEvent<unknown>): void {
   const payload = parseSharePayload(event.detail) ?? androidBridge.getPendingShare()
   if (payload) enqueueAndroidShare(payload)
   syncAndroidTaskNotification()
+}
+
+async function clearAndroidConversationCacheAction(): Promise<void> {
+  if (!androidBridge.nativeAvailable.value) return
+  await clearAndroidConversationCache()
 }
 
 function onAndroidShare(event: CustomEvent<unknown>): void {

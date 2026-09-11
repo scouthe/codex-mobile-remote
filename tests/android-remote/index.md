@@ -10,6 +10,7 @@ Return to the [manual test index](../../tests.md).
 | Section |
 | --- |
 | [Bridge contract, task notifications, and share intake](bridge-contract-task-notifications-and-share-intake.md) |
+| [Android conversation startup snapshot cache](android-conversation-startup-snapshot-cache.md) |
 
 ## Automated contract tests
 

@@ -28,3 +28,4 @@ Return to the [manual test index](../../tests.md).
 | [Home route no longer crashes on dev startup](home-route-no-longer-crashes-on-dev-startup.md) |
 | [Shared app-server socket fails closed during Desktop reconnect](shared-app-server-socket-fails-closed.md) |
 | [StarBridge user client activation](starbridge-user-client.md) |
+| [Linux one-click installer](linux-one-click-installer.md) |

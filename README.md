@@ -32,6 +32,50 @@ Codex 会话，而不是把项目变成另一个独立的多模型平台。
 - **兼容原有功能**：保留上游的项目管理、Skills、文件浏览、导入导出、Telegram 和隧道能力；
   账号刷新所需的临时隔离 app-server 仍然保留。
 
+## Linux 一键安装（推荐）
+
+Linux 用户不需要安装 pnpm、拉取源码或手动创建 systemd 服务。发布版本提供
+安装脚本和预构建运行包，脚本只安装 Codex Remote 自身，并继续使用本机已经配置
+好的官方 Codex CLI、`CODEX_HOME` 和 app-server socket。
+
+先下载脚本并检查内容，再执行：
+
+```bash
+curl -fsSL https://github.com/scouthe/codex-mobile-remote/releases/latest/download/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+安装脚本会检查 Linux 架构、Node.js 18+ 和官方 `codex` 命令，安装到
+`~/.local/share/codexapp`，创建用户级 `codexapp-5900.service` 并输出局域网地址。
+它不会修改 `~/.codex/auth.json`、`config.toml`、项目记录或官方 app-server。
+
+首次打开网页时完成访问密码设置，然后进入“设置 → 星桥”输入管理员发放的激活码，
+即可由现有 StarBridge 流程配置 FRPC 并获得公网访问地址。公网使用必须设置网页
+访问密码；不设置密码时只能用于受信任的局域网环境。
+
+离线安装时，将对应架构的发布包放在本机：
+
+```bash
+CODEXAPP_ARCHIVE="$PWD/codexapp-linux-amd64.tar.gz" bash install.sh
+```
+
+离线包也可以通过 `CODEXAPP_SHA256=<sha256>` 做强校验；发布包对应的校验值位于
+同一 Release 的 `SHA256SUMS` 文件中。
+
+默认端口和安装目录可以调整：
+
+```bash
+CODEXAPP_PORT=5910 CODEXAPP_INSTALL_ROOT="$HOME/.local/share/codexapp-test" bash install.sh
+```
+
+网络受限时，可以把 `CODEXAPP_RELEASE_BASE_URL` 指向管理员提供的 HTTPS 发布镜像；
+安装脚本仍会优先校验发布包的 `SHA256SUMS`：
+
+```bash
+CODEXAPP_RELEASE_BASE_URL="https://mirror.example/releases" bash install.sh
+```
+
 ## 本地部署教程（源码方式）
 
 下面的流程适用于把 `codex-mobile-remote` 部署在运行 Codex CLI 的 Linux

@@ -1139,7 +1139,10 @@ function planStepStatusIcon(status: UiPlanStep['status']): string {
 }
 
 function isCommandAutoExpanded(message: UiMessage): boolean {
-  return !hasLiveAssistantText.value && message.id === activeCommandMessageId.value
+  // On narrow/mobile layouts command output can push the actual conversation
+  // below the fold. Keep the active command as a compact, clickable row there;
+  // desktop retains the previous auto-expanded runtime output behaviour.
+  return !isMobile.value && !hasLiveAssistantText.value && message.id === activeCommandMessageId.value
 }
 
 function isCommandExpanded(message: UiMessage): boolean {
