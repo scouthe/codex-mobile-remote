@@ -762,14 +762,26 @@
       aria-label="Conversation prompts"
     >
       <button
+        v-if="isMobile && mobilePreviewAnchor"
+        type="button"
+        class="conversation-turn-mobile-preview"
+        :aria-label="mobilePreviewAnchor.preview"
+        @click="confirmMobileConversationTurn"
+      >
+        {{ mobilePreviewAnchor.preview }}
+      </button>
+      <button
         v-for="anchor in conversationTurnAnchors"
         :key="`turn-nav:${anchor.id}`"
         type="button"
         class="conversation-turn-marker"
-        :class="{ 'is-active': activeTurnMessageId === anchor.id }"
+        :class="{
+          'is-active': activeTurnMessageId === anchor.id,
+          'is-previewing': mobilePreviewAnchorId === anchor.id,
+        }"
         :aria-label="anchor.preview"
-        :title="anchor.preview"
-        @click="jumpToConversationTurn(anchor)"
+        :title="isMobile ? undefined : anchor.preview"
+        @click="onConversationTurnMarkerClick(anchor)"
       />
     </nav>
 
@@ -942,7 +954,11 @@ import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { useMobile } from '../../composables/useMobile'
 import { shouldAutoLoadPersistedAbove } from '../../task/olderMessageLoading'
-import { buildConversationTurnAnchors, type ConversationTurnAnchor } from '../../task/conversationTurnNavigator'
+import {
+  buildConversationTurnAnchors,
+  mobileTurnMarkerAction,
+  type ConversationTurnAnchor,
+} from '../../task/conversationTurnNavigator'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
@@ -1465,6 +1481,10 @@ const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMore
 // older pages enter the window, their prompt markers appear automatically.
 const conversationTurnAnchors = computed(() => buildConversationTurnAnchors(visibleMessages.value))
 const activeTurnMessageId = ref('')
+const mobilePreviewAnchorId = ref('')
+const mobilePreviewAnchor = computed(() => (
+  conversationTurnAnchors.value.find((anchor) => anchor.id === mobilePreviewAnchorId.value) ?? null
+))
 
 const showJumpToLatestButton = computed(
   () => !autoFollowOutput.value && (props.messages.length > 0 || props.pendingRequests.length > 0 || Boolean(props.liveOverlay)),
@@ -4311,6 +4331,33 @@ async function jumpToConversationTurn(anchor: ConversationTurnAnchor): Promise<v
   autoFollowOutput.value = false
 }
 
+function onConversationTurnMarkerClick(anchor: ConversationTurnAnchor): void {
+  if (!isMobile.value) {
+    void jumpToConversationTurn(anchor)
+    return
+  }
+  if (mobileTurnMarkerAction(mobilePreviewAnchorId.value, anchor.id) === 'preview') {
+    mobilePreviewAnchorId.value = anchor.id
+    return
+  }
+  mobilePreviewAnchorId.value = ''
+  void jumpToConversationTurn(anchor)
+}
+
+function confirmMobileConversationTurn(): void {
+  const anchor = mobilePreviewAnchor.value
+  if (!anchor) return
+  mobilePreviewAnchorId.value = ''
+  void jumpToConversationTurn(anchor)
+}
+
+function dismissMobileConversationTurnPreview(event: PointerEvent): void {
+  if (!mobilePreviewAnchorId.value) return
+  const target = event.target
+  if (target instanceof Element && target.closest('.conversation-turn-nav')) return
+  mobilePreviewAnchorId.value = ''
+}
+
 defineExpose({
   jumpToLatest,
 })
@@ -4452,6 +4499,7 @@ watch(
     modalImageUrl.value = ''
     isLoadingMore.value = false
     activeTurnMessageId.value = ''
+    mobilePreviewAnchorId.value = ''
     fileChangeActionState.value = {}
     fileChangeActionError.value = {}
     fileChangeRedoPatchIds.value = {}
@@ -4518,6 +4566,7 @@ onMounted(() => {
   window.addEventListener('pointerdown', onWindowPointerDownForFileLinkContextMenu)
   window.addEventListener('blur', onWindowBlurForFileLinkContextMenu)
   window.addEventListener('keydown', onWindowKeydownForFileLinkContextMenu)
+  document.addEventListener('pointerdown', dismissMobileConversationTurnPreview)
 })
 
 onBeforeUnmount(() => {
@@ -4537,6 +4586,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointerdown', onWindowPointerDownForFileLinkContextMenu)
   window.removeEventListener('blur', onWindowBlurForFileLinkContextMenu)
   window.removeEventListener('keydown', onWindowKeydownForFileLinkContextMenu)
+  document.removeEventListener('pointerdown', dismissMobileConversationTurnPreview)
 })
 </script>
 
@@ -4557,23 +4607,48 @@ onBeforeUnmount(() => {
 }
 
 .conversation-turn-marker {
-  @apply h-1 w-4 shrink-0 rounded-full border-0 bg-slate-300/80 p-0 transition-all duration-150;
+  @apply flex h-4 w-7 shrink-0 items-center justify-end border-0 bg-transparent p-0 outline-none;
 }
 
-.conversation-turn-marker:hover,
-.conversation-turn-marker:focus-visible,
-.conversation-turn-marker.is-active {
-  @apply w-7 bg-slate-600 outline-none;
+.conversation-turn-marker::before {
+  content: '';
+  @apply block h-1 w-4 rounded-full bg-slate-300/80 transition-all duration-150;
 }
 
-:global(:root.dark) .conversation-turn-marker {
+.conversation-turn-marker:hover::before,
+.conversation-turn-marker:focus-visible::before,
+.conversation-turn-marker.is-active::before,
+.conversation-turn-marker.is-previewing::before {
+  @apply w-7 bg-slate-600;
+}
+
+:global(:root.dark) .conversation-turn-marker::before {
   @apply bg-zinc-600/80;
 }
 
-:global(:root.dark) .conversation-turn-marker:hover,
-:global(:root.dark) .conversation-turn-marker:focus-visible,
-:global(:root.dark) .conversation-turn-marker.is-active {
+:global(:root.dark) .conversation-turn-marker:hover::before,
+:global(:root.dark) .conversation-turn-marker:focus-visible::before,
+:global(:root.dark) .conversation-turn-marker.is-active::before,
+:global(:root.dark) .conversation-turn-marker.is-previewing::before {
   @apply bg-zinc-200;
+}
+
+.conversation-turn-mobile-preview {
+  @apply absolute right-9 top-1/2 max-h-28 w-[min(17rem,calc(100vw-4.5rem))] -translate-y-1/2 overflow-hidden rounded-md border border-slate-200 bg-white px-3 py-2 text-left text-xs leading-5 text-slate-800 shadow-lg;
+}
+
+:global(:root.dark) .conversation-turn-mobile-preview {
+  @apply border-zinc-700 bg-zinc-900 text-zinc-100;
+}
+
+@media (max-width: 767px) {
+  .conversation-turn-nav {
+    @apply right-1 gap-0;
+  }
+
+  .conversation-turn-marker {
+    @apply h-6 w-8;
+  }
 }
 
 .conversation-loading {

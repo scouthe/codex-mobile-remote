@@ -6,6 +6,8 @@ export type ConversationTurnAnchor = {
   preview: string
 }
 
+export type MobileTurnMarkerAction = 'preview' | 'jump'
+
 const DEFAULT_PREVIEW_LENGTH = 120
 
 export function conversationTurnPreview(text: string, maxLength = DEFAULT_PREVIEW_LENGTH): string {
@@ -24,4 +26,9 @@ export function buildConversationTurnAnchors(messages: UiMessage[]): Conversatio
       messageIndex,
       preview: conversationTurnPreview(message.text) || 'User message',
     }))
+}
+
+/** Touch devices preview a prompt before a second tap confirms navigation. */
+export function mobileTurnMarkerAction(previewedId: string, targetId: string): MobileTurnMarkerAction {
+  return previewedId === targetId ? 'jump' : 'preview'
 }

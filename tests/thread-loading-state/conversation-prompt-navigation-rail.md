@@ -15,7 +15,9 @@ prompts, matching the navigation affordance in the Windows Codex client.
 2. Hover a marker and read its tooltip.
 3. Click a marker for an older prompt.
 4. Scroll manually and observe which marker is highlighted.
-5. Repeat in light and dark themes.
+5. On a phone-sized viewport, tap a marker once and confirm its prompt preview
+   appears without scrolling. Tap it again, or tap the preview, to jump.
+6. Repeat in light and dark themes.
 
 #### Expected Results
 
@@ -25,6 +27,8 @@ prompts, matching the navigation affordance in the Windows Codex client.
   or loading a different conversation.
 - The active marker follows the prompt nearest the upper portion of the
   viewport; marker contrast remains readable in both themes.
+- Mobile markers retain a compact visual appearance but expose a larger touch
+  target, and require preview confirmation before navigation.
 
 #### Rollback/Cleanup
 

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { buildConversationTurnAnchors, conversationTurnPreview } from './conversationTurnNavigator'
+import {
+  buildConversationTurnAnchors,
+  conversationTurnPreview,
+  mobileTurnMarkerAction,
+} from './conversationTurnNavigator'
 import type { UiMessage } from '../types/codex'
 
 function message(overrides: Partial<UiMessage> = {}): UiMessage {
@@ -26,5 +30,11 @@ describe('conversation turn navigator', () => {
 
   it('normalizes whitespace and truncates long prompt previews', () => {
     expect(conversationTurnPreview(' first\nsecond\tthird ', 12)).toBe('first secon…')
+  })
+
+  it('previews the first mobile tap and jumps on the second tap', () => {
+    expect(mobileTurnMarkerAction('', 'user-1')).toBe('preview')
+    expect(mobileTurnMarkerAction('user-1', 'user-1')).toBe('jump')
+    expect(mobileTurnMarkerAction('user-1', 'user-2')).toBe('preview')
   })
 })
