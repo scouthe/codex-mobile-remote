@@ -9,6 +9,7 @@ import {
   listDirectoryComposioConnectors,
   resumeThread,
   setThreadGoal,
+  startThread,
   startThreadTurn,
 } from './codexGateway'
 
@@ -69,6 +70,45 @@ describe('startThreadTurn collaboration mode payloads', () => {
         developer_instructions: null,
       },
     })
+  })
+})
+
+describe('startThread desktop-compatible history', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('creates user threads with the paginated history contract used by Codex Desktop', async () => {
+    const requests: Array<{ method: string; params: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string'
+        ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
+        : { method: '', params: {} }
+      requests.push(body)
+      return new Response(JSON.stringify({
+        result: {
+          thread: { id: 'thread-web-1' },
+          model: 'gpt-5.6-sol',
+          modelProvider: 'custom',
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(startThread('/home/user/project', 'gpt-5.6-sol')).resolves.toMatchObject({
+      threadId: 'thread-web-1',
+    })
+    expect(requests).toEqual([{
+      method: 'thread/start',
+      params: {
+        cwd: '/home/user/project',
+        model: 'gpt-5.6-sol',
+        historyMode: 'paginated',
+        threadSource: 'user',
+      },
+    }])
   })
 })
 
