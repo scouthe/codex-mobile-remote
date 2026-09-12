@@ -1,5 +1,5 @@
 <template>
-  <section class="conversation-root" @contextmenu.capture="onConversationContextMenu">
+  <section ref="conversationRootRef" class="conversation-root" @contextmenu.capture="onConversationContextMenu">
     <p v-if="isLoading" class="conversation-loading">Loading messages...</p>
 
     <p
@@ -9,7 +9,16 @@
       No messages in this thread yet.
     </p>
 
-    <ul v-else ref="conversationListRef" class="conversation-list" @scroll="onConversationScroll">
+    <ul
+      v-else
+      ref="conversationListRef"
+      class="conversation-list"
+      @scroll="onConversationScroll"
+      @scrollend="onConversationScrollEnd"
+      @wheel="onConversationUserScrollStart"
+      @touchstart="onConversationUserScrollStart"
+      @pointerdown="onConversationUserScrollStart"
+    >
       <li v-if="hasMoreAbove" class="conversation-load-more">
         <button
           type="button"
@@ -22,7 +31,7 @@
       </li>
       <template v-for="message in visibleMessages" :key="message.id">
       <li
-        v-if="!hiddenGroupedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
+        v-if="shouldRenderConversationMessage(message, isMobile) && !hiddenGroupedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
         class="conversation-item"
         :data-role="message.role"
         :data-message-type="message.messageType || ''"
@@ -734,7 +743,7 @@
         </div>
       </li>
       </template>
-      <li v-if="liveOverlay" class="conversation-item conversation-item-overlay">
+      <li v-if="liveOverlay && shouldRenderLiveOverlay(liveOverlay, isMobile)" class="conversation-item conversation-item-overlay">
         <div class="message-row">
           <div class="message-stack">
             <article class="live-overlay-inline" aria-live="polite">
@@ -757,13 +766,16 @@
     </ul>
 
     <button
-      v-if="isMobile && mobilePreviewAnchor"
+      v-if="conversationTurnTooltipAnchor"
       type="button"
-      class="conversation-turn-mobile-preview"
-      :aria-label="mobilePreviewAnchor.preview"
-      @click="confirmMobileConversationTurn"
+      class="conversation-turn-tooltip"
+      :style="conversationTurnTooltipStyle"
+      id="conversation-turn-tooltip"
+      role="tooltip"
+      :aria-label="conversationTurnTooltipAnchor.preview"
+      @click="isMobile ? confirmMobileConversationTurn() : undefined"
     >
-      {{ mobilePreviewAnchor.preview }}
+      {{ conversationTurnTooltipAnchor.preview }}
     </button>
     <nav
       v-if="!isLoading && conversationTurnAnchors.length > 0"
@@ -775,13 +787,20 @@
         :key="`turn-nav:${anchor.id}`"
         type="button"
         class="conversation-turn-marker"
+        :data-turn-anchor-id="anchor.id"
         :class="{
           'is-active': activeTurnMessageId === anchor.id,
           'is-previewing': mobilePreviewAnchorId === anchor.id,
+          'is-hovered': hoveredConversationTurnId === anchor.id,
         }"
         :aria-label="anchor.preview"
-        :title="isMobile ? undefined : anchor.preview"
+        :aria-describedby="conversationTurnTooltipId === anchor.id ? 'conversation-turn-tooltip' : undefined"
         @click="onConversationTurnMarkerClick(anchor)"
+        @pointerenter="onConversationTurnMarkerPointerEnter(anchor)"
+        @pointermove="onConversationTurnMarkerPointerMove(anchor)"
+        @pointerleave="onConversationTurnMarkerPointerLeave"
+        @focus="onConversationTurnMarkerFocus(anchor)"
+        @blur="onConversationTurnMarkerBlur"
       />
     </nav>
 
@@ -959,6 +978,10 @@ import {
   mobileTurnMarkerAction,
   type ConversationTurnAnchor,
 } from '../../task/conversationTurnNavigator'
+import {
+  shouldRenderConversationMessage,
+  shouldRenderLiveOverlay,
+} from '../../task/mobileConversationVisibility'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
@@ -1474,6 +1497,7 @@ const LOAD_MORE_SCROLL_THRESHOLD_PX = 200
 
 const renderWindowStart = ref(0)
 const isLoadingMore = ref(false)
+const conversationRootRef = ref<HTMLElement | null>(null)
 
 const visibleMessages = computed(() => props.messages.slice(renderWindowStart.value))
 const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
@@ -1481,10 +1505,46 @@ const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMore
 // older pages enter the window, their prompt markers appear automatically.
 const conversationTurnAnchors = computed(() => buildConversationTurnAnchors(visibleMessages.value))
 const activeTurnMessageId = ref('')
+// A programmatic jump should remain selected while smooth scrolling emits
+// intermediate scroll events. Once the scroll settles, normal viewport-based
+// marker tracking resumes.
+const navigationJumpTargetId = ref('')
+let navigationJumpResetTimer: ReturnType<typeof setTimeout> | null = null
+let navigationJumpSequence = 0
 const mobilePreviewAnchorId = ref('')
+const hoveredConversationTurnId = ref('')
+const focusedConversationTurnId = ref('')
+const suppressHoverUntilPointerMove = ref(false)
+const conversationTooltipLayoutVersion = ref(0)
 const mobilePreviewAnchor = computed(() => (
   conversationTurnAnchors.value.find((anchor) => anchor.id === mobilePreviewAnchorId.value) ?? null
 ))
+const conversationTurnTooltipId = computed(() => (
+  isMobile.value
+    ? mobilePreviewAnchorId.value
+    : hoveredConversationTurnId.value || focusedConversationTurnId.value
+))
+const conversationTurnTooltipAnchor = computed(() => (
+  conversationTurnAnchors.value.find((anchor) => anchor.id === conversationTurnTooltipId.value) ?? null
+))
+const conversationTurnTooltipStyle = computed(() => {
+  // Recalculate the anchor position as the conversation scrolls.
+  void conversationTooltipLayoutVersion.value
+  const root = conversationRootRef.value
+  if (!root || !conversationTurnTooltipId.value) return {}
+  const marker = Array.from(root.querySelectorAll<HTMLElement>('[data-turn-anchor-id]'))
+    .find((candidate) => candidate.dataset.turnAnchorId === conversationTurnTooltipId.value)
+  if (!marker) return {}
+  const markerRect = marker.getBoundingClientRect()
+  const rootRect = root.getBoundingClientRect()
+  const top = Math.max(64, Math.min(
+    Math.max(64, rootRect.height - 64),
+    markerRect.top - rootRect.top + markerRect.height / 2,
+  ))
+  return {
+    top: `${top}px`,
+  }
+})
 
 const showJumpToLatestButton = computed(
   () => !autoFollowOutput.value && (props.messages.length > 0 || props.pendingRequests.length > 0 || Boolean(props.liveOverlay)),
@@ -4323,12 +4383,36 @@ async function loadMoreAbove(): Promise<void> {
 }
 
 async function jumpToConversationTurn(anchor: ConversationTurnAnchor): Promise<void> {
+  const threadIdAtStart = props.activeThreadId
+  const jumpSequence = ++navigationJumpSequence
+  if (navigationJumpResetTimer) {
+    clearTimeout(navigationJumpResetTimer)
+    navigationJumpResetTimer = null
+  }
+  navigationJumpTargetId.value = anchor.id
   activeTurnMessageId.value = anchor.id
   await nextTick()
+  if (props.activeThreadId !== threadIdAtStart || navigationJumpSequence !== jumpSequence) return
   const target = document.getElementById(`conversation-message-${anchor.id}`)
-  if (target && conversationListRef.value && !conversationListRef.value.contains(target)) return
-  target?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  const container = conversationListRef.value
+  if (!target || !container || !container.contains(target)) {
+    navigationJumpTargetId.value = ''
+    if (activeTurnMessageId.value === anchor.id) activeTurnMessageId.value = ''
+    return
+  }
+  target.scrollIntoView({ block: 'center', behavior: 'smooth' })
   autoFollowOutput.value = false
+  // Re-assert the target for browsers/webviews that do not dispatch
+  // `scrollend` (including older Android WebView). The target remains pinned
+  // until the user starts a manual scroll.
+  const resetTimer = setTimeout(() => {
+    if (navigationJumpSequence !== jumpSequence) return
+    if (navigationJumpTargetId.value === anchor.id) {
+      activeTurnMessageId.value = anchor.id
+    }
+    if (navigationJumpResetTimer === resetTimer) navigationJumpResetTimer = null
+  }, 2000)
+  navigationJumpResetTimer = resetTimer
 }
 
 function onConversationTurnMarkerClick(anchor: ConversationTurnAnchor): void {
@@ -4344,6 +4428,35 @@ function onConversationTurnMarkerClick(anchor: ConversationTurnAnchor): void {
   void jumpToConversationTurn(anchor)
 }
 
+function onConversationTurnMarkerPointerEnter(anchor: ConversationTurnAnchor): void {
+  if (isMobile.value) return
+  if (suppressHoverUntilPointerMove.value) return
+  hoveredConversationTurnId.value = anchor.id
+}
+
+function onConversationTurnMarkerPointerMove(anchor: ConversationTurnAnchor): void {
+  if (isMobile.value) return
+  if (suppressHoverUntilPointerMove.value) {
+    suppressHoverUntilPointerMove.value = false
+  }
+  hoveredConversationTurnId.value = anchor.id
+}
+
+function onConversationTurnMarkerPointerLeave(): void {
+  if (isMobile.value) return
+  hoveredConversationTurnId.value = ''
+}
+
+function onConversationTurnMarkerFocus(anchor: ConversationTurnAnchor): void {
+  if (isMobile.value) return
+  focusedConversationTurnId.value = anchor.id
+}
+
+function onConversationTurnMarkerBlur(): void {
+  if (isMobile.value) return
+  focusedConversationTurnId.value = ''
+}
+
 function confirmMobileConversationTurn(): void {
   const anchor = mobilePreviewAnchor.value
   if (!anchor) return
@@ -4354,7 +4467,7 @@ function confirmMobileConversationTurn(): void {
 function dismissMobileConversationTurnPreview(event: PointerEvent): void {
   if (!mobilePreviewAnchorId.value) return
   const target = event.target
-  if (target instanceof Element && target.closest('.conversation-turn-nav, .conversation-turn-mobile-preview')) return
+  if (target instanceof Element && target.closest('.conversation-turn-nav, .conversation-turn-tooltip')) return
   mobilePreviewAnchorId.value = ''
 }
 
@@ -4387,6 +4500,8 @@ async function scheduleConversationScroll(): Promise<void> {
       conversationScrollFrame = 0
       conversationScrollPromise = null
       applyConversationScrollState()
+      const container = conversationListRef.value
+      if (container) updateActiveTurnMarker(container)
       bindPendingImageHandlers()
       scheduleBottomLock()
       resolve()
@@ -4498,8 +4613,17 @@ watch(
     autoFollowOutput.value = true
     modalImageUrl.value = ''
     isLoadingMore.value = false
+    navigationJumpSequence += 1
     activeTurnMessageId.value = ''
+    navigationJumpTargetId.value = ''
+    if (navigationJumpResetTimer) {
+      clearTimeout(navigationJumpResetTimer)
+      navigationJumpResetTimer = null
+    }
     mobilePreviewAnchorId.value = ''
+    hoveredConversationTurnId.value = ''
+    focusedConversationTurnId.value = ''
+    suppressHoverUntilPointerMove.value = true
     fileChangeActionState.value = {}
     fileChangeActionError.value = {}
     fileChangeRedoPatchIds.value = {}
@@ -4513,6 +4637,7 @@ watch(
 function onConversationScroll(): void {
   const container = conversationListRef.value
   if (!container || props.isLoading) return
+  conversationTooltipLayoutVersion.value += 1
   autoFollowOutput.value = isAtBottom(container)
   updateActiveTurnMarker(container)
   if (
@@ -4525,9 +4650,39 @@ function onConversationScroll(): void {
   }
 }
 
+function onConversationScrollEnd(): void {
+  const targetId = navigationJumpTargetId.value
+  if (!targetId) return
+  // Keep the clicked marker selected after the smooth scroll has settled.
+  // A subsequent wheel/touch/pointer gesture releases the pin and resumes
+  // viewport-based tracking.
+  activeTurnMessageId.value = targetId
+}
+
+function onConversationUserScrollStart(): void {
+  if (!navigationJumpTargetId.value) return
+  navigationJumpSequence += 1
+  navigationJumpTargetId.value = ''
+  if (navigationJumpResetTimer) {
+    clearTimeout(navigationJumpResetTimer)
+    navigationJumpResetTimer = null
+  }
+}
+
 function updateActiveTurnMarker(container: HTMLElement): void {
   const rows = Array.from(container.querySelectorAll<HTMLElement>('[data-role="user"][data-message-id]'))
   if (rows.length === 0) return
+  const jumpTargetId = navigationJumpTargetId.value
+  if (jumpTargetId) {
+    const jumpTarget = rows.find((row) => row.dataset.messageId === jumpTargetId)
+    if (jumpTarget) {
+      activeTurnMessageId.value = jumpTargetId
+      return
+    }
+    // The target may have been evicted by the render window while loading
+    // older history. In that case fall back to normal marker tracking.
+    navigationJumpTargetId.value = ''
+  }
   const markerLine = container.scrollTop + Math.max(24, container.clientHeight * 0.22)
   let active = rows[0]
   for (const row of rows) {
@@ -4570,6 +4725,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  navigationJumpSequence += 1
   clearRenderCaches()
   if (conversationScrollFrame) {
     cancelAnimationFrame(conversationScrollFrame)
@@ -4578,6 +4734,10 @@ onBeforeUnmount(() => {
   if (bottomLockFrame) {
     cancelAnimationFrame(bottomLockFrame)
     bottomLockFrame = 0
+  }
+  if (navigationJumpResetTimer) {
+    clearTimeout(navigationJumpResetTimer)
+    navigationJumpResetTimer = null
   }
   if (copiedMessageResetTimer) {
     clearTimeout(copiedMessageResetTimer)
@@ -4607,7 +4767,7 @@ onBeforeUnmount(() => {
 }
 
 .conversation-turn-marker {
-  @apply flex h-4 w-7 shrink-0 items-center justify-end border-0 bg-transparent p-0 outline-none;
+  @apply relative z-10 flex h-4 w-7 shrink-0 items-center justify-end border-0 bg-transparent p-0 outline-none;
 }
 
 .conversation-turn-marker::before {
@@ -4633,11 +4793,15 @@ onBeforeUnmount(() => {
   @apply bg-zinc-200;
 }
 
-.conversation-turn-mobile-preview {
-  @apply absolute right-9 top-1/2 z-30 max-h-28 w-[min(17rem,calc(100vw-4.5rem))] -translate-y-1/2 overflow-hidden rounded-md border border-slate-200 bg-white px-3 py-2 text-left text-xs leading-5 text-slate-800 shadow-lg;
+.conversation-turn-tooltip {
+  @apply pointer-events-none absolute right-10 z-40 max-h-28 max-w-lg -translate-y-1/2 overflow-hidden rounded-xl border border-slate-200 bg-white px-3 py-2 text-left text-sm leading-5 text-slate-800 shadow-[0_8px_24px_rgba(15,23,42,0.14)];
+  width: min(28rem, calc(100% - 4.5rem));
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
 }
 
-:global(:root.dark) .conversation-turn-mobile-preview {
+:global(:root.dark) .conversation-turn-tooltip {
   @apply border-zinc-700 bg-zinc-900 text-zinc-100;
 }
 
@@ -4648,6 +4812,11 @@ onBeforeUnmount(() => {
 
   .conversation-turn-marker {
     @apply h-6 w-8;
+  }
+
+  .conversation-turn-tooltip {
+    @apply pointer-events-auto right-9 max-w-sm rounded-lg text-xs;
+    width: min(22rem, calc(100% - 4rem));
   }
 }
 
