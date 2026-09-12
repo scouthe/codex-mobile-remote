@@ -2275,7 +2275,12 @@ export type ForkedThread = {
 
 export async function startThread(cwd?: string, model?: string): Promise<StartedThread> {
   try {
-    const params: Record<string, unknown> = {}
+    const params: Record<string, unknown> = {
+      // Match the official Desktop thread contract so threads created from
+      // the web/Android client appear in Desktop's project conversation list.
+      historyMode: 'paginated',
+      threadSource: 'user',
+    }
     if (typeof cwd === 'string' && cwd.trim().length > 0) {
       params.cwd = cwd.trim()
     }
