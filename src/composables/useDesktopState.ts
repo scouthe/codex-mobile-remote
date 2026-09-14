@@ -118,6 +118,7 @@ const RECENT_SKILLS_LOAD_REUSE_MS = 2000
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
+const AUTO_RETRY_DELAYS_MS = [10_000, 20_000, 40_000]
 const OPENCODE_ZEN_DEFAULT_MODEL = 'big-pickle'
 const CODEX_CLI_MISSING_MESSAGE = 'Codex CLI not found. Install @openai/codex or set CODEXUI_CODEX_COMMAND.'
 const ACTIVE_TASK_STATES = new Set<TaskSnapshot['state']>([
@@ -676,6 +677,15 @@ function isUnsupportedChatGptModelError(error: unknown): boolean {
   )
 }
 
+/** Errors that are safe to replay because the upstream service may recover. */
+export function isRetryableTurnErrorMessage(message: string): boolean {
+  const normalized = message.toLowerCase()
+  if (!normalized || isUnsupportedChatGptModelError(new Error(message))) return false
+  if (/already has an active writer|already has a live local writer|failed to acquire thread writer/.test(normalized)) return false
+  if (/cancel(?:led|ed)|interrupt|permission|unauthori[sz]ed|forbidden|invalid (?:request|argument|parameter)|authentication|api key|no rollout found|not found/.test(normalized)) return false
+  return /capacity|at capacity|overloaded|rate.?limit|too many requests|http\s*(?:429|500|502|503|504)|(?:^|\s)(?:429|500|502|503|504)(?:\s|$)|temporar(?:y|ily) unavailable|gateway|timeout|timed out|network|connection reset|connection refused|service unavailable|provider unavailable|upstream unavailable|try again/.test(normalized)
+}
+
 function areMessageFieldsEqual(first: UiMessage, second: UiMessage): boolean {
   return (
     first.id === second.id &&
@@ -908,6 +918,17 @@ type TurnActivityState = {
 type TurnErrorState = {
   message: string
   transient: boolean
+}
+
+export type TurnRetryState = {
+  threadId: string
+  turnId?: string
+  attempt: number
+  maxAttempts: number
+  retryAtMs: number
+  remainingSeconds: number
+  error: string
+  phase: 'scheduled' | 'retrying'
 }
 
 type TurnStartedInfo = {
@@ -1523,6 +1544,7 @@ export function useDesktopState() {
     effort: ReasoningEffort | ''
     collaborationMode: CollaborationModeKind
     fallbackRetried: boolean
+    retryAttempt?: number
   }
   const queuedMessagesByThreadId = ref<Record<string, QueuedMessage[]>>({})
   const queueProcessingByThreadId = ref<Record<string, boolean>>({})
@@ -1688,6 +1710,9 @@ export function useDesktopState() {
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
   const fallbackRetryInFlightThreadIds = new Set<string>()
+  const turnRetryByThreadId = ref<Record<string, TurnRetryState>>({})
+  const turnRetryTimerByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
+  let turnRetryTicker: ReturnType<typeof setInterval> | null = null
   const threadGoalLoadPromiseByThreadId = new Map<string, Promise<void>>()
   const threadGoalMutationVersionByThreadId = new Map<string, number>()
   const lastThreadGoalLoadAtByThreadId = new Map<string, number>()
@@ -2167,6 +2192,10 @@ export function useDesktopState() {
       errorText,
     }
   })
+  const selectedTurnRetryState = computed<TurnRetryState | null>(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? turnRetryByThreadId.value[threadId] ?? null : null
+  })
   const codexQuota = computed<UiRateLimitSnapshot | null>(() => codexRateLimit.value)
   const selectedThreadTokenUsage = computed<UiThreadTokenUsage | null>(() => {
     const threadId = selectedThreadId.value
@@ -2416,6 +2445,45 @@ export function useDesktopState() {
     }
   }
 
+  function isRetryableTurnError(message: string): boolean {
+    return isRetryableTurnErrorMessage(message)
+  }
+
+  function stopTurnRetryTickerIfIdle(): void {
+    if (turnRetryByThreadId.value && Object.keys(turnRetryByThreadId.value).length === 0 && turnRetryTicker !== null) {
+      clearInterval(turnRetryTicker)
+      turnRetryTicker = null
+    }
+  }
+
+  function clearTurnRetry(threadId: string): void {
+    const timer = turnRetryTimerByThreadId.get(threadId)
+    if (timer !== undefined) clearTimeout(timer)
+    turnRetryTimerByThreadId.delete(threadId)
+    if (turnRetryByThreadId.value[threadId]) {
+      turnRetryByThreadId.value = omitKey(turnRetryByThreadId.value, threadId)
+    }
+    stopTurnRetryTickerIfIdle()
+  }
+
+  function ensureTurnRetryTicker(): void {
+    if (turnRetryTicker !== null) return
+    turnRetryTicker = setInterval(() => {
+      const now = Date.now()
+      let changed = false
+      const next = { ...turnRetryByThreadId.value }
+      for (const [threadId, state] of Object.entries(next)) {
+        const remainingSeconds = Math.max(0, Math.ceil((state.retryAtMs - now) / 1000))
+        if (remainingSeconds !== state.remainingSeconds) {
+          next[threadId] = { ...state, remainingSeconds }
+          changed = true
+        }
+      }
+      if (changed) turnRetryByThreadId.value = next
+      stopTurnRetryTickerIfIdle()
+    }, 250)
+  }
+
   function isActiveThreadWriterConflict(error: unknown): boolean {
     const message = error instanceof Error ? error.message : String(error ?? '')
     const normalized = message.toLowerCase()
@@ -2559,6 +2627,118 @@ export function useDesktopState() {
       setTurnActivityForThread(threadId, null)
     } finally {
       fallbackRetryInFlightThreadIds.delete(threadId)
+    }
+  }
+
+  async function retryPendingTurn(threadId: string): Promise<void> {
+    const state = turnRetryByThreadId.value[threadId]
+    const pending = pendingTurnRequestByThreadId.value[threadId]
+    if (!state || !pending || fallbackRetryInFlightThreadIds.has(threadId)) return
+
+    clearTurnRetry(threadId)
+    setTurnActivityForThread(threadId, {
+      label: 'Retrying',
+      details: [`Attempt ${state.attempt} of ${state.maxAttempts}`],
+    })
+    setThreadInProgress(threadId, true)
+    setTurnErrorForThread(threadId, null)
+    fallbackRetryInFlightThreadIds.add(threadId)
+
+    try {
+      // A failed turn normally leaves its user message in the session. Roll
+      // back only when that exact failed turn is present; never remove a
+      // newer turn written by Desktop while we were waiting.
+      const failedTurnId = state.turnId
+      if (failedTurnId) {
+        const persisted = persistedMessagesByThreadId.value[threadId] ?? []
+        if (persisted.some((message) => message.turnId === failedTurnId)) {
+          const rolledBackMessages = await rollbackThread(threadId, 1)
+          setPersistedMessagesForThread(threadId, rolledBackMessages)
+          clearLivePlansForThread(threadId)
+          setLiveAgentMessagesForThread(threadId, [])
+          clearLiveReasoningForThread(threadId)
+          if (liveCommandsByThreadId.value[threadId]) {
+            liveCommandsByThreadId.value = omitKey(liveCommandsByThreadId.value, threadId)
+          }
+        }
+      }
+      await startTurnForThread(
+        threadId,
+        pending.text,
+        pending.imageUrls,
+        pending.skills,
+        pending.fileAttachments,
+        pending.collaborationMode,
+        true,
+        state.attempt,
+      )
+      scheduleRateLimitRefresh()
+      pendingThreadMessageRefresh.add(threadId)
+      await syncFromNotifications()
+    } catch (unknownError) {
+      const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+      setThreadInProgress(threadId, false)
+      setTurnActivityForThread(threadId, null)
+      setTurnErrorForThread(threadId, errorMessage)
+      if (isRetryableTurnError(errorMessage)) {
+        scheduleTurnRetry(threadId, errorMessage)
+      } else {
+        clearPendingTurnRequest(threadId)
+      }
+    } finally {
+      fallbackRetryInFlightThreadIds.delete(threadId)
+    }
+  }
+
+  function scheduleTurnRetry(threadId: string, message: string, failedTurnId = ''): void {
+    if (!isRetryableTurnError(message)) return
+    const pending = pendingTurnRequestByThreadId.value[threadId]
+    if (!pending || turnRetryByThreadId.value[threadId]) return
+    const attempt = Math.max(1, (pending.retryAttempt ?? 0) + 1)
+    if (attempt > AUTO_RETRY_DELAYS_MS.length) {
+      clearPendingTurnRequest(threadId)
+      setTurnActivityForThread(threadId, null)
+      return
+    }
+    const delayMs = AUTO_RETRY_DELAYS_MS[attempt - 1] ?? AUTO_RETRY_DELAYS_MS[AUTO_RETRY_DELAYS_MS.length - 1]
+    const retryAtMs = Date.now() + delayMs
+    const state: TurnRetryState & { turnId?: string } = {
+      threadId,
+      attempt,
+      maxAttempts: AUTO_RETRY_DELAYS_MS.length,
+      retryAtMs,
+      remainingSeconds: Math.ceil(delayMs / 1000),
+      error: message,
+      phase: 'scheduled',
+      turnId: failedTurnId || undefined,
+    }
+    setPendingTurnRequest(threadId, { ...pending, retryAttempt: attempt })
+    turnRetryByThreadId.value = { ...turnRetryByThreadId.value, [threadId]: state }
+    setTurnActivityForThread(threadId, {
+      label: 'Retrying soon',
+      details: [`Automatic retry in ${state.remainingSeconds}s`],
+    })
+    ensureTurnRetryTicker()
+    const timer = setTimeout(() => {
+      turnRetryTimerByThreadId.delete(threadId)
+      void retryPendingTurn(threadId)
+    }, delayMs)
+    turnRetryTimerByThreadId.set(threadId, timer)
+  }
+
+  async function retrySelectedThreadNow(): Promise<void> {
+    const threadId = selectedThreadId.value
+    if (!threadId) return
+    const state = turnRetryByThreadId.value[threadId]
+    if (state) {
+      await retryPendingTurn(threadId)
+      return
+    }
+    const pending = pendingTurnRequestByThreadId.value[threadId]
+    const message = turnErrorByThreadId.value[threadId]?.message ?? ''
+    if (pending && message && isRetryableTurnError(message)) {
+      scheduleTurnRetry(threadId, message)
+      await retryPendingTurn(threadId)
     }
   }
 
@@ -4649,6 +4829,7 @@ export function useDesktopState() {
 
     const startedTurn = readTurnStartedInfo(notification)
     if (startedTurn) {
+      clearTurnRetry(startedTurn.threadId)
       pendingTurnStartsById.set(startedTurn.turnId, startedTurn)
       setTurnIndexForThread(startedTurn.threadId, startedTurn.turnId, inferNextTurnIndex(startedTurn.threadId))
       activeTurnIdByThreadId.value = {
@@ -4702,7 +4883,7 @@ export function useDesktopState() {
       setThreadInProgress(completedTurn.threadId, false)
       setTurnActivityForThread(completedTurn.threadId, null)
       markThreadUnreadByEvent(completedTurn.threadId)
-      if (!shouldRetryWithFallback) {
+      if (!shouldRetryWithFallback && !isRetryableTurnError(turnErrorMessage)) {
         clearPendingTurnRequest(completedTurn.threadId)
         scheduleQueueStateRefresh(completedTurn.threadId)
       }
@@ -4716,6 +4897,8 @@ export function useDesktopState() {
       error.value = turnErrorMessage
       if (failedThreadId && shouldRetryWithFallback) {
         void retryPendingTurnWithFallback(failedThreadId)
+      } else if (failedThreadId && isRetryableTurnError(turnErrorMessage)) {
+        scheduleTurnRetry(failedThreadId, turnErrorMessage, completedTurn?.turnId ?? '')
       }
     } else if (completedTurn) {
       setTurnErrorForThread(completedTurn.threadId, null)
@@ -4736,6 +4919,8 @@ export function useDesktopState() {
         } else {
           void applyFallbackModelSelection()
         }
+      } else if (errorThreadId && notificationErrorState.transient !== true && isRetryableTurnError(notificationErrorState.message)) {
+        scheduleTurnRetry(errorThreadId, notificationErrorState.message)
       }
     }
 
@@ -6123,6 +6308,10 @@ export function useDesktopState() {
     const nextText = text.trim()
     if (!threadId || (!nextText && imageUrls.length === 0 && fileAttachments.length === 0)) return
 
+    // A new user message supersedes any pending automatic retry for this
+    // thread.  This prevents the old request from racing the new one.
+    clearTurnRetry(threadId)
+
     if (await maybeReplyToPendingUserInputRequest(threadId, nextText, imageUrls, skills, fileAttachments)) {
       return
     }
@@ -6214,6 +6403,7 @@ export function useDesktopState() {
         const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
         setTurnErrorForThread(threadId, errorMessage)
         error.value = errorMessage
+        scheduleTurnRetry(threadId, errorMessage)
         throw unknownError
       }
       return
@@ -6262,6 +6452,7 @@ export function useDesktopState() {
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
       error.value = errorMessage
+      scheduleTurnRetry(threadId, errorMessage)
       throw unknownError
     }
   }
@@ -6379,6 +6570,7 @@ export function useDesktopState() {
           const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
           setTurnErrorForThread(threadId, errorMessage)
           error.value = errorMessage
+          scheduleTurnRetry(threadId, errorMessage)
         })
         .finally(() => {
           isSendingMessage.value = false
@@ -6394,6 +6586,7 @@ export function useDesktopState() {
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       if (threadId) {
         setTurnErrorForThread(threadId, errorMessage)
+        scheduleTurnRetry(threadId, errorMessage)
       }
       error.value = errorMessage
       isSendingMessage.value = false
@@ -6409,6 +6602,7 @@ export function useDesktopState() {
     fileAttachments: FileAttachment[] = [],
     collaborationModeOverride?: CollaborationModeKind,
     allowQueueOnWriterConflict = false,
+    retryAttempt?: number,
   ): Promise<void> {
     const reasoningEffort = selectedReasoningEffort.value
     const collaborationMode = collaborationModeOverride === 'plan' ? 'plan' : collaborationModeOverride === 'default'
@@ -6436,6 +6630,7 @@ export function useDesktopState() {
       effort: reasoningEffort,
       collaborationMode,
       fallbackRetried: false,
+      retryAttempt,
     })
 
     try {
@@ -6477,6 +6672,7 @@ export function useDesktopState() {
             effort: reasoningEffort,
             collaborationMode,
             fallbackRetried: true,
+            retryAttempt,
           })
           startedTurnId = await startThreadTurn(
             threadId,
@@ -7151,6 +7347,13 @@ export function useDesktopState() {
       }
     }
     delayedTurnSyncTimerByThreadId.clear()
+    for (const timer of turnRetryTimerByThreadId.values()) clearTimeout(timer)
+    turnRetryTimerByThreadId.clear()
+    turnRetryByThreadId.value = {}
+    if (turnRetryTicker !== null) {
+      clearInterval(turnRetryTicker)
+      turnRetryTicker = null
+    }
     activeReasoningItemId = ''
     shouldAutoScrollOnNextAgentEvent = false
     persistedMessagesByThreadId.value = {}
@@ -7289,6 +7492,7 @@ export function useDesktopState() {
     isThreadGoalSupported,
     taskSnapshotsByThreadId,
     selectedLiveOverlay,
+    selectedTurnRetryState,
     codexQuota,
     selectedThreadId,
     availableCollaborationModes,
@@ -7338,6 +7542,7 @@ export function useDesktopState() {
     sendMessageToNewThread,
     interruptSelectedThreadTurn,
     interruptTask,
+    retrySelectedThreadNow,
     selectedThreadQueuedMessages,
     removeQueuedMessage,
     reorderQueuedMessage,

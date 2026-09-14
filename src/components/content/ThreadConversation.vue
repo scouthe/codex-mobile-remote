@@ -743,20 +743,23 @@
         </div>
       </li>
       </template>
-      <li v-if="liveOverlay && shouldRenderLiveOverlay(liveOverlay, isMobile)" class="conversation-item conversation-item-overlay">
+      <li v-if="(liveOverlay && shouldRenderLiveOverlay(liveOverlay, isMobile)) || retryState" class="conversation-item conversation-item-overlay">
         <div class="message-row">
           <div class="message-stack">
             <article class="live-overlay-inline" aria-live="polite">
-              <p class="live-overlay-label">{{ liveOverlay.activityLabel }}</p>
+              <p class="live-overlay-label">{{ retryState ? 'Retrying request' : liveOverlay?.activityLabel }}</p>
               <p
-                v-if="liveOverlay.reasoningText"
+                v-if="liveOverlay?.reasoningText"
                 class="live-overlay-reasoning"
               >
-                {{ liveOverlay.reasoningText }}
+                {{ liveOverlay?.reasoningText }}
               </p>
-              <div v-if="liveOverlay.errorText" class="live-overlay-error">
-                <span>{{ liveOverlay.errorText }}</span>
-                <a class="live-overlay-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, liveOverlay.errorText)">Send feedback</a>
+              <div v-if="liveOverlay?.errorText || retryState" class="live-overlay-error">
+                <span>{{ retryState ? `${retryState.error} — automatic retry in ${retryState.remainingSeconds}s` : liveOverlay?.errorText }}</span>
+                <div class="live-overlay-actions">
+                  <button v-if="retryState" type="button" class="live-overlay-retry" @click="retryNow?.()">Continue now</button>
+                  <a v-if="liveOverlay?.errorText" class="live-overlay-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, liveOverlay.errorText)">Send feedback</a>
+                </div>
               </div>
             </article>
           </div>
@@ -969,6 +972,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UiFileChange, UiLiveOverlay, UiMessage, UiPlanStep, UiServerRequest } from '../../types/codex'
+import type { TurnRetryState } from '../../composables/useDesktopState'
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { useMobile } from '../../composables/useMobile'
@@ -1381,6 +1385,8 @@ const props = defineProps<{
   deferAutoLoadPersistedAbove?: boolean
   isLoadingPersistedAbove?: boolean
   loadEarlierMessages?: (threadId: string) => Promise<void>
+  retryState?: TurnRetryState | null
+  retryNow?: () => Promise<void> | void
 }>()
 
 const emit = defineEmits<{
@@ -4979,6 +4985,14 @@ onBeforeUnmount(() => {
 
 .live-overlay-error {
   @apply m-0 flex items-start justify-between gap-3 text-sm leading-5 text-rose-600 whitespace-pre-wrap;
+}
+
+.live-overlay-actions {
+  @apply flex shrink-0 items-center gap-2;
+}
+
+.live-overlay-retry {
+  @apply rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs font-semibold leading-none text-amber-800 transition hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-300;
 }
 
 .live-overlay-feedback {

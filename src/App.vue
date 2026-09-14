@@ -1017,6 +1017,8 @@
                   <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
                     :live-overlay="liveOverlay"
+                    :retry-state="selectedTurnRetryState"
+                    :retry-now="retrySelectedThreadNow"
                     :pending-requests="selectedThreadServerRequests"
                     :has-more-persisted-above="hasMoreOlderMessages"
                     :defer-auto-load-persisted-above="deferAutoLoadPersistedAbove"
@@ -1565,6 +1567,7 @@ const {
   selectedThreadGoalError,
   isThreadGoalSupported,
   selectedLiveOverlay,
+  selectedTurnRetryState,
   codexQuota,
   selectedThreadId,
   availableCollaborationModes,
@@ -1604,6 +1607,7 @@ const {
   steerTaskMessage,
   sendMessageToNewThread,
   interruptSelectedThreadTurn,
+  retrySelectedThreadNow,
   selectedThreadQueuedMessages,
   removeQueuedMessage,
   reorderQueuedMessage,

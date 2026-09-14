@@ -6,6 +6,7 @@ import {
   findAdjacentThreadId,
   removeThreadFromGroups,
   isThreadUnreadByLastRead,
+  isRetryableTurnErrorMessage,
   useDesktopState,
 } from './useDesktopState'
 import type { UiProjectGroup } from '../types/codex'
@@ -100,6 +101,20 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+})
+
+describe('automatic turn retry classification', () => {
+  it('retries temporary capacity and gateway failures', () => {
+    expect(isRetryableTurnErrorMessage('Selected model is at capacity')).toBe(true)
+    expect(isRetryableTurnErrorMessage('RPC turn/start failed with HTTP 502')).toBe(true)
+    expect(isRetryableTurnErrorMessage('upstream temporarily unavailable')).toBe(true)
+  })
+
+  it('does not retry user-actionable or writer-conflict failures', () => {
+    expect(isRetryableTurnErrorMessage('invalid request parameter')).toBe(false)
+    expect(isRetryableTurnErrorMessage('thread already has an active writer')).toBe(false)
+    expect(isRetryableTurnErrorMessage('request canceled by user')).toBe(false)
+  })
 })
 
 describe('filterGroupsByWorkspaceRoots', () => {
