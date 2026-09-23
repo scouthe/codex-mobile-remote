@@ -16,6 +16,7 @@ import { CodexApiError } from '../api/codexErrors'
 const gatewayMocks = vi.hoisted(() => ({
   archiveThread: vi.fn(),
   forkThread: vi.fn(),
+  forkThreadAtTurn: vi.fn(),
   getAccountRateLimits: vi.fn(),
   getAvailableCollaborationModes: vi.fn(),
   getAvailableModelIds: vi.fn(),
@@ -1792,6 +1793,33 @@ describe('live error overlay', () => {
 
     expect(state.selectedTaskSnapshot.value?.state).toBe('completed')
     expect(state.selectedTaskSnapshot.value?.activeTurnId).toBe('')
+  })
+
+  it('keeps a retry request available after an idle snapshot is hydrated', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5', modelProvider: 'openai', messages: [], inProgress: false,
+      activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+    gatewayMocks.resumeThread.mockResolvedValue({ model: 'gpt-5.5', modelProvider: 'openai' })
+    gatewayMocks.startThreadTurn.mockRejectedValueOnce(new Error('HTTP 503 service unavailable'))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('retry-after-idle-thread')
+    await state.loadMessages('retry-after-idle-thread')
+
+    await expect(state.sendTaskMessage('retry this request')).rejects.toThrow('HTTP 503 service unavailable')
+    expect(state.selectedTurnRetryState.value).toMatchObject({ threadId: 'retry-after-idle-thread' })
+
+    // A status refresh observes the failed turn as idle. It must not discard
+    // the request that the visible Continue button needs to replay.
+    await state.loadMessages('retry-after-idle-thread', { force: true })
+    expect(state.selectedTurnRetryState.value).toMatchObject({ threadId: 'retry-after-idle-thread' })
+
+    gatewayMocks.startThreadTurn.mockResolvedValueOnce('turn-retry')
+    await state.retrySelectedThreadNow('retry-after-idle-thread')
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledTimes(2)
   })
 
   it('uses the shared live turn id when stopping an externally-owned task', async () => {

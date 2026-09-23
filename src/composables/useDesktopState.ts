@@ -4,6 +4,7 @@ import {
   archiveThread,
   clearThreadGoal,
   forkThread,
+  forkThreadAtTurn,
   getAvailableCollaborationModes,
   getAccountRateLimits,
   renameThread,
@@ -2682,12 +2683,11 @@ export function useDesktopState() {
       await syncFromNotifications()
     } catch (unknownError) {
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+      scheduleTurnRetry(threadId, errorMessage)
       setThreadInProgress(threadId, false)
       setTurnActivityForThread(threadId, null)
       setTurnErrorForThread(threadId, errorMessage)
-      if (isRetryableTurnError(errorMessage)) {
-        scheduleTurnRetry(threadId, errorMessage)
-      } else {
+      if (!isRetryableTurnError(errorMessage)) {
         clearPendingTurnRequest(threadId)
       }
     } finally {
@@ -2731,19 +2731,19 @@ export function useDesktopState() {
     turnRetryTimerByThreadId.set(threadId, timer)
   }
 
-  async function retrySelectedThreadNow(): Promise<void> {
-    const threadId = selectedThreadId.value
-    if (!threadId) return
-    const state = turnRetryByThreadId.value[threadId]
+  async function retrySelectedThreadNow(threadId = selectedThreadId.value): Promise<void> {
+    const normalizedThreadId = threadId.trim()
+    if (!normalizedThreadId) return
+    const state = turnRetryByThreadId.value[normalizedThreadId]
     if (state) {
-      await retryPendingTurn(threadId)
+      await retryPendingTurn(normalizedThreadId)
       return
     }
-    const pending = pendingTurnRequestByThreadId.value[threadId]
-    const message = turnErrorByThreadId.value[threadId]?.message ?? ''
+    const pending = pendingTurnRequestByThreadId.value[normalizedThreadId]
+    const message = turnErrorByThreadId.value[normalizedThreadId]?.message ?? ''
     if (pending && message && isRetryableTurnError(message)) {
-      scheduleTurnRetry(threadId, message)
-      await retryPendingTurn(threadId)
+      scheduleTurnRetry(normalizedThreadId, message)
+      await retryPendingTurn(normalizedThreadId)
     }
   }
 
@@ -3546,7 +3546,12 @@ export function useDesktopState() {
     if (activeTurnIdByThreadId.value[threadId]) {
       activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
     }
-    clearPendingTurnRequest(threadId)
+    // A retryable failure is idle from the session's perspective, but the
+    // original request is still needed by the retry button/timer. Keep it
+    // until the retry succeeds or the retry policy gives up.
+    if (!turnRetryByThreadId.value[threadId]) {
+      clearPendingTurnRequest(threadId)
+    }
   }
 
   function normalizePlanStepStatus(value: unknown): UiPlanStep['status'] {
@@ -6210,9 +6215,10 @@ export function useDesktopState() {
     }
   }
 
-  async function forkThreadFromTurn(threadId: string, turnIndex: number): Promise<string> {
+  async function forkThreadFromTurn(threadId: string, turnId: string): Promise<string> {
     const normalizedThreadId = threadId.trim()
-    if (!normalizedThreadId || !Number.isInteger(turnIndex) || turnIndex < 0) return ''
+    const normalizedTurnId = turnId.trim()
+    if (!normalizedThreadId || !normalizedTurnId) return ''
 
     if (isTaskActiveForThread(normalizedThreadId)) {
       error.value = 'Finish the current turn before forking from a response.'
@@ -6228,21 +6234,11 @@ export function useDesktopState() {
       }
     }
 
-    const sourceMessages = persistedMessagesByThreadId.value[normalizedThreadId] ?? []
-    let lastTurnIndex = -1
-    for (const message of sourceMessages) {
-      if (typeof message.turnIndex === 'number' && Number.isFinite(message.turnIndex)) {
-        lastTurnIndex = Math.max(lastTurnIndex, message.turnIndex)
-      }
-    }
-
-    if (lastTurnIndex >= 0 && turnIndex > lastTurnIndex) return ''
-
     const sourceThread = flattenThreads(sourceGroups.value).find((row) => row.id === normalizedThreadId) ?? null
 
     try {
       error.value = ''
-      const forked = await forkThread(normalizedThreadId)
+      const forked = await forkThreadAtTurn(normalizedThreadId, normalizedTurnId)
       const forkedThreadId = forked.threadId.trim()
       if (!forkedThreadId) return ''
 
@@ -6269,12 +6265,6 @@ export function useDesktopState() {
       setTurnActivityForThread(forkedThreadId, null)
       setTurnErrorForThread(forkedThreadId, null)
       setThreadInProgress(forkedThreadId, false)
-
-      const turnsToRollback = lastTurnIndex - turnIndex
-      if (turnsToRollback > 0) {
-        const rolledBackMessages = await rollbackThread(forkedThreadId, turnsToRollback)
-        setPersistedMessagesForThread(forkedThreadId, rolledBackMessages)
-      }
 
       await renameThreadById(forkedThreadId, forkedThreadTitle)
       setSelectedThreadId(forkedThreadId)
@@ -6470,12 +6460,12 @@ export function useDesktopState() {
       )
     } catch (unknownError) {
       shouldAutoScrollOnNextAgentEvent = false
+      const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+      scheduleTurnRetry(threadId, errorMessage)
       setThreadInProgress(threadId, false)
       setTurnActivityForThread(threadId, null)
-      const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
       error.value = errorMessage
-      scheduleTurnRetry(threadId, errorMessage)
       throw unknownError
     }
   }

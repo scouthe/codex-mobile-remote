@@ -840,6 +840,10 @@
   @apply border-emerald-500/40 bg-emerald-500/10 text-emerald-200;
 }
 
+:root.dark .message-fork-button {
+  @apply text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 focus-visible:bg-zinc-800;
+}
+
 :root.dark .message-rollback-button {
   @apply text-amber-400/70 hover:text-amber-300;
 }

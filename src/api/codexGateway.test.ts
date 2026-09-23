@@ -8,6 +8,7 @@ import {
   getThreadLiveState,
   listDirectoryComposioConnectors,
   resumeThread,
+  forkThreadAtTurn,
   setThreadGoal,
   startThread,
   startThreadTurn,
@@ -106,6 +107,55 @@ describe('startThread desktop-compatible history', () => {
         cwd: '/home/user/project',
         model: 'gpt-5.6-sol',
         historyMode: 'paginated',
+        threadSource: 'user',
+      },
+    }])
+  })
+})
+
+describe('forkThreadAtTurn', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('forks through the selected turn with one atomic official request', async () => {
+    const requests: Array<{ method: string; params: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string'
+        ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
+        : { method: '', params: {} }
+      requests.push(body)
+      return new Response(JSON.stringify({
+        result: {
+          thread: {
+            id: 'forked-thread-1',
+            cwd: '/home/user/project',
+            turns: [
+              {
+                id: 'turn-1',
+                status: 'completed',
+                items: [{ id: 'item-1', type: 'userMessage', content: [{ type: 'input_text', text: 'keep this' }] }],
+              },
+            ],
+          },
+          model: 'gpt-5.4',
+          modelProvider: 'custom',
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }))
+
+    await expect(forkThreadAtTurn('source-thread-1', 'turn-1')).resolves.toMatchObject({
+      threadId: 'forked-thread-1',
+      cwd: '/home/user/project',
+    })
+    expect(requests).toEqual([{
+      method: 'thread/fork',
+      params: {
+        threadId: 'source-thread-1',
+        lastTurnId: 'turn-1',
         threadSource: 'user',
       },
     }])

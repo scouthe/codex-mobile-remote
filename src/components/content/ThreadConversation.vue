@@ -730,12 +730,11 @@
                   v-if="showForkResponseButton(message)"
                   type="button"
                   class="message-fork-button"
-                  aria-label="Fork thread from this response"
-                  title="Fork thread from this response"
+                  aria-label="分支到新聊天"
+                  data-tooltip="分支到新聊天"
                   @click="forkResponse(message.id)"
                 >
-                  <IconTablerGitFork class="icon-svg message-fork-icon" />
-                  <span class="message-fork-label">Fork</span>
+                  <IconTablerArrowsDiagonal class="icon-svg message-fork-icon" />
                 </button>
                 <button
                   v-if="showCopyResponseButton(message)"
@@ -769,7 +768,14 @@
               <div v-if="liveOverlay?.errorText || retryState" class="live-overlay-error">
                 <span>{{ retryState ? `${retryState.error} — automatic retry in ${retryState.remainingSeconds}s` : liveOverlay?.errorText }}</span>
                 <div class="live-overlay-actions">
-                  <button v-if="retryState" type="button" class="live-overlay-retry" @click="retryNow?.()">Continue now</button>
+                  <button
+                    v-if="retryState"
+                    type="button"
+                    class="live-overlay-retry"
+                    @click="retryNow?.(retryState.threadId)"
+                  >
+                    Continue now
+                  </button>
                   <a v-if="liveOverlay?.errorText" class="live-overlay-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, liveOverlay.errorText)">Send feedback</a>
                 </div>
               </div>
@@ -1005,7 +1011,7 @@ import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
-import IconTablerGitFork from '../icons/IconTablerGitFork.vue'
+import IconTablerArrowsDiagonal from '../icons/IconTablerArrowsDiagonal.vue'
 import IconTablerChevronRight from '../icons/IconTablerChevronRight.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 
@@ -1401,11 +1407,11 @@ const props = defineProps<{
   isLoadingPersistedAbove?: boolean
   loadEarlierMessages?: (threadId: string) => Promise<void>
   retryState?: TurnRetryState | null
-  retryNow?: () => Promise<void> | void
+  retryNow?: (threadId: string) => Promise<void> | void
 }>()
 
 const emit = defineEmits<{
-  forkThread: [payload: { threadId: string; turnIndex: number }]
+  forkThread: [payload: { threadId: string; turnId: string }]
   rollback: [payload: { turnId: string }]
   implementPlan: [payload: { turnId: string }]
   respondServerRequest: [payload: { id: number; result?: unknown; error?: { code?: number; message: string } }]
@@ -1995,29 +2001,29 @@ const copyableResponseContentByAnchorId = computed<Record<string, string>>(() =>
   return next
 })
 
-const forkableTurnIndexByAnchorId = computed<Record<string, number>>(() => {
-  const groupedTurns = new Map<string, { anchorMessageId: string; turnIndex: number }>()
+const forkableTurnIdByAnchorId = computed<Record<string, string>>(() => {
+  const groupedTurns = new Map<string, { anchorMessageId: string; turnId: string }>()
 
   for (const message of props.messages) {
-    if (!isCopyableAssistantMessage(message) || typeof message.turnIndex !== 'number') continue
+    if (!isCopyableAssistantMessage(message) || !message.turnId) continue
 
-    const responseKey = `turn:${message.turnIndex}`
+    const responseKey = `turn:${message.turnId}`
     const existing = groupedTurns.get(responseKey)
     if (existing) {
       existing.anchorMessageId = message.id
-      existing.turnIndex = message.turnIndex
+      existing.turnId = message.turnId
       continue
     }
 
     groupedTurns.set(responseKey, {
       anchorMessageId: message.id,
-      turnIndex: message.turnIndex,
+      turnId: message.turnId,
     })
   }
 
-  const next: Record<string, number> = {}
+  const next: Record<string, string> = {}
   for (const groupedTurn of groupedTurns.values()) {
-    next[groupedTurn.anchorMessageId] = groupedTurn.turnIndex
+    next[groupedTurn.anchorMessageId] = groupedTurn.turnId
   }
   return next
 })
@@ -2027,7 +2033,7 @@ function showCopyResponseButton(message: UiMessage): boolean {
 }
 
 function showForkResponseButton(message: UiMessage): boolean {
-  return typeof forkableTurnIndexByAnchorId.value[message.id] === 'number'
+  return typeof forkableTurnIdByAnchorId.value[message.id] === 'string'
 }
 
 function mergeFileChangeDiff(first: string, second: string): string {
@@ -2527,12 +2533,12 @@ async function copyResponse(anchorMessageId: string): Promise<void> {
 }
 
 function forkResponse(anchorMessageId: string): void {
-  const turnIndex = forkableTurnIndexByAnchorId.value[anchorMessageId]
-  if (typeof turnIndex !== 'number') return
+  const turnId = forkableTurnIdByAnchorId.value[anchorMessageId]
+  if (!turnId) return
   if (!props.activeThreadId) return
   emit('forkThread', {
     threadId: props.activeThreadId,
-    turnIndex,
+    turnId,
   })
 }
 
@@ -5099,7 +5105,27 @@ onBeforeUnmount(() => {
 }
 
 .message-fork-button {
-  @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-slate-500 transition hover:text-slate-900;
+  @apply relative inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 focus-visible:bg-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-500;
+}
+
+.message-fork-button::after {
+  content: attr(data-tooltip);
+  @apply pointer-events-none absolute bottom-full left-1/2 z-30 mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-xl bg-zinc-900 px-3 py-2 text-sm font-medium leading-5 text-white opacity-0 shadow-lg transition-opacity;
+}
+
+.message-fork-button:hover::after,
+.message-fork-button:focus-visible::after {
+  @apply opacity-100;
+}
+
+@media (hover: none) {
+  .message-toolbar {
+    @apply opacity-100;
+  }
+
+  .message-fork-button::after {
+    content: none;
+  }
 }
 
 
@@ -5111,13 +5137,15 @@ onBeforeUnmount(() => {
   @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-amber-600/70 transition hover:text-amber-700;
 }
 
-.message-fork-icon,
 .message-copy-icon,
 .message-edit-icon {
   @apply text-[10px];
 }
 
-.message-fork-label,
+.message-fork-icon {
+  @apply text-[18px];
+}
+
 .message-copy-label,
 .message-edit-label {
   @apply leading-none;
