@@ -2425,6 +2425,7 @@ function buildSessionProjectionFallback(
 type FastSessionTurn = {
   id: string
   status: 'inProgress' | 'completed' | 'failed' | 'interrupted'
+  durationMs?: number
   items: Record<string, unknown>[]
 }
 
@@ -2478,7 +2479,16 @@ function buildFastSessionTurns(
     preferCanonicalId = false,
   ): void => {
     const itemId = readNonEmptyString(item.id)
-    if (itemId && turn.items.some((candidate) => readNonEmptyString(candidate.id) === itemId)) return
+    const existingItemIndex = itemId
+      ? turn.items.findIndex((candidate) => readNonEmptyString(candidate.id) === itemId)
+      : -1
+    if (existingItemIndex >= 0) {
+      const existing = turn.items[existingItemIndex]
+      if (preferCanonicalId && item.type === 'agentMessage' && !existing.phase && item.phase) {
+        turn.items[existingItemIndex] = { ...existing, ...item }
+      }
+      return
+    }
     const assistantText = item.type === 'agentMessage' ? readNonEmptyString(item.text) : ''
     const equivalentAssistantIndex = assistantText
       ? turn.items.findIndex((candidate) => candidate.type === 'agentMessage' && readNonEmptyString(candidate.text) === assistantText)
@@ -2556,7 +2566,12 @@ function buildFastSessionTurns(
             ? 'interrupted'
             : 'completed'
         const turn = ensureTurn(completedTurnId, terminalStatus)
-        if (turn) turn.status = terminalStatus
+        if (turn) {
+          turn.status = terminalStatus
+          if (typeof payload.duration_ms === 'number' && Number.isFinite(payload.duration_ms)) {
+            turn.durationMs = Math.max(0, payload.duration_ms)
+          }
+        }
         if (completedTurnId === currentTurnId) currentTurnId = ''
       } else if (eventType === 'item_completed') {
         const completedItem = asRecord(payload.item)
@@ -2581,6 +2596,8 @@ function buildFastSessionTurns(
               id: completedItemId || `${turn.id}-session-agent-${turn.items.length}`,
               type: 'agentMessage',
               text,
+              ...(completedItem.phase === 'commentary' || completedItem.phase === 'final_answer'
+                ? { phase: completedItem.phase } : {}),
             }, Boolean(completedItemId))
             markCompletedMessage(turn.id, completedItemId)
           }
@@ -2593,6 +2610,8 @@ function buildFastSessionTurns(
             id: readNonEmptyString(payload.id) || `${turn.id}-session-agent-${turn.items.length}`,
             type: 'agentMessage',
             text,
+            ...(payload.phase === 'commentary' || payload.phase === 'final_answer'
+              ? { phase: payload.phase } : {}),
           })
         }
       } else if (eventType === 'user_message') {
@@ -2623,6 +2642,8 @@ function buildFastSessionTurns(
           id: payloadId || `${turn.id}-session-agent-${turn.items.length}`,
           type: 'agentMessage',
           text,
+          ...(payload.phase === 'commentary' || payload.phase === 'final_answer'
+            ? { phase: payload.phase } : {}),
         }, Boolean(payloadId))
       }
     } else if (role === 'user') {

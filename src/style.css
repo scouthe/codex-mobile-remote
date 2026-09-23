@@ -1440,6 +1440,18 @@
   @apply bg-zinc-700;
 }
 
+:root.dark .turn-process-toggle {
+  @apply border-zinc-700 text-zinc-400 hover:text-zinc-200;
+}
+
+:root.dark .conversation-item-process .message-row {
+  @apply border-zinc-700;
+}
+
+:root.dark .conversation-item-process .message-card[data-role='assistant'] {
+  @apply text-zinc-300;
+}
+
 :root.dark .request-card {
   @apply border-amber-700 bg-amber-900/30;
 }

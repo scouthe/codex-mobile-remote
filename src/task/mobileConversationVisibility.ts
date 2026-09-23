@@ -13,9 +13,7 @@ export function shouldRenderConversationMessage(message: UiMessage, isMobile: bo
   return message.messageType !== 'worked'
 }
 
-/** Keep actionable live errors visible while removing the duplicate activity
- * line that is already represented by the mobile task status bar. */
-export function shouldRenderLiveOverlay(overlay: UiLiveOverlay | null, isMobile: boolean): boolean {
-  if (!overlay) return false
-  return !isMobile || overlay.errorText.trim().length > 0
+/** The task status bar already shows activity on both layouts; keep only actionable errors here. */
+export function shouldRenderLiveOverlay(overlay: UiLiveOverlay | null, _isMobile: boolean): boolean {
+  return Boolean(overlay?.errorText.trim())
 }

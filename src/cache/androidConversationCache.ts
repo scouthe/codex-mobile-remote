@@ -19,6 +19,7 @@ export type AndroidConversationCacheRecord = {
 
 const DATABASE_NAME = 'codex-remote-android'
 const DATABASE_VERSION = 1
+const RENDER_FORMAT_VERSION = 2
 const STORE_NAME = 'conversation-snapshots'
 const MAX_CACHED_THREADS = 20
 // Keep several render-window pages locally so mobile history can expand from
@@ -30,7 +31,11 @@ const MAX_COMMAND_OUTPUT_LENGTH = 32_000
 const MAX_CACHED_BYTES_PER_THREAD = 4 * 1024 * 1024
 let lastPruneAt = 0
 
-type StoredRecord = AndroidConversationCacheRecord & { key: string; origin: string }
+type StoredRecord = AndroidConversationCacheRecord & { key: string; origin: string; renderFormatVersion?: number }
+
+export function isCurrentAndroidConversationCacheRecord(record: { renderFormatVersion?: unknown } | null): boolean {
+  return record?.renderFormatVersion === RENDER_FORMAT_VERSION
+}
 
 function isAndroidWebView(scope?: unknown): boolean {
   return getCodexAndroidBridge(scope) !== null
@@ -135,7 +140,7 @@ export async function readAndroidConversationCache(threadId: string): Promise<An
       const request = transaction.objectStore(STORE_NAME).get(cacheKey(origin, normalizedThreadId))
       request.onsuccess = () => {
         const value = request.result as StoredRecord | undefined
-        if (!value || value.origin !== origin || value.threadId !== normalizedThreadId) {
+        if (!value || value.origin !== origin || value.threadId !== normalizedThreadId || !isCurrentAndroidConversationCacheRecord(value)) {
           resolve(null)
           return
         }
@@ -175,6 +180,7 @@ export async function writeAndroidConversationCache(
     key: cacheKey(origin, normalizedThreadId),
     origin,
     threadId: normalizedThreadId,
+    renderFormatVersion: RENDER_FORMAT_VERSION,
     sessionRevision: snapshot.sessionRevision.trim(),
     updatedAtIso: snapshot.updatedAtIso.trim(),
     hasMoreOlder: snapshot.hasMoreOlder === true,

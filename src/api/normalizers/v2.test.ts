@@ -46,6 +46,20 @@ function threadReadResponseWithContent(content: ThreadReadResponse['thread']['tu
 }
 
 describe('normalizeThreadMessagesV2', () => {
+  it('preserves commentary, final-answer phase and turn duration for conversation grouping', () => {
+    const response = threadReadResponseWithContent([
+      { type: 'agentMessage', id: 'progress', text: 'Checking files', phase: 'commentary', memoryCitation: null, delivery: null },
+      { type: 'agentMessage', id: 'final', text: 'Done', phase: 'final_answer', memoryCitation: null, delivery: null },
+    ])
+    response.thread.turns[0].durationMs = 98_000
+
+    const messages = normalizeThreadMessagesV2(response)
+    expect(messages.map((message) => ({ phase: message.messagePhase, durationMs: message.turnDurationMs }))).toEqual([
+      { phase: 'commentary', durationMs: 98_000 },
+      { phase: 'final_answer', durationMs: 98_000 },
+    ])
+  })
+
   it('preserves selected skill inputs on the rendered user message', () => {
     const messages = normalizeThreadMessagesV2(threadReadResponseWithContent([{
       type: 'userMessage',

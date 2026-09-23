@@ -1438,6 +1438,44 @@ describe('thread selection latency', () => {
     })
     expect(state.selectedLiveOverlay.value?.errorText).toBe('')
   })
+
+  it('keeps live commentary separate from the final answer', async () => {
+    installTestWindow()
+    let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5', modelProvider: 'openai', messages: [], inProgress: false,
+      activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('live-phases-thread')
+    await state.loadMessages('live-phases-thread')
+    state.startPolling()
+    notificationHandler({ method: 'turn/started', params: { threadId: 'live-phases-thread', turn: { id: 'turn-1' } } })
+    notificationHandler({
+      method: 'item/started',
+      params: { threadId: 'live-phases-thread', turnId: 'turn-1', item: { id: 'progress', type: 'agentMessage', phase: 'commentary' } },
+    })
+    notificationHandler({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'live-phases-thread', turnId: 'turn-1', itemId: 'progress', delta: 'Checking files' },
+    })
+    notificationHandler({
+      method: 'item/completed',
+      params: { threadId: 'live-phases-thread', turnId: 'turn-1', item: { id: 'final', type: 'agentMessage', phase: 'final_answer', text: 'Done' } },
+    })
+
+    expect(state.messages.value.find((message) => message.id === 'progress')).toMatchObject({
+      messagePhase: 'commentary', turnId: 'turn-1', text: 'Checking files',
+    })
+    expect(state.messages.value.find((message) => message.id === 'final')).toMatchObject({
+      messagePhase: 'final_answer', turnId: 'turn-1', text: 'Done',
+    })
+  })
 })
 
 describe('live error overlay', () => {

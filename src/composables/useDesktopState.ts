@@ -695,6 +695,9 @@ function areMessageFieldsEqual(first: UiMessage, second: UiMessage): boolean {
     areUiFileChangesEqual(first.fileChanges, second.fileChanges) &&
     first.fileChangeStatus === second.fileChangeStatus &&
     first.messageType === second.messageType &&
+    first.messagePhase === second.messagePhase &&
+    first.turnDurationMs === second.turnDurationMs &&
+    first.turnStatus === second.turnStatus &&
     first.rawPayload === second.rawPayload &&
     first.isUnhandled === second.isUnhandled &&
     areCommandExecutionsEqual(first.commandExecution, second.commandExecution) &&
@@ -1707,6 +1710,7 @@ export function useDesktopState() {
   let loadedThreadListRootsState: WorkspaceRootsState | null = null
   let hasHydratedWorkspaceRootsState = false
   let activeReasoningItemId = ''
+  const liveAgentMessagePhaseById = new Map<string, UiMessage['messagePhase']>()
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
   const fallbackRetryInFlightThreadIds = new Set<string>()
@@ -2287,6 +2291,7 @@ export function useDesktopState() {
       nextThreadId,
     )
     activeReasoningItemId = ''
+    liveAgentMessagePhaseById.clear()
     shouldAutoScrollOnNextAgentEvent = false
   }
 
@@ -4459,17 +4464,22 @@ export function useDesktopState() {
     return ''
   }
 
-  function readAgentMessageStartedId(notification: RpcNotification): string {
+  function readAgentMessageStarted(notification: RpcNotification): { id: string; phase?: UiMessage['messagePhase'] } | null {
     const params = asRecord(notification.params)
-    if (!params) return ''
+    if (!params) return null
 
     if (notification.method === 'item/started') {
       const item = asRecord(params.item)
-      if (!item || item.type !== 'agentMessage') return ''
-      return readString(item.id)
+      if (!item || item.type !== 'agentMessage') return null
+      const id = readString(item.id)
+      if (!id) return null
+      return {
+        id,
+        ...(item.phase === 'commentary' || item.phase === 'final_answer' ? { phase: item.phase } : {}),
+      }
     }
 
-    return ''
+    return null
   }
 
   function readAgentMessageDelta(notification: RpcNotification): { messageId: string; delta: string } | null {
@@ -4502,6 +4512,9 @@ export function useDesktopState() {
         role: 'assistant',
         text,
         messageType: 'agentMessage.live',
+        ...(item.phase === 'commentary' || item.phase === 'final_answer' ? { messagePhase: item.phase } : {}),
+        turnId: readString(params.turnId) || undefined,
+        turnStatus: 'inProgress',
       }
     }
 
@@ -4944,9 +4957,12 @@ export function useDesktopState() {
 
     if (!notificationThreadId || notificationThreadId !== selectedThreadId.value) return
 
-    const startedAgentMessageId = readAgentMessageStartedId(notification)
-    if (startedAgentMessageId) {
+    const startedAgentMessage = readAgentMessageStarted(notification)
+    if (startedAgentMessage) {
       activeReasoningItemId = ''
+      if (startedAgentMessage.phase) {
+        liveAgentMessagePhaseById.set(startedAgentMessage.id, startedAgentMessage.phase)
+      }
     }
 
     const liveAgentMessageDelta = readAgentMessageDelta(notification)
@@ -4959,12 +4975,19 @@ export function useDesktopState() {
         role: 'assistant',
         text: nextText,
         messageType: 'agentMessage.live',
+        messagePhase: existing?.messagePhase ?? liveAgentMessagePhaseById.get(liveAgentMessageDelta.messageId),
+        turnId: existing?.turnId ?? (readString(asRecord(notification.params)?.turnId) || undefined),
+        turnStatus: 'inProgress',
       })
     }
 
     const completedAgentMessage = readAgentMessageCompleted(notification)
     if (completedAgentMessage) {
-      upsertLiveAgentMessage(notificationThreadId, completedAgentMessage)
+      upsertLiveAgentMessage(notificationThreadId, {
+        ...completedAgentMessage,
+        messagePhase: completedAgentMessage.messagePhase ?? liveAgentMessagePhaseById.get(completedAgentMessage.id),
+      })
+      liveAgentMessagePhaseById.delete(completedAgentMessage.id)
     }
 
     const completedImageView = readCompletedImageView(notification)

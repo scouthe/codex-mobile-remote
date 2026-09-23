@@ -228,6 +228,9 @@ export type UiMessage = {
   fileChanges?: UiFileChange[]
   fileChangeStatus?: UiFileChangeStatus
   messageType?: string
+  messagePhase?: 'commentary' | 'final_answer'
+  turnDurationMs?: number
+  turnStatus?: 'inProgress' | 'completed' | 'failed' | 'interrupted'
   rawPayload?: string
   isUnhandled?: boolean
   commandExecution?: CommandExecutionData

@@ -30,9 +30,21 @@
         </button>
       </li>
       <template v-for="message in visibleMessages" :key="message.id">
+      <li v-if="turnProcessPresentation.firstGroupByMessageId.has(message.id)" class="conversation-item turn-process-summary">
+        <button
+          type="button"
+          class="turn-process-toggle"
+          :aria-expanded="isTurnProcessExpanded(turnProcessPresentation.firstGroupByMessageId.get(message.id)?.key ?? '')"
+          @click="toggleTurnProcess(turnProcessPresentation.firstGroupByMessageId.get(message.id)?.key ?? '')"
+        >
+          <span>{{ formatTurnProcessLabel(turnProcessPresentation.firstGroupByMessageId.get(message.id)!) }}</span>
+          <IconTablerChevronRight class="icon-svg turn-process-chevron" :class="{ 'is-expanded': isTurnProcessExpanded(turnProcessPresentation.firstGroupByMessageId.get(message.id)?.key ?? '') }" />
+        </button>
+      </li>
       <li
-        v-if="shouldRenderConversationMessage(message, isMobile) && !hiddenGroupedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
+        v-if="shouldRenderConversationMessage(message, isMobile) && isTurnProcessItemVisible(message) && !hiddenGroupedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
         class="conversation-item"
+        :class="{ 'conversation-item-process': turnProcessPresentation.groupByMessageId.has(message.id) }"
         :data-role="message.role"
         :data-message-type="message.messageType || ''"
         :data-message-id="message.id"
@@ -986,6 +998,7 @@ import {
   shouldRenderConversationMessage,
   shouldRenderLiveOverlay,
 } from '../../task/mobileConversationVisibility'
+import { buildTurnProcessPresentation, formatTurnProcessLabel } from '../../task/turnProcessPresentation'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
@@ -993,6 +1006,7 @@ import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
 import IconTablerGitFork from '../icons/IconTablerGitFork.vue'
+import IconTablerChevronRight from '../icons/IconTablerChevronRight.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 
 type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
@@ -1001,6 +1015,7 @@ const expandedCommandIds = ref<Set<string>>(new Set())
 const collapsedAutoCommandIds = ref<Set<string>>(new Set())
 const expandedCommandGroupIds = ref<Set<string>>(new Set())
 const expandedWorkedIds = ref<Set<string>>(new Set())
+const expandedTurnProcessKeys = ref<Set<string>>(new Set())
 const expandedFileChangeSummaryIds = ref<Set<string>>(new Set())
 const activeDiffViewerSummary = ref<TurnFileChangeSummary | null>(null)
 const activeDiffViewerChangeKey = ref('')
@@ -1506,6 +1521,29 @@ const isLoadingMore = ref(false)
 const conversationRootRef = ref<HTMLElement | null>(null)
 
 const visibleMessages = computed(() => props.messages.slice(renderWindowStart.value))
+const turnProcessPresentation = computed(() => buildTurnProcessPresentation(visibleMessages.value))
+
+function isTurnProcessExpanded(key: string): boolean {
+  return Boolean(key && expandedTurnProcessKeys.value.has(key))
+}
+
+function toggleTurnProcess(key: string): void {
+  if (!key) return
+  const next = new Set(expandedTurnProcessKeys.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedTurnProcessKeys.value = next
+}
+
+function isTurnProcessItemVisible(message: UiMessage): boolean {
+  if (turnProcessPresentation.value.suppressedWorkedIds.has(message.id)) return false
+  const group = turnProcessPresentation.value.groupByMessageId.get(message.id)
+  return !group || isTurnProcessExpanded(group.key)
+}
+
+watch(() => props.activeThreadId, () => {
+  expandedTurnProcessKeys.value = new Set()
+})
 const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
 // Keep the rail bounded with the same render window as the conversation. As
 // older pages enter the window, their prompt markers appear automatically.
@@ -1919,6 +1957,7 @@ const copyableResponseContentByAnchorId = computed<Record<string, string>>(() =>
 
   for (const message of props.messages) {
     if (!isCopyableAssistantMessage(message)) continue
+    if (message.messagePhase === 'commentary') continue
 
     const content = buildCopyableMessageContent(message)
     if (!content) continue
@@ -4838,6 +4877,12 @@ onBeforeUnmount(() => {
   @apply h-full min-h-0 list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-visible flex flex-col gap-2 sm:gap-3;
 }
 
+@media (max-width: 900px) {
+  .conversation-list {
+    padding-right: 2.75rem;
+  }
+}
+
 .conversation-load-more {
   @apply flex justify-center py-3 m-0;
 }
@@ -4852,6 +4897,34 @@ onBeforeUnmount(() => {
 
 .conversation-item {
   @apply m-0 w-full min-w-0 flex;
+}
+
+.turn-process-summary {
+  @apply max-w-[min(var(--chat-column-max,45rem),100%)] mx-auto;
+}
+
+.turn-process-toggle {
+  @apply w-full min-h-9 flex items-center justify-between gap-2 border-0 border-b border-slate-200 bg-transparent px-0 py-1.5 text-left text-sm text-slate-500 cursor-pointer hover:text-slate-700;
+}
+
+.turn-process-toggle:focus-visible {
+  @apply outline outline-2 outline-offset-2 outline-emerald-500;
+}
+
+.turn-process-chevron {
+  @apply h-4 w-4 shrink-0 transition-transform;
+}
+
+.turn-process-chevron.is-expanded {
+  transform: rotate(90deg);
+}
+
+.conversation-item-process .message-row {
+  @apply border-l-2 border-slate-200 pl-3;
+}
+
+.conversation-item-process .message-card[data-role='assistant'] {
+  @apply text-slate-600;
 }
 
 .conversation-item-request {

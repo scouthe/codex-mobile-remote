@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ANDROID_CONVERSATION_CACHE_LIMITS,
   isAndroidConversationCacheEnabled,
+  isCurrentAndroidConversationCacheRecord,
   readAndroidConversationCache,
   writeAndroidConversationCache,
 } from './androidConversationCache'
@@ -16,6 +17,12 @@ afterEach(() => {
 })
 
 describe('android conversation cache', () => {
+  it('invalidates older render snapshots that lack message phase metadata', () => {
+    expect(isCurrentAndroidConversationCacheRecord({})).toBe(false)
+    expect(isCurrentAndroidConversationCacheRecord({ renderFormatVersion: 1 })).toBe(false)
+    expect(isCurrentAndroidConversationCacheRecord({ renderFormatVersion: 2 })).toBe(true)
+  })
+
   it('keeps enough cached rows for several mobile history pages', () => {
     expect(ANDROID_CONVERSATION_CACHE_LIMITS.maxMessagesPerThread).toBe(200)
   })
