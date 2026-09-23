@@ -56,7 +56,19 @@ describe('forked thread list recovery', () => {
       `
       expect(spawnSync('sqlite3', [database, sql]).status).toBe(0)
 
-      const recovered = mergeImportedThreadsIntoThreadListResult({ data: [], nextCursor: null }) as { data: Array<{ id: string }> }
+      const recovered = (() => {
+        const originalPath = process.env.PATH
+        const [major, minor] = process.versions.node.split('.').map(Number)
+        try {
+          if (major > 22 || (major === 22 && minor >= 5)) {
+            process.env.PATH = '/usr/bin:/bin'
+          }
+          return mergeImportedThreadsIntoThreadListResult({ data: [], nextCursor: null }) as { data: Array<{ id: string }> }
+        } finally {
+          if (originalPath === undefined) delete process.env.PATH
+          else process.env.PATH = originalPath
+        }
+      })()
       expect(recovered.data.map((thread) => thread.id)).toEqual(['fork-1', 'large-1'])
 
       expect(spawnSync('sqlite3', [database, "UPDATE threads SET has_user_event = 1, first_user_message = 'new prompt', updated_at = 102 WHERE id = 'fork-1';"]).status).toBe(0)

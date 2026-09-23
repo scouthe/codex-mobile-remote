@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
 import { mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes, open } from 'node:fs/promises'
 import { closeSync, createReadStream, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -1903,6 +1904,7 @@ function registerImportedSessionsInStateDb(sessions: ImportedSessionRecord[]): v
 }
 
 const forkedSessionMetaCache = new Map<string, boolean>()
+const requireNodeModule = createRequire(import.meta.url)
 
 function isForkedSessionRollout(path: string, threadId: string): boolean {
   const cached = forkedSessionMetaCache.get(path)
@@ -1969,10 +1971,30 @@ SELECT * FROM (
 )
 ORDER BY updated_at DESC;
 `
-  const result = spawnSync('sqlite3', ['-json', stateDbPath, sql], { encoding: 'utf8' })
-  if (result.status !== 0 || !result.stdout.trim()) return []
+  let rows: unknown
   try {
-    const rows = JSON.parse(result.stdout) as unknown
+    const sqlite = requireNodeModule('node:sqlite') as {
+      DatabaseSync: new (path: string, options: { readOnly: boolean }) => {
+        prepare: (query: string) => { all: () => unknown[] }
+        close: () => void
+      }
+    }
+    const database = new sqlite.DatabaseSync(stateDbPath, { readOnly: true })
+    try {
+      rows = database.prepare(sql).all()
+    } finally {
+      database.close()
+    }
+  } catch {
+    const result = spawnSync('sqlite3', ['-json', stateDbPath, sql], { encoding: 'utf8' })
+    if (result.status !== 0 || !result.stdout.trim()) return []
+    try {
+      rows = JSON.parse(result.stdout) as unknown
+    } catch {
+      return []
+    }
+  }
+  try {
     if (!Array.isArray(rows)) return []
     return rows.flatMap((row) => {
       const record = asRecord(row)
