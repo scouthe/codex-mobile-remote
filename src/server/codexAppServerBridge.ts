@@ -7842,6 +7842,7 @@ const MERGEABLE_ITEM_TYPES = new Set([
 // requests, then recycle an idle child so its locks are released without
 // interrupting an active turn.
 const IDLE_WRITER_RELEASE_DELAY_MS = 1200
+const SHARED_APP_SERVER_MAX_PAYLOAD_BYTES = 512 * 1024 * 1024
 
 type AppServerLaunchMode = 'shared-proxy'
 
@@ -8222,6 +8223,7 @@ export class AppServerProcess {
       // handshake with "incorrect sec-websocket-extensions".
       perMessageDeflate: false,
       handshakeTimeout: 10_000,
+      maxPayload: SHARED_APP_SERVER_MAX_PAYLOAD_BYTES,
       createConnection: () => proxyDuplex,
     })
     this.sharedWebSocket = socket
