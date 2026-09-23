@@ -30,9 +30,21 @@
         </button>
       </li>
       <template v-for="message in visibleMessages" :key="message.id">
+      <li v-if="turnProcessPresentation.firstGroupByMessageId.has(message.id)" class="conversation-item turn-process-summary">
+        <button
+          type="button"
+          class="turn-process-toggle"
+          :aria-expanded="isTurnProcessExpanded(turnProcessPresentation.firstGroupByMessageId.get(message.id)?.key ?? '')"
+          @click="toggleTurnProcess(turnProcessPresentation.firstGroupByMessageId.get(message.id)?.key ?? '')"
+        >
+          <span>{{ formatTurnProcessLabel(turnProcessPresentation.firstGroupByMessageId.get(message.id)!) }}</span>
+          <IconTablerChevronRight class="icon-svg turn-process-chevron" :class="{ 'is-expanded': isTurnProcessExpanded(turnProcessPresentation.firstGroupByMessageId.get(message.id)?.key ?? '') }" />
+        </button>
+      </li>
       <li
-        v-if="shouldRenderConversationMessage(message, isMobile) && !hiddenGroupedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
+        v-if="shouldRenderConversationMessage(message, isMobile) && isTurnProcessItemVisible(message) && !hiddenGroupedCommandIds.has(message.id) && !hiddenFileChangeMessageIds.has(message.id)"
         class="conversation-item"
+        :class="{ 'conversation-item-process': turnProcessPresentation.groupByMessageId.has(message.id) }"
         :data-role="message.role"
         :data-message-type="message.messageType || ''"
         :data-message-id="message.id"
@@ -718,12 +730,11 @@
                   v-if="showForkResponseButton(message)"
                   type="button"
                   class="message-fork-button"
-                  aria-label="Fork thread from this response"
-                  title="Fork thread from this response"
+                  aria-label="分支到新聊天"
+                  data-tooltip="分支到新聊天"
                   @click="forkResponse(message.id)"
                 >
-                  <IconTablerGitFork class="icon-svg message-fork-icon" />
-                  <span class="message-fork-label">Fork</span>
+                  <IconTablerArrowsDiagonal class="icon-svg message-fork-icon" />
                 </button>
                 <button
                   v-if="showCopyResponseButton(message)"
@@ -743,20 +754,30 @@
         </div>
       </li>
       </template>
-      <li v-if="liveOverlay && shouldRenderLiveOverlay(liveOverlay, isMobile)" class="conversation-item conversation-item-overlay">
+      <li v-if="(liveOverlay && shouldRenderLiveOverlay(liveOverlay, isMobile)) || retryState" class="conversation-item conversation-item-overlay">
         <div class="message-row">
           <div class="message-stack">
             <article class="live-overlay-inline" aria-live="polite">
-              <p class="live-overlay-label">{{ liveOverlay.activityLabel }}</p>
+              <p class="live-overlay-label">{{ retryState ? 'Retrying request' : liveOverlay?.activityLabel }}</p>
               <p
-                v-if="liveOverlay.reasoningText"
+                v-if="liveOverlay?.reasoningText"
                 class="live-overlay-reasoning"
               >
-                {{ liveOverlay.reasoningText }}
+                {{ liveOverlay?.reasoningText }}
               </p>
-              <div v-if="liveOverlay.errorText" class="live-overlay-error">
-                <span>{{ liveOverlay.errorText }}</span>
-                <a class="live-overlay-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, liveOverlay.errorText)">Send feedback</a>
+              <div v-if="liveOverlay?.errorText || retryState" class="live-overlay-error">
+                <span>{{ retryState ? `${retryState.error} — automatic retry in ${retryState.remainingSeconds}s` : liveOverlay?.errorText }}</span>
+                <div class="live-overlay-actions">
+                  <button
+                    v-if="retryState"
+                    type="button"
+                    class="live-overlay-retry"
+                    @click="retryNow?.(retryState.threadId)"
+                  >
+                    Continue now
+                  </button>
+                  <a v-if="liveOverlay?.errorText" class="live-overlay-feedback" :href="feedbackMailto" @click="prepareLiveErrorFeedback($event, liveOverlay.errorText)">Send feedback</a>
+                </div>
               </div>
             </article>
           </div>
@@ -969,6 +990,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UiFileChange, UiLiveOverlay, UiMessage, UiPlanStep, UiServerRequest } from '../../types/codex'
+import type { TurnRetryState } from '../../composables/useDesktopState'
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { useMobile } from '../../composables/useMobile'
@@ -982,13 +1004,15 @@ import {
   shouldRenderConversationMessage,
   shouldRenderLiveOverlay,
 } from '../../task/mobileConversationVisibility'
+import { buildTurnProcessPresentation, formatTurnProcessLabel } from '../../task/turnProcessPresentation'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
 import IconTablerCopy from '../icons/IconTablerCopy.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
-import IconTablerGitFork from '../icons/IconTablerGitFork.vue'
+import IconTablerArrowsDiagonal from '../icons/IconTablerArrowsDiagonal.vue'
+import IconTablerChevronRight from '../icons/IconTablerChevronRight.vue'
 import IconTablerX from '../icons/IconTablerX.vue'
 
 type HighlightJsModule = (typeof import('highlight.js/lib/common'))['default']
@@ -997,6 +1021,7 @@ const expandedCommandIds = ref<Set<string>>(new Set())
 const collapsedAutoCommandIds = ref<Set<string>>(new Set())
 const expandedCommandGroupIds = ref<Set<string>>(new Set())
 const expandedWorkedIds = ref<Set<string>>(new Set())
+const expandedTurnProcessKeys = ref<Set<string>>(new Set())
 const expandedFileChangeSummaryIds = ref<Set<string>>(new Set())
 const activeDiffViewerSummary = ref<TurnFileChangeSummary | null>(null)
 const activeDiffViewerChangeKey = ref('')
@@ -1381,10 +1406,12 @@ const props = defineProps<{
   deferAutoLoadPersistedAbove?: boolean
   isLoadingPersistedAbove?: boolean
   loadEarlierMessages?: (threadId: string) => Promise<void>
+  retryState?: TurnRetryState | null
+  retryNow?: (threadId: string) => Promise<void> | void
 }>()
 
 const emit = defineEmits<{
-  forkThread: [payload: { threadId: string; turnIndex: number }]
+  forkThread: [payload: { threadId: string; turnId: string }]
   rollback: [payload: { turnId: string }]
   implementPlan: [payload: { turnId: string }]
   respondServerRequest: [payload: { id: number; result?: unknown; error?: { code?: number; message: string } }]
@@ -1500,6 +1527,29 @@ const isLoadingMore = ref(false)
 const conversationRootRef = ref<HTMLElement | null>(null)
 
 const visibleMessages = computed(() => props.messages.slice(renderWindowStart.value))
+const turnProcessPresentation = computed(() => buildTurnProcessPresentation(visibleMessages.value))
+
+function isTurnProcessExpanded(key: string): boolean {
+  return Boolean(key && expandedTurnProcessKeys.value.has(key))
+}
+
+function toggleTurnProcess(key: string): void {
+  if (!key) return
+  const next = new Set(expandedTurnProcessKeys.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expandedTurnProcessKeys.value = next
+}
+
+function isTurnProcessItemVisible(message: UiMessage): boolean {
+  if (turnProcessPresentation.value.suppressedWorkedIds.has(message.id)) return false
+  const group = turnProcessPresentation.value.groupByMessageId.get(message.id)
+  return !group || isTurnProcessExpanded(group.key)
+}
+
+watch(() => props.activeThreadId, () => {
+  expandedTurnProcessKeys.value = new Set()
+})
 const hasMoreAbove = computed(() => renderWindowStart.value > 0 || props.hasMorePersistedAbove === true)
 // Keep the rail bounded with the same render window as the conversation. As
 // older pages enter the window, their prompt markers appear automatically.
@@ -1913,6 +1963,7 @@ const copyableResponseContentByAnchorId = computed<Record<string, string>>(() =>
 
   for (const message of props.messages) {
     if (!isCopyableAssistantMessage(message)) continue
+    if (message.messagePhase === 'commentary') continue
 
     const content = buildCopyableMessageContent(message)
     if (!content) continue
@@ -1950,29 +2001,29 @@ const copyableResponseContentByAnchorId = computed<Record<string, string>>(() =>
   return next
 })
 
-const forkableTurnIndexByAnchorId = computed<Record<string, number>>(() => {
-  const groupedTurns = new Map<string, { anchorMessageId: string; turnIndex: number }>()
+const forkableTurnIdByAnchorId = computed<Record<string, string>>(() => {
+  const groupedTurns = new Map<string, { anchorMessageId: string; turnId: string }>()
 
   for (const message of props.messages) {
-    if (!isCopyableAssistantMessage(message) || typeof message.turnIndex !== 'number') continue
+    if (!isCopyableAssistantMessage(message) || !message.turnId) continue
 
-    const responseKey = `turn:${message.turnIndex}`
+    const responseKey = `turn:${message.turnId}`
     const existing = groupedTurns.get(responseKey)
     if (existing) {
       existing.anchorMessageId = message.id
-      existing.turnIndex = message.turnIndex
+      existing.turnId = message.turnId
       continue
     }
 
     groupedTurns.set(responseKey, {
       anchorMessageId: message.id,
-      turnIndex: message.turnIndex,
+      turnId: message.turnId,
     })
   }
 
-  const next: Record<string, number> = {}
+  const next: Record<string, string> = {}
   for (const groupedTurn of groupedTurns.values()) {
-    next[groupedTurn.anchorMessageId] = groupedTurn.turnIndex
+    next[groupedTurn.anchorMessageId] = groupedTurn.turnId
   }
   return next
 })
@@ -1982,7 +2033,7 @@ function showCopyResponseButton(message: UiMessage): boolean {
 }
 
 function showForkResponseButton(message: UiMessage): boolean {
-  return typeof forkableTurnIndexByAnchorId.value[message.id] === 'number'
+  return typeof forkableTurnIdByAnchorId.value[message.id] === 'string'
 }
 
 function mergeFileChangeDiff(first: string, second: string): string {
@@ -2482,12 +2533,12 @@ async function copyResponse(anchorMessageId: string): Promise<void> {
 }
 
 function forkResponse(anchorMessageId: string): void {
-  const turnIndex = forkableTurnIndexByAnchorId.value[anchorMessageId]
-  if (typeof turnIndex !== 'number') return
+  const turnId = forkableTurnIdByAnchorId.value[anchorMessageId]
+  if (!turnId) return
   if (!props.activeThreadId) return
   emit('forkThread', {
     threadId: props.activeThreadId,
-    turnIndex,
+    turnId,
   })
 }
 
@@ -4832,6 +4883,12 @@ onBeforeUnmount(() => {
   @apply h-full min-h-0 list-none m-0 px-2 sm:px-6 py-0 overflow-y-auto overflow-x-visible flex flex-col gap-2 sm:gap-3;
 }
 
+@media (max-width: 900px) {
+  .conversation-list {
+    padding-right: 2.75rem;
+  }
+}
+
 .conversation-load-more {
   @apply flex justify-center py-3 m-0;
 }
@@ -4846,6 +4903,34 @@ onBeforeUnmount(() => {
 
 .conversation-item {
   @apply m-0 w-full min-w-0 flex;
+}
+
+.turn-process-summary {
+  @apply max-w-[min(var(--chat-column-max,45rem),100%)] mx-auto;
+}
+
+.turn-process-toggle {
+  @apply w-full min-h-9 flex items-center justify-between gap-2 border-0 border-b border-slate-200 bg-transparent px-0 py-1.5 text-left text-sm text-slate-500 cursor-pointer hover:text-slate-700;
+}
+
+.turn-process-toggle:focus-visible {
+  @apply outline outline-2 outline-offset-2 outline-emerald-500;
+}
+
+.turn-process-chevron {
+  @apply h-4 w-4 shrink-0 transition-transform;
+}
+
+.turn-process-chevron.is-expanded {
+  transform: rotate(90deg);
+}
+
+.conversation-item-process .message-row {
+  @apply border-l-2 border-slate-200 pl-3;
+}
+
+.conversation-item-process .message-card[data-role='assistant'] {
+  @apply text-slate-600;
 }
 
 .conversation-item-request {
@@ -4981,6 +5066,14 @@ onBeforeUnmount(() => {
   @apply m-0 flex items-start justify-between gap-3 text-sm leading-5 text-rose-600 whitespace-pre-wrap;
 }
 
+.live-overlay-actions {
+  @apply flex shrink-0 items-center gap-2;
+}
+
+.live-overlay-retry {
+  @apply rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs font-semibold leading-none text-amber-800 transition hover:bg-amber-100 focus:outline-none focus:ring-2 focus:ring-amber-300;
+}
+
 .live-overlay-feedback {
   @apply shrink-0 rounded-full border border-rose-200 bg-white px-2.5 py-1 text-xs font-semibold leading-none text-rose-700 transition hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-300;
 }
@@ -5012,7 +5105,27 @@ onBeforeUnmount(() => {
 }
 
 .message-fork-button {
-  @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-slate-500 transition hover:text-slate-900;
+  @apply relative inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 focus-visible:bg-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-500;
+}
+
+.message-fork-button::after {
+  content: attr(data-tooltip);
+  @apply pointer-events-none absolute bottom-full left-1/2 z-30 mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-xl bg-zinc-900 px-3 py-2 text-sm font-medium leading-5 text-white opacity-0 shadow-lg transition-opacity;
+}
+
+.message-fork-button:hover::after,
+.message-fork-button:focus-visible::after {
+  @apply opacity-100;
+}
+
+@media (hover: none) {
+  .message-toolbar {
+    @apply opacity-100;
+  }
+
+  .message-fork-button::after {
+    content: none;
+  }
 }
 
 
@@ -5024,13 +5137,15 @@ onBeforeUnmount(() => {
   @apply inline-flex items-center gap-0.5 px-0.5 py-0 text-[9px] font-medium leading-none text-amber-600/70 transition hover:text-amber-700;
 }
 
-.message-fork-icon,
 .message-copy-icon,
 .message-edit-icon {
   @apply text-[10px];
 }
 
-.message-fork-label,
+.message-fork-icon {
+  @apply text-[18px];
+}
+
 .message-copy-label,
 .message-edit-label {
   @apply leading-none;

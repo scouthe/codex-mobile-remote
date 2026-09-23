@@ -501,7 +501,33 @@ describe('shared thread observer HTTP path', () => {
           turn_id: 'turn-fast-1',
           item: {
             type: 'AgentMessage',
+            id: 'commentary-fast-1',
+            phase: 'commentary',
+            content: [{ type: 'Text', text: 'checking files' }],
+          },
+        },
+      },
+      {
+        timestamp: new Date().toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          id: 'commentary-fast-1',
+          role: 'assistant',
+          phase: 'commentary',
+          content: [{ type: 'output_text', text: 'checking files' }],
+        },
+      },
+      {
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: 'turn-fast-1',
+          item: {
+            type: 'AgentMessage',
             id: 'assistant-fast-1',
+            phase: 'final_answer',
             content: [{ type: 'Text', text: 'fast answer' }],
           },
         },
@@ -513,13 +539,14 @@ describe('shared thread observer HTTP path', () => {
           type: 'message',
           id: 'assistant-fast-1',
           role: 'assistant',
+          phase: 'final_answer',
           content: [{ type: 'output_text', text: 'fast answer' }],
         },
       },
       {
         timestamp: new Date().toISOString(),
         type: 'event_msg',
-        payload: { type: 'task_complete', turn_id: 'turn-fast-1' },
+        payload: { type: 'task_complete', turn_id: 'turn-fast-1', duration_ms: 98_000 },
       },
     ]
     await writeFile(sessionPath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`, 'utf8')
@@ -563,16 +590,18 @@ describe('shared thread observer HTTP path', () => {
         partial?: boolean
         threadTurnStartIndex?: number
         threadTurnStartIndexKnown?: boolean
-        thread?: { turns?: Array<{ id?: string; items?: Array<{ id?: string; type?: string; text?: string }> }> }
+        thread?: { turns?: Array<{ id?: string; durationMs?: number; items?: Array<{ id?: string; type?: string; text?: string; phase?: string }> }> }
       }
       expect(payload.partial).toBe(true)
       expect(payload.threadTurnStartIndexKnown).toBe(true)
       expect(payload.threadTurnStartIndex).toBe(0)
       expect(payload.thread?.turns).toContainEqual(expect.objectContaining({
         id: 'turn-fast-1',
+        durationMs: 98_000,
         items: [
           expect.objectContaining({ id: 'user-fast-1', type: 'userMessage' }),
-          expect.objectContaining({ id: 'assistant-fast-1', type: 'agentMessage', text: 'fast answer' }),
+          expect.objectContaining({ id: 'commentary-fast-1', type: 'agentMessage', text: 'checking files', phase: 'commentary' }),
+          expect.objectContaining({ id: 'assistant-fast-1', type: 'agentMessage', text: 'fast answer', phase: 'final_answer' }),
         ],
       }))
       expect(originalRpc.some((call) => call.method === 'thread/read')).toBe(true)

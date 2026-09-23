@@ -48,8 +48,9 @@ describe('shouldRenderLiveOverlay', () => {
     expect(shouldRenderLiveOverlay(overlay({ errorText: 'Request failed' }), true)).toBe(true)
   })
 
-  it('keeps live activity visible on desktop', () => {
-    expect(shouldRenderLiveOverlay(overlay(), false)).toBe(true)
+  it('hides duplicate desktop activity but keeps desktop errors visible', () => {
+    expect(shouldRenderLiveOverlay(overlay(), false)).toBe(false)
+    expect(shouldRenderLiveOverlay(overlay({ errorText: 'Request failed' }), false)).toBe(true)
     expect(shouldRenderLiveOverlay(null, false)).toBe(false)
   })
 })

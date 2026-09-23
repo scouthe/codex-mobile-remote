@@ -1017,6 +1017,8 @@
                   <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
                     :live-overlay="liveOverlay"
+                    :retry-state="selectedTurnRetryState"
+                    :retry-now="retrySelectedThreadNow"
                     :pending-requests="selectedThreadServerRequests"
                     :has-more-persisted-above="hasMoreOlderMessages"
                     :defer-auto-load-persisted-above="deferAutoLoadPersistedAbove"
@@ -1565,6 +1567,7 @@ const {
   selectedThreadGoalError,
   isThreadGoalSupported,
   selectedLiveOverlay,
+  selectedTurnRetryState,
   codexQuota,
   selectedThreadId,
   availableCollaborationModes,
@@ -1604,6 +1607,7 @@ const {
   steerTaskMessage,
   sendMessageToNewThread,
   interruptSelectedThreadTurn,
+  retrySelectedThreadNow,
   selectedThreadQueuedMessages,
   removeQueuedMessage,
   reorderQueuedMessage,
@@ -3823,8 +3827,8 @@ async function handleServerRequestResponse(payload: UiServerRequestReply): Promi
   }
 }
 
-async function onForkThreadFromMessage(payload: { threadId: string; turnIndex: number }): Promise<void> {
-  const forkedThreadId = await forkThreadFromTurn(payload.threadId, payload.turnIndex)
+async function onForkThreadFromMessage(payload: { threadId: string; turnId: string }): Promise<void> {
+  const forkedThreadId = await forkThreadFromTurn(payload.threadId, payload.turnId)
   if (!forkedThreadId) return
   await router.push({ name: 'thread', params: { threadId: forkedThreadId } })
   if (selectedThreadId.value !== forkedThreadId) {

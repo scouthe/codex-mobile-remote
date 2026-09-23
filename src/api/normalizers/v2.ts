@@ -407,6 +407,7 @@ function toUiMessages(item: ThreadItem): UiMessage[] {
         role: 'assistant',
         text: item.text,
         messageType: item.type,
+        ...(item.phase === 'commentary' || item.phase === 'final_answer' ? { messagePhase: item.phase } : {}),
       },
     ]
   }
@@ -698,9 +699,12 @@ export function normalizeThreadMessagesV2(payload: ThreadReadResponse, baseTurnI
     const rawTurnId = typeof turn?.id === 'string' ? turn.id.trim() : ''
     const turnId = rawTurnId.length > 0 ? rawTurnId : undefined
     const items = Array.isArray(turn.items) ? turn.items : []
+    const turnDurationMs = typeof turn.durationMs === 'number' && Number.isFinite(turn.durationMs)
+      ? Math.max(0, turn.durationMs)
+      : undefined
     for (const item of items) {
       for (const msg of toUiMessages(item)) {
-        messages.push({ ...msg, turnId, turnIndex })
+        messages.push({ ...msg, turnId, turnIndex, turnDurationMs, turnStatus: turn.status })
       }
     }
     const errorText = readTurnErrorText(turn)

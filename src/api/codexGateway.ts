@@ -2273,6 +2273,33 @@ export type ForkedThread = {
   messages: UiMessage[]
 }
 
+export async function forkThreadAtTurn(threadId: string, lastTurnId: string): Promise<ForkedThread> {
+  const normalizedThreadId = threadId.trim()
+  const normalizedLastTurnId = lastTurnId.trim()
+  if (!normalizedThreadId) throw new Error('thread/fork requires threadId')
+  if (!normalizedLastTurnId) throw new Error('thread/fork requires lastTurnId')
+
+  try {
+    const payload = await callRpc<ThreadForkResponse & ThreadReadResponse & { thread?: { id?: string; cwd?: string } }>('thread/fork', {
+      threadId: normalizedThreadId,
+      lastTurnId: normalizedLastTurnId,
+      threadSource: 'user',
+    })
+    const forkedThreadId = normalizeThreadIdFromPayload(payload)
+    if (!forkedThreadId) {
+      throw new Error('thread/fork did not return a thread id')
+    }
+    return {
+      threadId: forkedThreadId,
+      cwd: normalizeThreadCwdFromPayload(payload),
+      model: normalizeThreadModelFromPayload(payload),
+      messages: normalizeThreadMessagesV2(payload, readThreadTurnStartIndex(payload)),
+    }
+  } catch (error) {
+    throw normalizeCodexApiError(error, `Failed to fork thread ${normalizedThreadId} at turn ${normalizedLastTurnId}`, 'thread/fork')
+  }
+}
+
 export async function startThread(cwd?: string, model?: string): Promise<StartedThread> {
   try {
     const params: Record<string, unknown> = {
