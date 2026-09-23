@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { spawnSync } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   buildProjectlessFolderName,
@@ -13,6 +14,7 @@ import {
   isThreadMaterializationPendingError,
   isThreadNotFoundError,
   isUnauthenticatedRateLimitError,
+  mergeImportedThreadsIntoThreadListResult,
   writeFreeModeStateFile,
   writeWorkspaceRootsState,
 } from './codexAppServerBridge'
@@ -25,6 +27,51 @@ afterEach(() => {
   } else {
     process.env.CODEX_HOME = originalCodexHome
   }
+})
+
+describe('forked thread list recovery', () => {
+  it('lists an unsent fork but not an ordinary empty thread, and avoids duplicates after first send', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'codex-fork-list-'))
+    const sessions = join(codexHome, 'sessions')
+    const forkPath = join(sessions, 'rollout-fork.jsonl')
+    const emptyPath = join(sessions, 'rollout-empty.jsonl')
+    const largePath = join(sessions, 'rollout-large.jsonl')
+    process.env.CODEX_HOME = codexHome
+    try {
+      await mkdir(sessions)
+      await writeFile(forkPath, `${JSON.stringify({ type: 'session_meta', payload: { id: 'fork-1', forked_from_id: 'source-1' } })}\n`)
+      await writeFile(emptyPath, `${JSON.stringify({ type: 'session_meta', payload: { id: 'empty-1', forked_from_id: null } })}\n`)
+      await writeFile(largePath, `${JSON.stringify({ type: 'session_meta', payload: { id: 'large-1' } })}\n`)
+      const database = join(codexHome, 'state_5.sqlite')
+      const sql = `
+        CREATE TABLE threads (id TEXT, rollout_path TEXT, created_at INTEGER, updated_at INTEGER,
+          source TEXT, model_provider TEXT, cwd TEXT, title TEXT, cli_version TEXT,
+          first_user_message TEXT, archived INTEGER, has_user_event INTEGER, thread_source TEXT);
+        INSERT INTO threads VALUES ('fork-1', '${forkPath}', 100, 100, 'vscode', 'custom',
+          '/tmp/project', '', '0.153.4', '', 0, 0, 'user');
+        INSERT INTO threads VALUES ('empty-1', '${emptyPath}', 101, 101, 'vscode', 'custom',
+          '/tmp/project', '', '0.153.4', '', 0, 0, 'user');
+        INSERT INTO threads VALUES ('large-1', '${largePath}', 99, 99, 'vscode', 'custom',
+          '/tmp/project', '', '0.153.4', replace(hex(zeroblob(600000)), '0', 'x'), 0, 1, 'user');
+      `
+      expect(spawnSync('sqlite3', [database, sql]).status).toBe(0)
+
+      const recovered = mergeImportedThreadsIntoThreadListResult({ data: [], nextCursor: null }) as { data: Array<{ id: string }> }
+      expect(recovered.data.map((thread) => thread.id)).toEqual(['fork-1', 'large-1'])
+
+      expect(spawnSync('sqlite3', [database, "UPDATE threads SET has_user_event = 1, first_user_message = 'new prompt', updated_at = 102 WHERE id = 'fork-1';"]).status).toBe(0)
+      const official = { id: 'fork-1', cwd: '/tmp/project', updatedAt: 102 }
+      const afterSend = mergeImportedThreadsIntoThreadListResult({ data: [official], nextCursor: null }) as { data: Array<{ id: string }> }
+      expect(afterSend.data.filter((thread) => thread.id === 'fork-1')).toHaveLength(1)
+      expect(afterSend.data[0]).toMatchObject({ id: official.id, cwd: official.cwd })
+
+      expect(spawnSync('sqlite3', [database, "UPDATE threads SET archived = 1 WHERE id = 'fork-1';"]).status).toBe(0)
+      const archived = mergeImportedThreadsIntoThreadListResult({ data: [], nextCursor: null }) as { data: Array<{ id: string }> }
+      expect(archived.data.map((thread) => thread.id)).toEqual(['large-1'])
+    } finally {
+      await rm(codexHome, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('callRpcWithArchiveRecovery', () => {

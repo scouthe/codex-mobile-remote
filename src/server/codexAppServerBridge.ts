@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink, realpath, utimes, open } from 'node:fs/promises'
-import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs'
+import { closeSync, createReadStream, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
@@ -1902,18 +1902,72 @@ function registerImportedSessionsInStateDb(sessions: ImportedSessionRecord[]): v
   }
 }
 
+const forkedSessionMetaCache = new Map<string, boolean>()
+
+function isForkedSessionRollout(path: string, threadId: string): boolean {
+  const cached = forkedSessionMetaCache.get(path)
+  if (cached !== undefined) return cached
+
+  let fd: number | null = null
+  try {
+    fd = openSync(path, 'r')
+    const chunks: Buffer[] = []
+    const chunk = Buffer.allocUnsafe(4096)
+    let offset = 0
+    let foundLineEnd = false
+    while (offset < 256 * 1024) {
+      const bytesRead = readSync(fd, chunk, 0, Math.min(chunk.length, 256 * 1024 - offset), offset)
+      if (bytesRead === 0) break
+      offset += bytesRead
+      const lineEnd = chunk.subarray(0, bytesRead).indexOf(10)
+      chunks.push(Buffer.from(chunk.subarray(0, lineEnd >= 0 ? lineEnd : bytesRead)))
+      if (lineEnd >= 0) {
+        foundLineEnd = true
+        break
+      }
+    }
+    if (!foundLineEnd) return false
+    const sessionMeta = asRecord(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+    const payload = asRecord(sessionMeta?.payload)
+    const isFork = sessionMeta?.type === 'session_meta'
+      && payload?.id === threadId
+      && Boolean(readNonEmptyString(payload.forked_from_id))
+    forkedSessionMetaCache.set(path, isFork)
+    if (forkedSessionMetaCache.size > 512) {
+      forkedSessionMetaCache.delete(forkedSessionMetaCache.keys().next().value as string)
+    }
+    return isFork
+  } catch {
+    return false
+  } finally {
+    if (fd !== null) closeSync(fd)
+  }
+}
+
 function listImportedThreadsFromStateDb(): Array<Record<string, unknown>> {
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
   if (!existsSync(stateDbPath)) return []
+  const columns = `id, rollout_path, created_at, updated_at, source, model_provider, cwd,
+    substr(coalesce(title, ''), 1, 300) AS title, cli_version,
+    substr(coalesce(first_user_message, ''), 1, 300) AS first_user_message,
+    archived, has_user_event, thread_source`
   const sql = `
-SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
-       cli_version, first_user_message, archived
-FROM threads
-WHERE archived = 0 AND replace(rollout_path, '\\', '/') LIKE '%/sessions/%' AND id IN (
-  SELECT id FROM threads WHERE first_user_message != '' OR title != ''
+SELECT * FROM (
+  SELECT ${columns} FROM threads
+  WHERE archived = 0 AND replace(rollout_path, '\\', '/') LIKE '%/sessions/%'
+    AND (first_user_message != '' OR title != '')
+  ORDER BY updated_at DESC LIMIT 200
 )
-ORDER BY updated_at DESC
-LIMIT 200;
+UNION ALL
+SELECT * FROM (
+  SELECT ${columns} FROM threads
+  WHERE archived = 0 AND replace(rollout_path, '\\', '/') LIKE '%/sessions/%'
+    AND has_user_event = 0 AND thread_source = 'user'
+    AND (first_user_message IS NULL OR first_user_message = '')
+    AND (title IS NULL OR title = '')
+  ORDER BY updated_at DESC LIMIT 200
+)
+ORDER BY updated_at DESC;
 `
   const result = spawnSync('sqlite3', ['-json', stateDbPath, sql], { encoding: 'utf8' })
   if (result.status !== 0 || !result.stdout.trim()) return []
@@ -1926,7 +1980,11 @@ LIMIT 200;
       const path = readNonEmptyString(record?.rollout_path)
       const cwd = readNonEmptyString(record?.cwd)
       if (!id || !path || !cwd) return []
-      const title = readNonEmptyString(record?.title) || readNonEmptyString(record?.first_user_message) || 'Imported chat'
+      const indexedTitle = readNonEmptyString(record?.title) || readNonEmptyString(record?.first_user_message)
+      const pendingFork = !indexedTitle && record?.has_user_event === 0
+        && record?.thread_source === 'user' && isForkedSessionRollout(path, id)
+      if (!indexedTitle && !pendingFork) return []
+      const title = indexedTitle || 'Forked chat'
       const createdAt = typeof record?.created_at === 'number' ? record.created_at : Math.floor(Date.now() / 1000)
       const updatedAt = typeof record?.updated_at === 'number' ? record.updated_at : createdAt
       return [{
@@ -1941,6 +1999,7 @@ LIMIT 200;
         source: 'cli',
         gitInfo: null,
         turns: [],
+        ...(pendingFork ? { pendingFork: true } : {}),
       }]
     })
   } catch {
@@ -1997,7 +2056,7 @@ ${archivedPredicate};
   }
 }
 
-function mergeImportedThreadsIntoThreadListResult(result: unknown): unknown {
+export function mergeImportedThreadsIntoThreadListResult(result: unknown): unknown {
   const record = asRecord(result)
   const data = Array.isArray(record?.data) ? record.data : null
   if (!record || !data) return result
@@ -2012,13 +2071,14 @@ function mergeImportedThreadsIntoThreadListResult(result: unknown): unknown {
     const id = readNonEmptyString(asRecord(item)?.id)
     const imported = id ? importedById.get(id) : undefined
     if (imported) {
-      mergedData.push({ ...asRecord(item), ...imported })
+      const { pendingFork, ...visibleImported } = imported
+      mergedData.push(pendingFork ? item : { ...asRecord(item), ...visibleImported })
       importedById.delete(id)
     } else {
       mergedData.push(item)
     }
   }
-  mergedData.push(...importedById.values())
+  mergedData.push(...Array.from(importedById.values(), ({ pendingFork: _pendingFork, ...visibleImported }) => visibleImported))
   return {
     ...record,
     data: mergedData.sort((a, b) => {
