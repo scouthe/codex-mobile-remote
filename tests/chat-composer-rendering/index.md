@@ -19,6 +19,7 @@ Return to the [manual test index](../../tests.md).
 | [Feature: Stop button interrupts active turn without missing turnId](stop-button-interrupts-active-turn-without-missing-turnid.md) |
 | [Feature: Backticked HTTP(S) URL renders as clickable link](backticked-http-s-url-renders-as-clickable-link.md) |
 | [Assistant response Fork action icon](assistant-response-fork-action-icon.md) |
+| [Web-created thread title in Desktop](web-created-thread-desktop-title.md) |
 | [Turn process collapse and final answer boundary](turn-process-collapse.md) |
 | [Feature: Chat file-link context menu (open/copy/edit)](chat-file-link-context-menu-open-copy-edit.md) |
 | [Feature: Official thread goal control](official-thread-goal-control.md) |

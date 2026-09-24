@@ -2468,6 +2468,7 @@ describe('provider model selection', () => {
       model: 'gpt-5.5',
       modelProvider: 'openai',
     })
+    gatewayMocks.generateThreadTitle.mockResolvedValue('Paper summary')
     gatewayMocks.startThreadTurn.mockResolvedValue('turn-1')
     gatewayMocks.getThreadDetail.mockResolvedValue({
       model: 'gpt-5.5',
@@ -2489,6 +2490,9 @@ describe('provider model selection', () => {
     const state = useDesktopState()
     await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
     await state.sendMessageToNewThread('hi', '/tmp/project')
+    await vi.waitFor(() => {
+      expect(gatewayMocks.renameThread).toHaveBeenCalledWith('codex-thread', 'Paper summary')
+    })
 
     expect(gatewayMocks.startThread).toHaveBeenCalledWith('/tmp/project', 'gpt-5.5')
     expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
