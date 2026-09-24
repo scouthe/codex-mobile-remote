@@ -5206,11 +5206,16 @@ export function useDesktopState() {
     if (!trimmed) return
     const truncated = trimmed.length > 300 ? trimmed.slice(0, 300) : trimmed
     try {
-      const title = await generateThreadTitle(truncated, cwd)
-      if (!title || threadTitleById.value[threadId]) return
+      const title = await generateThreadTitle(truncated, cwd) || toOptimisticThreadTitle(trimmed)
+      if (threadTitleById.value[threadId]) return
       threadTitleById.value = { ...threadTitleById.value, [threadId]: title }
       applyThreadFlags()
       void persistThreadTitle(threadId, title)
+      try {
+        await renameThread(threadId, title)
+      } catch {
+        // Keep the web title usable if the official name update is unavailable.
+      }
     } catch {
       // Title generation is best-effort.
     }
