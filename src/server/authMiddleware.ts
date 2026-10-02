@@ -9,6 +9,10 @@ const TOKEN_COOKIE = 'portal_session'
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const SESSION_STORE_FILE = 'webui-auth-sessions.json'
 const MAX_PERSISTED_TOKENS = 128
+const MAX_LOGIN_BODY_BYTES = 4096
+const LOGIN_FAILURE_LIMIT = 5
+const LOGIN_COOLDOWN_MS = 10 * 60 * 1000
+const MAX_LOGIN_CLIENTS = 4096
 
 type PersistedAuthState = {
   tokens?: Array<{
@@ -224,7 +228,10 @@ form.addEventListener('submit',async e=>{
   e.preventDefault();
   errEl.style.display='none';
   const res=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pw').value})});
-  if(res.ok){window.location.reload()}else{errEl.style.display='block';document.getElementById('pw').value='';document.getElementById('pw').focus()}
+  if(res.ok){window.location.reload()}else{
+    errEl.textContent=res.status===429?'Too many failed attempts. Try again in 10 minutes.':'Incorrect password';
+    errEl.style.display='block';document.getElementById('pw').value='';document.getElementById('pw').focus();
+  }
 });
 </script>
 </body>
@@ -337,8 +344,45 @@ export function createAuthSession(passwordOrOptions: string | AuthSessionOptions
   let setupRequired = options.setupRequired === true
   let lanOnly = options.lanOnly === true
   const validTokens = password ? readPersistedSessions() : new Map<string, number>()
+  const loginAttempts = new Map<string, { failures: number; lockedUntil: number }>()
   if (pruneExpiredSessions(validTokens)) {
     tryPersistSessions(validTokens)
+  }
+
+  function loginClientKey(req: Request): string {
+    const remote = req.socket.remoteAddress ?? 'unknown'
+    return remote.startsWith('::ffff:') ? remote.slice('::ffff:'.length) : remote
+  }
+
+  function remainingCooldownMs(clientKey: string): number {
+    const attempt = loginAttempts.get(clientKey)
+    if (!attempt?.lockedUntil) return 0
+    const remaining = attempt.lockedUntil - Date.now()
+    if (remaining > 0) return remaining
+    loginAttempts.delete(clientKey)
+    return 0
+  }
+
+  function recordFailedLogin(clientKey: string): number {
+    const failures = (loginAttempts.get(clientKey)?.failures ?? 0) + 1
+    const lockedUntil = failures >= LOGIN_FAILURE_LIMIT ? Date.now() + LOGIN_COOLDOWN_MS : 0
+    loginAttempts.delete(clientKey)
+    loginAttempts.set(clientKey, { failures, lockedUntil })
+    if (loginAttempts.size > MAX_LOGIN_CLIENTS) {
+      const oldest = loginAttempts.keys().next().value
+      if (oldest) loginAttempts.delete(oldest)
+    }
+    return lockedUntil ? LOGIN_COOLDOWN_MS : 0
+  }
+
+  function sendLoginCooldown(res: Response, remainingMs: number, asJson: boolean): void {
+    const retryAfterSeconds = Math.ceil(remainingMs / 1000)
+    res.setHeader('Retry-After', String(retryAfterSeconds))
+    if (asJson) {
+      res.status(429).json({ error: 'Too many failed login attempts. Try again later.', retryAfterSeconds })
+    } else {
+      res.status(429).type('text/plain; charset=utf-8').send('Too many failed login attempts. Try again later.')
+    }
   }
 
   function createSignedInSession(res: Response): void {
@@ -386,6 +430,7 @@ export function createAuthSession(passwordOrOptions: string | AuthSessionOptions
           password = nextPassword
           setupRequired = false
           lanOnly = false
+          loginAttempts.clear()
           createSignedInSession(res)
           res.json({ ok: true, passwordProtected: true, lanOnly: false })
         } catch {
@@ -428,6 +473,7 @@ export function createAuthSession(passwordOrOptions: string | AuthSessionOptions
             password = ''
             lanOnly = true
             validTokens.clear()
+            loginAttempts.clear()
             tryPersistSessions(validTokens)
             res.json({ ok: true, passwordProtected: false })
           })
@@ -463,10 +509,32 @@ export function createAuthSession(passwordOrOptions: string | AuthSessionOptions
 
     // Handle login POST
     if (req.method === 'POST' && req.path === '/auth/login') {
+      const clientKey = loginClientKey(req)
+      const remaining = remainingCooldownMs(clientKey)
+      if (remaining > 0) {
+        sendLoginCooldown(res, remaining, true)
+        req.resume()
+        return
+      }
       let body = ''
+      let bodyBytes = 0
+      let bodyTooLarge = false
       req.setEncoding('utf8')
-      req.on('data', (chunk: string) => { body += chunk })
+      req.on('data', (chunk: string) => {
+        if (bodyTooLarge) return
+        bodyBytes += Buffer.byteLength(chunk, 'utf8')
+        if (bodyBytes > MAX_LOGIN_BODY_BYTES) {
+          bodyTooLarge = true
+          body = ''
+          return
+        }
+        body += chunk
+      })
       req.on('end', () => {
+        if (bodyTooLarge) {
+          res.status(413).json({ error: 'Login request body is too large' })
+          return
+        }
         let parsed: { password?: string }
         try {
           parsed = JSON.parse(body) as { password?: string }
@@ -477,11 +545,14 @@ export function createAuthSession(passwordOrOptions: string | AuthSessionOptions
 
         const provided = typeof parsed.password === 'string' ? parsed.password : ''
         if (!constantTimeCompare(provided, password)) {
-          res.status(401).json({ error: 'Invalid password' })
+          const cooldown = recordFailedLogin(clientKey)
+          if (cooldown > 0) sendLoginCooldown(res, cooldown, true)
+          else res.status(401).json({ error: 'Invalid password' })
           return
         }
 
         try {
+          loginAttempts.delete(clientKey)
           const token = randomBytes(32).toString('hex')
           const expiresAt = Date.now() + SESSION_TTL_MS
           validTokens.set(token, expiresAt)
@@ -497,14 +568,26 @@ export function createAuthSession(passwordOrOptions: string | AuthSessionOptions
 
     // Handle one-click auth links like /password=<value>
     if (req.method === 'GET' && req.path.startsWith('/password=')) {
+      const clientKey = loginClientKey(req)
+      const remaining = remainingCooldownMs(clientKey)
+      if (remaining > 0) {
+        sendLoginCooldown(res, remaining, false)
+        return
+      }
       const provided = req.path.slice('/password='.length)
       if (constantTimeCompare(provided, password)) {
+        loginAttempts.delete(clientKey)
         const token = randomBytes(32).toString('hex')
         const expiresAt = Date.now() + SESSION_TTL_MS
         validTokens.set(token, expiresAt)
         tryPersistSessions(validTokens)
         res.setHeader('Set-Cookie', buildSessionCookie(token, expiresAt))
         res.redirect(302, '/')
+        return
+      }
+      const cooldown = recordFailedLogin(clientKey)
+      if (cooldown > 0) {
+        sendLoginCooldown(res, cooldown, false)
         return
       }
     }

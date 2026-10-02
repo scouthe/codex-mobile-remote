@@ -20,6 +20,9 @@ Fresh installations choose password-protected or LAN-only access in the browser.
 10. Start the CLI with a disposable explicit password: `node dist-cli/index.js --no-tunnel --no-open --port 5998 --password TEST_SECRET_SHOULD_NOT_PRINT`.
 11. Confirm startup output includes the local and network URLs but does not include `Password:` or `TEST_SECRET_SHOULD_NOT_PRINT`.
 12. If tunnel testing is available, start with tunnel enabled and confirm the printed tunnel URL and QR code do not include `/password=`.
+13. For a password-protected instance accessed through a public host, submit four wrong passwords; each should return 401. The fifth should return 429 with `Retry-After: 600`. A correct password should remain blocked during the cooldown and work after ten minutes. Successful login before the fifth failure resets the streak.
+14. Send a login JSON body larger than 4096 bytes and confirm HTTP 413. Repeat the five-failure check with a legacy `/password=<value>` link to confirm it cannot bypass the cooldown.
+15. Check `deploy/systemd/codexapp-5900.service` and confirm its `ExecStart` has no `--no-password`. On a disposable machine, install that template and confirm the first-run password choice appears.
 
 #### Expected Results
 - Password-protected startup still works.
@@ -30,6 +33,8 @@ Fresh installations choose password-protected or LAN-only access in the browser.
 - The password is not printed as a standalone line.
 - Existing password files remain compatible and are no longer overwritten on restart.
 - Tunnel output does not include an autologin URL containing the password.
+- Five consecutive failed password attempts impose a ten-minute cooldown for that source address; oversized login bodies are rejected without being retained in memory.
+- Both the generated installer unit and the source systemd template preserve first-run password setup.
 
 #### Rollback/Cleanup
 - Stop the disposable CLI process.

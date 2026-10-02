@@ -2,7 +2,7 @@ import { createServer as createHttpServer, request as httpRequest, type Server }
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer } from './httpServer.js'
 
 const servers: Server[] = []
@@ -11,6 +11,7 @@ const tempDirectories: string[] = []
 const originalCodexHome = process.env.CODEX_HOME
 
 afterEach(async () => {
+  vi.useRealTimers()
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve())
   })))
@@ -19,6 +20,39 @@ afterEach(async () => {
   if (originalCodexHome === undefined) delete process.env.CODEX_HOME
   else process.env.CODEX_HOME = originalCodexHome
 })
+
+async function publicRequest(
+  endpoint: string,
+  path: string,
+  method = 'GET',
+  body = '',
+): Promise<{ status: number; body: string; retryAfter: string | undefined; setCookie: string[] | undefined }> {
+  const url = new URL(endpoint)
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest({
+      hostname: url.hostname,
+      port: url.port,
+      path,
+      method,
+      headers: {
+        Host: 'public-relay.example.com',
+        ...(body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } : {}),
+      },
+    }, (response) => {
+      let responseBody = ''
+      response.setEncoding('utf8')
+      response.on('data', (chunk) => { responseBody += chunk })
+      response.on('end', () => resolve({
+        status: response.statusCode ?? 0,
+        body: responseBody,
+        retryAfter: response.headers['retry-after'],
+        setCookie: response.headers['set-cookie'],
+      }))
+    })
+    request.on('error', reject)
+    request.end(body)
+  })
+}
 
 async function listen(options: Parameters<typeof createServer>[0]): Promise<string> {
   const codexHome = await mkdtemp(join(tmpdir(), 'codexapp-auth-session-'))
@@ -134,5 +168,59 @@ describe('first-run web password setup', () => {
 
     const starbridgeResponse = await fetch(`${endpoint}/codex-api/starbridge/status`)
     expect((await starbridgeResponse.json() as { data: { passwordProtected: boolean } }).data.passwordProtected).toBe(true)
+  })
+})
+
+describe('web password login protection', () => {
+  const password = 'correct-horse-battery'
+  const login = (endpoint: string, provided: string) => publicRequest(
+    endpoint,
+    '/auth/login',
+    'POST',
+    JSON.stringify({ password: provided }),
+  )
+
+  it('locks login for ten minutes after five consecutive failed passwords', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-02T00:00:00Z'))
+    const endpoint = await listen({ password })
+
+    for (let attempt = 1; attempt < 5; attempt++) {
+      expect((await login(endpoint, 'wrong-password')).status).toBe(401)
+    }
+    const fifth = await login(endpoint, 'wrong-password')
+    expect(fifth.status).toBe(429)
+    expect(fifth.retryAfter).toBe('600')
+    expect((await login(endpoint, password)).status).toBe(429)
+
+    vi.setSystemTime(new Date('2026-10-02T00:10:01Z'))
+    const recovered = await login(endpoint, password)
+    expect(recovered.status).toBe(200)
+    expect(recovered.setCookie?.join('')).toContain('portal_session=')
+  })
+
+  it('resets the failure streak after a successful login', async () => {
+    const endpoint = await listen({ password })
+    for (let attempt = 0; attempt < 4; attempt++) {
+      expect((await login(endpoint, 'wrong-password')).status).toBe(401)
+    }
+    expect((await login(endpoint, password)).status).toBe(200)
+    expect((await login(endpoint, 'wrong-password')).status).toBe(401)
+  })
+
+  it('applies the same cooldown to legacy password links', async () => {
+    const endpoint = await listen({ password })
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await publicRequest(endpoint, '/password=wrong-password')
+    }
+    const blocked = await publicRequest(endpoint, `/password=${password}`)
+    expect(blocked.status).toBe(429)
+    expect(blocked.retryAfter).toBeDefined()
+  })
+
+  it('rejects oversized login bodies', async () => {
+    const endpoint = await listen({ password })
+    const response = await publicRequest(endpoint, '/auth/login', 'POST', JSON.stringify({ password: 'x'.repeat(5000) }))
+    expect(response.status).toBe(413)
   })
 })

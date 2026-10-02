@@ -7635,10 +7635,31 @@ function bufferIndexOf(buf: Buffer, needle: Buffer, start = 0): number {
   return -1
 }
 
+const MAX_UPLOAD_BODY_BYTES = 25 * 1024 * 1024
+
 function handleFileUpload(req: IncomingMessage, res: ServerResponse): void {
+  const declaredSize = Number(req.headers['content-length'])
+  if (Number.isFinite(declaredSize) && declaredSize > MAX_UPLOAD_BODY_BYTES) {
+    setJson(res, 413, { error: 'Upload exceeds the 25 MB limit' })
+    req.resume()
+    return
+  }
   const chunks: Buffer[] = []
-  req.on('data', (chunk: Buffer) => chunks.push(chunk))
+  let receivedBytes = 0
+  let tooLarge = false
+  req.on('data', (chunk: Buffer) => {
+    if (tooLarge) return
+    receivedBytes += chunk.length
+    if (receivedBytes > MAX_UPLOAD_BODY_BYTES) {
+      tooLarge = true
+      chunks.length = 0
+      setJson(res, 413, { error: 'Upload exceeds the 25 MB limit' })
+      return
+    }
+    chunks.push(chunk)
+  })
   req.on('end', async () => {
+    if (tooLarge) return
     try {
       const body = Buffer.concat(chunks)
       const contentType = req.headers['content-type'] ?? ''
@@ -7682,7 +7703,7 @@ function handleFileUpload(req: IncomingMessage, res: ServerResponse): void {
     }
   })
   req.on('error', (err: Error) => {
-    setJson(res, 500, { error: getErrorMessage(err, 'Upload stream error') })
+    if (!res.writableEnded) setJson(res, 500, { error: getErrorMessage(err, 'Upload stream error') })
   })
 }
 

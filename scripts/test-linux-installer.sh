@@ -52,4 +52,8 @@ if grep -q -- '--no-password' "$UNIT"; then
   echo 'installer incorrectly disabled password protection' >&2
   exit 1
 fi
+if grep -q -- '--no-password' "${ROOT_DIR}/deploy/systemd/codexapp-5900.service"; then
+  echo 'source deployment unit incorrectly disabled password protection' >&2
+  exit 1
+fi
 printf 'Linux installer smoke test passed\n'
