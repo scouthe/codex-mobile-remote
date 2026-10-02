@@ -248,7 +248,10 @@ const FAST_THREAD_SESSION_TAIL_BYTES = 4 * 1024 * 1024
 // shared source of truth for this path; large files are projected from their
 // bounded tail instead.  Small sessions retain the existing full projection
 // so command/file details and exact turn pagination remain unchanged.
-const OBSERVER_FULL_READ_MAX_BYTES = 8 * 1024 * 1024
+// A small child rollout can still inherit a very large paginated history
+// base.  Keep the observer path bounded before app-server expands that base
+// during a full thread/read.
+const OBSERVER_FULL_READ_MAX_BYTES = 1 * 1024 * 1024
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
 // A desktop app-server can append the terminal session marker before its
 // thread/read projection is flushed.  Give that projection a short,
@@ -1138,19 +1141,17 @@ async function readThreadSnapshotForObserver(
   threadId: string,
 ): Promise<unknown> {
   // `thread/read(includeTurns:false)` is a cheap metadata lookup and does not
-  // force app-server to deserialize the complete rollout.  Prefer the bridge
-  // summary when available, then use the metadata response to obtain the
-  // canonical session path for a thread opened outside this process.
-  let metadataResult = appServer.getThreadSummarySnapshot(threadId)
+  // force app-server to deserialize the complete rollout.  Always ask the
+  // official app-server first: a forked thread can keep the same logical id
+  // while its canonical rollout path changes from the parent file to a child
+  // file.  The bridge summary is only a fallback for transient RPC failures.
+  let metadataResult = await readCurrentThreadMetadata(appServer, threadId)
   let metadataRecord = asRecord(metadataResult)
   let metadataThread = asRecord(metadataRecord?.thread)
   let sessionPath = readNonEmptyString(metadataThread?.path)
 
   if (!sessionPath || !isAbsolute(sessionPath)) {
-    metadataResult = await appServer.rpc('thread/read', {
-      threadId,
-      includeTurns: false,
-    })
+    metadataResult = appServer.getThreadSummarySnapshot(threadId)
     metadataRecord = asRecord(metadataResult)
     metadataThread = asRecord(metadataRecord?.thread)
     sessionPath = readNonEmptyString(metadataThread?.path)
@@ -1195,6 +1196,28 @@ async function readThreadSnapshotForObserver(
   })
   const trimmedResult = trimThreadTurnsInRpcResult('thread/read', rawResult)
   return mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
+}
+
+async function readCurrentThreadMetadata(
+  appServer: AppServerProcess,
+  threadId: string,
+): Promise<unknown | null> {
+  try {
+    const result = await appServer.rpc('thread/read', {
+      threadId,
+      includeTurns: false,
+    })
+    const record = asRecord(result)
+    const thread = asRecord(record?.thread)
+    const returnedThreadId = readNonEmptyString(thread?.id)
+    if (thread && (!returnedThreadId || returnedThreadId === threadId)) {
+      return result
+    }
+  } catch {
+    // A cached summary remains useful while the official server is starting
+    // or while a just-created thread has not materialized its rollout yet.
+  }
+  return appServer.getThreadSummarySnapshot(threadId)
 }
 
 const warnedCodexAuthReadFailures = new Set<string>()
@@ -10255,11 +10278,7 @@ export function createCodexBridgeMiddleware(options: { passwordConfigured?: bool
           // complete rollout.  The path is obtained from Codex itself rather
           // than accepted from the browser, so this endpoint cannot be used
           // as an arbitrary local-file reader.
-          const summaryResult = appServer.getThreadSummarySnapshot(threadId)
-            ?? await appServer.rpc('thread/read', {
-              threadId,
-              includeTurns: false,
-            })
+          const summaryResult = await readCurrentThreadMetadata(appServer, threadId)
           const summaryRecord = asRecord(summaryResult)
           const summaryThread = asRecord(summaryRecord?.thread)
           const sessionPath = readNonEmptyString(summaryThread?.path)

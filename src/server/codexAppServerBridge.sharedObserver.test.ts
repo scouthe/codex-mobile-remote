@@ -18,6 +18,7 @@ function installFakeSharedBridge(options: {
   rejectResumeWithActiveWriter?: boolean
   threadListResult?: unknown
   threadReadResults?: unknown[]
+  threadSummarySnapshot?: unknown
 } = {}) {
   const globalScope = globalThis as typeof globalThis & { __codexRemoteSharedBridge__?: unknown }
   const previous = globalScope.__codexRemoteSharedBridge__
@@ -73,7 +74,7 @@ function installFakeSharedBridge(options: {
     getStreamEvents: () => [],
     getStreamEventsSince: () => ({ events: [], truncated: false }),
     getProcessGeneration: () => generation,
-    getThreadSummarySnapshot: () => null,
+    getThreadSummarySnapshot: () => options.threadSummarySnapshot ?? null,
     getSessionActivityReader: () => appServer.sessionActivityReader,
     storeThreadReadSnapshot: () => undefined,
     getLastThreadReadSnapshot: () => null,
@@ -337,6 +338,74 @@ describe('shared thread observer HTTP path', () => {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
       instance.dispose()
       fake.restore()
+    }
+  })
+
+  it('uses the current forked session path instead of a stale cached parent path', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-forked-observer-'))
+    const parentPath = join(directory, 'rollout-parent.jsonl')
+    const childPath = join(directory, 'rollout-child.jsonl')
+    const timestamp = new Date().toISOString()
+    await writeFile(parentPath, JSON.stringify({
+      timestamp,
+      type: 'event_msg',
+      payload: { type: 'turn_aborted', turn_id: 'parent-turn', reason: 'interrupted' },
+    }) + '\n', 'utf8')
+    await writeFile(childPath, JSON.stringify({
+      timestamp,
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'child-turn' },
+    }) + '\n', 'utf8')
+
+    const fake = installFakeSharedBridge({
+      threadSummarySnapshot: {
+        thread: {
+          id: 'shared-thread',
+          path: parentPath,
+          status: { type: 'idle' },
+        },
+      },
+      threadReadResults: [{
+        thread: {
+          id: 'shared-thread',
+          path: childPath,
+          status: { type: 'idle' },
+          turns: [],
+        },
+      }],
+    })
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Test server did not expose a TCP port')
+      const endpoint = `http://127.0.0.1:${address.port}`
+
+      const fastResponse = await fetch(`${endpoint}/codex-api/thread-fast-state?threadId=shared-thread`)
+      expect(fastResponse.status).toBe(200)
+      const fastPayload = await fastResponse.json() as Record<string, unknown>
+      expect(fastPayload).toMatchObject({
+        taskState: 'completed',
+        thread: { path: childPath },
+      })
+
+      const liveResponse = await fetch(`${endpoint}/codex-api/thread-live-state?threadId=shared-thread`)
+      expect(liveResponse.status).toBe(200)
+      const livePayload = await liveResponse.json() as Record<string, unknown>
+      expect(livePayload).toMatchObject({
+        taskState: 'completed',
+        thread: { path: childPath },
+      })
+      expect(fake.calls.filter((call) => call.method === 'thread/read').length).toBeGreaterThanOrEqual(2)
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+      await rm(directory, { recursive: true, force: true })
     }
   })
 
