@@ -1019,6 +1019,7 @@
                     :live-overlay="liveOverlay"
                     :retry-state="selectedTurnRetryState"
                     :retry-now="retrySelectedThreadNow"
+                    :fork-status-by-turn-id="selectedForkStatusByTurnId"
                     :pending-requests="selectedThreadServerRequests"
                     :has-more-persisted-above="hasMoreOlderMessages"
                     :defer-auto-load-persisted-above="deferAutoLoadPersistedAbove"
@@ -1570,6 +1571,7 @@ const {
   selectedTurnRetryState,
   codexQuota,
   selectedThreadId,
+  selectedForkStatusByTurnId,
   availableCollaborationModes,
   availableModelIds,
   selectedCollaborationMode,

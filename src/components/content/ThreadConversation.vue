@@ -730,12 +730,21 @@
                   v-if="showForkResponseButton(message)"
                   type="button"
                   class="message-fork-button"
-                  aria-label="分支到新聊天"
-                  data-tooltip="分支到新聊天"
+                  :disabled="forkStatusForMessage(message)?.state === 'creating'"
+                  :aria-busy="forkStatusForMessage(message)?.state === 'creating'"
+                  :aria-label="forkStatusForMessage(message)?.state === 'creating' ? t('Creating…') : t('Fork thread from this response')"
+                  :data-tooltip="forkStatusForMessage(message)?.state === 'creating' ? t('Creating…') : t('Fork thread from this response')"
                   @click="forkResponse(message.id)"
                 >
-                  <IconTablerArrowsDiagonal class="icon-svg message-fork-icon" />
+                  <IconTablerArrowsDiagonal class="icon-svg message-fork-icon" :class="{ 'message-fork-icon-loading': forkStatusForMessage(message)?.state === 'creating' }" />
                 </button>
+                <span
+                  v-if="forkStatusForMessage(message)?.state === 'failed'"
+                  class="message-fork-error"
+                  role="alert"
+                >
+                  {{ t(forkStatusForMessage(message)?.error ?? '') }}
+                </span>
                 <button
                   v-if="showCopyResponseButton(message)"
                   type="button"
@@ -990,10 +999,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { UiFileChange, UiLiveOverlay, UiMessage, UiPlanStep, UiServerRequest } from '../../types/codex'
-import type { TurnRetryState } from '../../composables/useDesktopState'
+import type { ThreadForkStatus, TurnRetryState } from '../../composables/useDesktopState'
 import { updateThreadFileChanges } from '../../api/codexGateway'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { useMobile } from '../../composables/useMobile'
+import { useUiLanguage } from '../../composables/useUiLanguage'
 import { shouldAutoLoadPersistedAbove } from '../../task/olderMessageLoading'
 import {
   buildConversationTurnAnchors,
@@ -1033,6 +1043,7 @@ const fileLinkContextMenuY = ref(0)
 const fileLinkContextBrowseUrl = ref('')
 const fileLinkContextEditUrl = ref('')
 const { isMobile } = useMobile()
+const { t } = useUiLanguage()
 const { buildFeedbackMailto, feedbackMailtoBase, recordVisibleFailure } = useFeedbackDiagnostics()
 const feedbackMailto = feedbackMailtoBase()
 
@@ -1408,6 +1419,7 @@ const props = defineProps<{
   loadEarlierMessages?: (threadId: string) => Promise<void>
   retryState?: TurnRetryState | null
   retryNow?: (threadId: string) => Promise<void> | void
+  forkStatusByTurnId?: Record<string, ThreadForkStatus>
 }>()
 
 const emit = defineEmits<{
@@ -2034,6 +2046,12 @@ function showCopyResponseButton(message: UiMessage): boolean {
 
 function showForkResponseButton(message: UiMessage): boolean {
   return typeof forkableTurnIdByAnchorId.value[message.id] === 'string'
+}
+
+function forkStatusForMessage(message: UiMessage): ThreadForkStatus | null {
+  const turnId = forkableTurnIdByAnchorId.value[message.id]
+  if (!turnId) return null
+  return props.forkStatusByTurnId?.[turnId] ?? null
 }
 
 function mergeFileChangeDiff(first: string, second: string): string {
@@ -5106,6 +5124,18 @@ onBeforeUnmount(() => {
 
 .message-fork-button {
   @apply relative inline-flex h-8 w-8 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 focus-visible:bg-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-500;
+}
+
+.message-fork-button:disabled {
+  @apply cursor-wait opacity-60;
+}
+
+.message-fork-icon-loading {
+  @apply animate-spin;
+}
+
+.message-fork-error {
+  @apply max-w-[min(32rem,70vw)] text-xs font-medium leading-5 text-rose-600;
 }
 
 .message-fork-button::after {

@@ -87,6 +87,15 @@ function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
 }
 
+export type ThreadForkStatus = {
+  state: 'creating' | 'failed'
+  error: string
+}
+
+function forkStatusKey(threadId: string, turnId: string): string {
+  return `${threadId.trim()}\u0000${turnId.trim()}`
+}
+
 export function findAdjacentThreadId(threads: UiThread[], threadId: string): string {
   const targetIndex = threads.findIndex((thread) => thread.id === threadId)
   if (targetIndex < 0) return ''
@@ -1614,6 +1623,11 @@ export function useDesktopState() {
   let pendingServerRequestRefreshSequence = 0
   let pendingServerRequestMutationVersion = 0
   const pendingTurnRequestByThreadId = ref<Record<string, PendingTurnRequest>>({})
+  // Fork requests are keyed by the source thread and target turn.  Keeping
+  // this separate from the task lifecycle prevents a busy thread from
+  // blocking forks of already-completed historical turns and prevents a
+  // double click from creating duplicate fork threads.
+  const forkStatusByKey = ref<Record<string, ThreadForkStatus>>({})
   const codexRateLimit = ref<UiRateLimitSnapshot | null>(null)
   const threadTokenUsageByThreadId = ref<Record<string, UiThreadTokenUsage>>(loadThreadTokenUsageMap())
   const terminalOpenByThreadId = ref<Record<string, boolean>>(loadThreadTerminalOpenMap())
@@ -2221,6 +2235,18 @@ export function useDesktopState() {
     const summary = turnSummaryByThreadId.value[threadId]
     if (!summary) return combined
     return insertTurnSummaryMessage(combined, summary)
+  })
+  const selectedForkStatusByTurnId = computed<Record<string, ThreadForkStatus>>(() => {
+    const threadId = selectedThreadId.value.trim()
+    if (!threadId) return {}
+    const prefix = `${threadId}\u0000`
+    const next: Record<string, ThreadForkStatus> = {}
+    for (const [key, status] of Object.entries(forkStatusByKey.value)) {
+      if (!key.startsWith(prefix)) continue
+      const turnId = key.slice(prefix.length)
+      if (turnId) next[turnId] = status
+    }
+    return next
   })
   const hasMoreOlderMessages = computed(() => {
     const threadId = selectedThreadId.value
@@ -6189,6 +6215,58 @@ export function useDesktopState() {
     }
   }
 
+  function setForkStatus(threadId: string, turnId: string, status: ThreadForkStatus | null): void {
+    const key = forkStatusKey(threadId, turnId)
+    if (!key) return
+    const current = forkStatusByKey.value[key]
+    if (!status) {
+      if (!current) return
+      forkStatusByKey.value = omitKey(forkStatusByKey.value, key)
+      return
+    }
+    if (current?.state === status.state && current.error === status.error) return
+    forkStatusByKey.value = {
+      ...forkStatusByKey.value,
+      [key]: status,
+    }
+  }
+
+  function readForkTargetState(threadId: string, turnId: string): 'inProgress' | 'terminal' | 'unknown' {
+    const normalizedThreadId = threadId.trim()
+    const normalizedTurnId = turnId.trim()
+    if (!normalizedThreadId || !normalizedTurnId) return 'unknown'
+
+    // A target turn can be represented by persisted assistant messages,
+    // live assistant messages, or command/plan items.  Any in-progress marker
+    // wins over a terminal marker because a stale terminal projection must not
+    // race an active turn's writer.
+    const messages = [
+      ...(persistedMessagesByThreadId.value[normalizedThreadId] ?? []),
+      ...(liveAgentMessagesByThreadId.value[normalizedThreadId] ?? []),
+      ...(liveCommandsByThreadId.value[normalizedThreadId] ?? []),
+      ...(livePlanMessagesByThreadId.value[normalizedThreadId] ?? []),
+      ...(liveFileChangeMessagesByThreadId.value[normalizedThreadId] ?? []),
+    ]
+    const statuses = messages
+      .filter((message) => message.turnId?.trim() === normalizedTurnId)
+      .map((message) => message.turnStatus)
+      .filter((status): status is NonNullable<UiMessage['turnStatus']> => Boolean(status))
+
+    if (statuses.includes('inProgress')) return 'inProgress'
+
+    const activeTurnId = activeTurnIdByThreadId.value[normalizedThreadId]
+      || taskSnapshotsByThreadId.value[normalizedThreadId]?.activeTurnId
+      || ''
+    if (activeTurnId === normalizedTurnId && isSessionActiveForThread(normalizedThreadId)) {
+      return 'inProgress'
+    }
+
+    if (statuses.some((status) => status === 'completed' || status === 'failed' || status === 'interrupted')) {
+      return 'terminal'
+    }
+    return 'unknown'
+  }
+
   async function forkThreadById(threadId: string): Promise<string> {
     const sourceThreadId = threadId.trim()
     if (!sourceThreadId) return ''
@@ -6225,27 +6303,40 @@ export function useDesktopState() {
     const normalizedTurnId = turnId.trim()
     if (!normalizedThreadId || !normalizedTurnId) return ''
 
-    if (isTaskActiveForThread(normalizedThreadId)) {
-      error.value = 'Finish the current turn before forking from a response.'
+    const statusKey = forkStatusKey(normalizedThreadId, normalizedTurnId)
+    if (forkStatusByKey.value[statusKey]?.state === 'creating') {
       return ''
     }
+
+    error.value = ''
+    setForkStatus(normalizedThreadId, normalizedTurnId, { state: 'creating', error: '' })
 
     if (loadedMessagesByThreadId.value[normalizedThreadId] !== true) {
       try {
         await loadMessages(normalizedThreadId)
       } catch (unknownError) {
-        error.value = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+        const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+        error.value = message
+        setForkStatus(normalizedThreadId, normalizedTurnId, { state: 'failed', error: message })
         return ''
       }
+    }
+
+    if (readForkTargetState(normalizedThreadId, normalizedTurnId) === 'inProgress') {
+      const message = 'This response is still running. Finish it before creating a fork.'
+      error.value = message
+      setForkStatus(normalizedThreadId, normalizedTurnId, { state: 'failed', error: message })
+      return ''
     }
 
     const sourceThread = flattenThreads(sourceGroups.value).find((row) => row.id === normalizedThreadId) ?? null
 
     try {
-      error.value = ''
       const forked = await forkThreadAtTurn(normalizedThreadId, normalizedTurnId)
       const forkedThreadId = forked.threadId.trim()
-      if (!forkedThreadId) return ''
+      if (!forkedThreadId) {
+        throw new Error('thread/fork did not return a thread id')
+      }
 
       const forkedCwd = forked.cwd.trim() || sourceThread?.cwd?.trim() || ''
       const forkedThreadTitle = toForkedThreadTitle(sourceThread?.title || sourceThread?.preview || 'Untitled thread')
@@ -6273,10 +6364,13 @@ export function useDesktopState() {
 
       await renameThreadById(forkedThreadId, forkedThreadTitle)
       setSelectedThreadId(forkedThreadId)
+      setForkStatus(normalizedThreadId, normalizedTurnId, null)
       void loadThreads().catch(() => {})
       return forkedThreadId
     } catch (unknownError) {
-      error.value = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+      const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+      error.value = message
+      setForkStatus(normalizedThreadId, normalizedTurnId, { state: 'failed', error: message })
       return ''
     }
   }
@@ -7513,6 +7607,7 @@ export function useDesktopState() {
     selectedTurnRetryState,
     codexQuota,
     selectedThreadId,
+    selectedForkStatusByTurnId,
     availableCollaborationModes,
     availableModelIds,
     selectedCollaborationMode,

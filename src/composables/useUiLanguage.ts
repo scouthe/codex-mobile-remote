@@ -228,6 +228,7 @@ const zhCN: Record<string, string> = {
   'Edit this message': '编辑此消息',
   'Edit message': '编辑消息',
   'Fork thread from this response': '从此回复分叉线程',
+  'This response is still running. Finish it before creating a fork.': '此回复仍在执行中，请完成后再创建分支。',
   'Fork': '分叉',
   'Response copied': '回复已复制',
   'Copy response': '复制回复',

@@ -118,6 +118,105 @@ describe('automatic turn retry classification', () => {
   })
 })
 
+describe('response Fork target-turn handling', () => {
+  it('allows forking a completed historical turn while a later turn is active', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [{
+        id: 'assistant-old',
+        role: 'assistant',
+        text: 'completed history',
+        messageType: 'agentMessage',
+        turnId: 'turn-old',
+        turnStatus: 'completed',
+      }],
+      inProgress: true,
+      activeTurnId: 'turn-new',
+      hasMoreOlder: false,
+      turnIndexByTurnId: { 'turn-old': 0, 'turn-new': 1 },
+    })
+    gatewayMocks.forkThreadAtTurn.mockResolvedValue({
+      threadId: 'forked-thread',
+      cwd: '/tmp/project',
+      model: 'gpt-5.5',
+      messages: [],
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('source-thread')
+    await state.loadMessages('source-thread')
+
+    await expect(state.forkThreadFromTurn('source-thread', 'turn-old')).resolves.toBe('forked-thread')
+    expect(gatewayMocks.forkThreadAtTurn).toHaveBeenCalledWith('source-thread', 'turn-old')
+  })
+
+  it('rejects forking the currently running target turn without calling the server', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [{
+        id: 'assistant-current',
+        role: 'assistant',
+        text: 'still working',
+        messageType: 'agentMessage',
+        turnId: 'turn-current',
+        turnStatus: 'inProgress',
+      }],
+      inProgress: true,
+      activeTurnId: 'turn-current',
+      hasMoreOlder: false,
+      turnIndexByTurnId: { 'turn-current': 0 },
+    })
+
+    const state = useDesktopState()
+    state.primeSelectedThread('active-thread')
+    await state.loadMessages('active-thread')
+
+    await expect(state.forkThreadFromTurn('active-thread', 'turn-current')).resolves.toBe('')
+    expect(gatewayMocks.forkThreadAtTurn).not.toHaveBeenCalled()
+    expect(state.error.value).toContain('still running')
+  })
+
+  it('deduplicates repeated Fork requests for the same target turn', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [{
+        id: 'assistant-old',
+        role: 'assistant',
+        text: 'completed history',
+        messageType: 'agentMessage',
+        turnId: 'turn-old',
+        turnStatus: 'completed',
+      }],
+      inProgress: true,
+      activeTurnId: 'turn-new',
+      hasMoreOlder: false,
+      turnIndexByTurnId: { 'turn-old': 0, 'turn-new': 1 },
+    })
+    let resolveFork: ((value: { threadId: string; cwd: string; model: string; messages: [] }) => void) | undefined
+    gatewayMocks.forkThreadAtTurn.mockReturnValue(new Promise((resolve) => {
+      resolveFork = resolve
+    }))
+
+    const state = useDesktopState()
+    state.primeSelectedThread('source-thread')
+    await state.loadMessages('source-thread')
+
+    const first = state.forkThreadFromTurn('source-thread', 'turn-old')
+    const second = state.forkThreadFromTurn('source-thread', 'turn-old')
+
+    expect(gatewayMocks.forkThreadAtTurn).toHaveBeenCalledTimes(1)
+    resolveFork?.({ threadId: 'forked-thread', cwd: '/tmp/project', model: 'gpt-5.5', messages: [] })
+    await expect(first).resolves.toBe('forked-thread')
+    await expect(second).resolves.toBe('')
+  })
+})
+
 describe('filterGroupsByWorkspaceRoots', () => {
   it('keeps projectless chats visible when workspace roots are configured', () => {
     const groups: UiProjectGroup[] = [

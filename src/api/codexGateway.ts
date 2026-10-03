@@ -24,7 +24,7 @@ import type {
   ThreadStartResponse,
   Turn,
 } from './appServerDtos'
-import { extractErrorMessage, normalizeCodexApiError } from './codexErrors'
+import { CodexApiError, extractErrorMessage, normalizeCodexApiError } from './codexErrors'
 import {
   readActiveTurnIdFromResponse,
   normalizeThreadGroupsV2,
@@ -2273,6 +2273,22 @@ export type ForkedThread = {
   messages: UiMessage[]
 }
 
+function normalizeForkTargetError(error: unknown, threadId: string, turnId: string): CodexApiError {
+  const normalized = normalizeCodexApiError(
+    error,
+    `Failed to fork thread ${threadId} at turn ${turnId}`,
+    'thread/fork',
+  )
+  if (/last[_ ]?turn[_ ]?id|turn.*(?:in progress|running)|(?:in progress|running).*turn/i.test(normalized.message)) {
+    return new CodexApiError('This response is still running. Finish it before creating a fork.', {
+      code: normalized.code,
+      method: normalized.method,
+      status: normalized.status,
+    })
+  }
+  return normalized
+}
+
 export async function forkThreadAtTurn(threadId: string, lastTurnId: string): Promise<ForkedThread> {
   const normalizedThreadId = threadId.trim()
   const normalizedLastTurnId = lastTurnId.trim()
@@ -2296,7 +2312,7 @@ export async function forkThreadAtTurn(threadId: string, lastTurnId: string): Pr
       messages: normalizeThreadMessagesV2(payload, readThreadTurnStartIndex(payload)),
     }
   } catch (error) {
-    throw normalizeCodexApiError(error, `Failed to fork thread ${normalizedThreadId} at turn ${normalizedLastTurnId}`, 'thread/fork')
+    throw normalizeForkTargetError(error, normalizedThreadId, normalizedLastTurnId)
   }
 }
 

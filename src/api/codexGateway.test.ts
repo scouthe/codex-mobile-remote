@@ -160,6 +160,18 @@ describe('forkThreadAtTurn', () => {
       },
     }])
   })
+
+  it('normalizes an official in-progress target-turn rejection', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: { message: 'last_turn_id cannot reference a turn that is in progress' },
+    }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(forkThreadAtTurn('source-thread-1', 'turn-1'))
+      .rejects.toThrow('This response is still running. Finish it before creating a fork.')
+  })
 })
 
 describe('thread goal RPCs', () => {

@@ -13,6 +13,7 @@
 4. Click once and wait for the new thread; do not click repeatedly while the server processes the fork.
 5. Without sending a message, confirm the Fork appears in the left conversation list. Refresh the page and confirm it remains there. Open the same project in a second browser and confirm it appears once there too.
 6. Send one message in the Fork and confirm the same list entry remains, without a duplicate.
+7. While a later turn is running, click Fork on an earlier completed response and confirm the fork starts immediately; the currently running response remains unavailable until it completes.
 
 ## Expected results
 
@@ -20,6 +21,7 @@
 - Light and dark themes have a legible button and tooltip; Copy and Edit actions are unchanged.
 - The button still emits the selected turn ID for forking.
 - An unsent Fork is listed immediately and survives a refresh; after its first message, the official list entry replaces the fallback without duplication.
+- Fork availability follows the selected response turn: a completed historical turn can fork while a later turn is active, while an in-progress response is disabled with a clear status.
 
 ## Cleanup
 
