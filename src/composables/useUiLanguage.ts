@@ -359,7 +359,6 @@ const zhCN: Record<string, string> = {
   'Manual sync': '手动同步',
   'GitHub device login': 'GitHub 设备登录',
   'and enter code:': '并输入代码：',
-  'Login with GitHub': '使用 GitHub 登录',
   'Device Login': '设备登录',
   'Logout GitHub': '退出 GitHub',
   'Syncing...': '同步中...',

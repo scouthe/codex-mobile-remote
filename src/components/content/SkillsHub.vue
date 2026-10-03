@@ -41,7 +41,6 @@
         <code>{{ deviceLogin.user_code }}</code>
       </div>
       <div class="skills-sync-actions">
-        <button v-if="!syncStatus.loggedIn" class="skills-hub-sort" type="button" @click="startGithubFirebaseLogin">{{ t('Login with GitHub') }}</button>
         <button v-if="!syncStatus.loggedIn" class="skills-hub-sort" type="button" @click="startGithubLogin">{{ t('Device Login') }}</button>
         <button v-if="syncStatus.loggedIn" class="skills-hub-sort" type="button" @click="logoutGithub" :disabled="isSyncActionInFlight">{{ t('Logout GitHub') }}</button>
         <button class="skills-hub-sort" type="button" @click="startupSkillsSync" :disabled="isSyncActionInFlight">{{ isStartupSyncInFlight ? t('Syncing...') : t('Startup Sync') }}</button>
@@ -386,7 +385,6 @@ const {
   pullSkillsSync,
   pushSkillsSync,
   startupSkillsSync,
-  startGithubFirebaseLogin,
   startGithubLogin,
   syncActionError,
   syncActionStatus,

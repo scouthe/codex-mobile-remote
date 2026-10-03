@@ -1459,23 +1459,6 @@ export async function handleSkillsRoutes(
     return true
   }
 
-  if (req.method === 'POST' && url.pathname === '/codex-api/skills-sync/github/token-login') {
-    try {
-      const payload = asRecord(await readJsonBody(req))
-      const token = typeof payload?.token === 'string' ? payload.token.trim() : ''
-      if (!token) {
-        setJson(res, 400, { error: 'Missing GitHub token' })
-        return true
-      }
-      const username = await resolveGithubUsername(token)
-      await finalizeGithubLoginAndSync(token, username, appServer)
-      setJson(res, 200, { ok: true, data: { githubUsername: username } })
-    } catch (error) {
-      setJson(res, 502, { error: getErrorMessage(error, 'Failed to login with GitHub token') })
-    }
-    return true
-  }
-
   if (req.method === 'POST' && url.pathname === '/codex-api/skills-sync/github/logout') {
     try {
       const state = await readSkillsSyncState()
