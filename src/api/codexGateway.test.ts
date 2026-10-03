@@ -420,6 +420,22 @@ describe('getThreadLiveState', () => {
     vi.unstubAllGlobals()
   })
 
+  it('does not revive an active turn ID from a stale projection after an authoritative idle marker', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      thread: { id: 'thread-1', turns: [{
+        id: 'turn-done', status: 'inProgress', items: [{ id: 'answer', type: 'agentMessage', text: 'done' }],
+      }] },
+      sessionActivityKnown: true,
+      inProgress: false,
+      activeTurnId: '',
+      terminalTurnId: 'turn-done',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+
+    await expect(getThreadLiveState('thread-1')).resolves.toMatchObject({
+      inProgress: false, activeTurnId: '', terminalTurnId: 'turn-done',
+    })
+  })
+
   it('preserves bounded projection metadata for the message reducer', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
       thread: {

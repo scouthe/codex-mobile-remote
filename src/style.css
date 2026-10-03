@@ -844,6 +844,14 @@
   @apply text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 focus-visible:bg-zinc-800;
 }
 
+:root.dark .message-fork-progress {
+  @apply text-zinc-400;
+}
+
+:root.dark .message-fork-error {
+  @apply text-rose-400;
+}
+
 :root.dark .message-rollback-button {
   @apply text-amber-400/70 hover:text-amber-300;
 }

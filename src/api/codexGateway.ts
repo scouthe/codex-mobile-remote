@@ -1430,7 +1430,9 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       // an old projected in-progress turn resurrect the spinner after the
       // desktop task has completed.
       inProgress: explicitInProgress ?? readThreadInProgressFromResponse(threadPayload),
-      activeTurnId: readString(record?.activeTurnId) || readActiveTurnIdFromResponse(threadPayload),
+      // An authoritative idle marker also clears the active ID. A stale turn
+      // projection must not resurrect it after the server explicitly clears it.
+      activeTurnId: explicitInProgress === false ? '' : readString(record?.activeTurnId) || readActiveTurnIdFromResponse(threadPayload),
       ...(terminalTurnId ? { terminalTurnId } : {}),
       hasMoreOlder,
       ...(record?.partial === true || hasMoreOlder ? { partial: true } : {}),

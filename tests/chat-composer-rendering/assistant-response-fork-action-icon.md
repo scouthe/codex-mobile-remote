@@ -8,12 +8,14 @@
 ## Steps
 
 1. Hover over an assistant response, then hover or keyboard-focus its diagonal-arrow Fork button.
-2. Verify a dark `分支到新聊天` tooltip appears above the round button; the button remains discoverable with keyboard focus.
+2. Verify a dark `从此回复分叉线程` tooltip (or `Fork thread from this response` in English) appears above the round button; the button remains discoverable with keyboard focus.
 3. On a touch-sized viewport, check the Fork button is visible without hover and has an accessible label. No hover tooltip should cover the conversation.
-4. Click once and wait for the new thread; do not click repeatedly while the server processes the fork.
+4. Click once, verify `创建中…` / `Creating…` and a disabled button, then attempt another click while the server processes the fork; only one creation request should be sent.
 5. Without sending a message, confirm the Fork appears in the left conversation list. Refresh the page and confirm it remains there. Open the same project in a second browser and confirm it appears once there too.
 6. Send one message in the Fork and confirm the same list entry remains, without a duplicate.
 7. While a later turn is running, click Fork on an earlier completed response and confirm the fork starts immediately; the currently running response remains unavailable until it completes.
+8. Complete the running turn and immediately use its Fork button before history refresh finishes. It must become available without a hard refresh, including when a stale message projection arrives afterward.
+9. Simulate a Fork failure. Move the pointer away and verify the reason stays visible under that response, the button is restored, and retry works. An invalid turn ID must retain its actual failure reason.
 
 ## Expected results
 

@@ -119,6 +119,53 @@ describe('automatic turn retry classification', () => {
 })
 
 describe('response Fork target-turn handling', () => {
+  it('allows a completed target immediately and does not restore a stale running message', async () => {
+    installTestWindow()
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    gatewayMocks.getThreadGroupsPage.mockRejectedValue(new Error('refresh unavailable'))
+    let notify: ((notification: { method: string; params: unknown }) => void) | undefined
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notify = handler
+      return vi.fn()
+    })
+    const staleMessages = [{
+      id: 'assistant-current', role: 'assistant', text: 'answer', messageType: 'agentMessage',
+      turnId: 'turn-current', turnStatus: 'inProgress',
+    }]
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5', modelProvider: 'openai', messages: staleMessages, inProgress: true,
+      activeTurnId: 'turn-current', hasMoreOlder: false, turnIndexByTurnId: { 'turn-current': 0 },
+    })
+    gatewayMocks.forkThreadAtTurn.mockResolvedValue({
+      threadId: 'forked-thread', cwd: '/tmp/project', model: 'gpt-5.5', messages: [],
+    })
+    const state = useDesktopState()
+    state.primeSelectedThread('source-thread')
+    await state.loadMessages('source-thread')
+    state.startPolling()
+    notify?.({ method: 'turn/completed', params: {
+      threadId: 'source-thread', turn: { id: 'turn-current', status: 'completed' },
+    } })
+    expect(state.messages.value.find((message) => message.id === 'assistant-current')?.turnStatus).toBe('completed')
+    notify?.({ method: 'item/agentMessage/delta', params: {
+      threadId: 'source-thread', turnId: 'turn-current', itemId: 'late-assistant', delta: 'late output',
+    } })
+    expect(state.messages.value.some((message) => message.id === 'late-assistant')).toBe(false)
+
+    // A stale projection for this completed turn may arrive while the next
+    // turn is running. It must not disable the historical Fork button again.
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5', modelProvider: 'openai', messages: staleMessages, inProgress: true,
+      activeTurnId: 'turn-new', hasMoreOlder: true, partial: true,
+      turnIndexByTurnId: { 'turn-current': 0, 'turn-new': 1 },
+    })
+    await state.loadMessages('source-thread', { force: true, fast: false })
+    expect(state.messages.value.find((message) => message.id === 'assistant-current')?.turnStatus).toBe('completed')
+    await expect(state.forkThreadFromTurn('source-thread', 'turn-current')).resolves.toBe('forked-thread')
+    expect(gatewayMocks.forkThreadAtTurn).toHaveBeenCalledTimes(1)
+    state.stopPolling()
+  })
+
   it('allows forking a completed historical turn while a later turn is active', async () => {
     installTestWindow()
     gatewayMocks.getThreadDetail.mockResolvedValue({
@@ -211,9 +258,47 @@ describe('response Fork target-turn handling', () => {
     const second = state.forkThreadFromTurn('source-thread', 'turn-old')
 
     expect(gatewayMocks.forkThreadAtTurn).toHaveBeenCalledTimes(1)
+    expect(state.selectedForkStatusByTurnId.value['turn-old']).toEqual({ state: 'creating', error: '' })
     resolveFork?.({ threadId: 'forked-thread', cwd: '/tmp/project', model: 'gpt-5.5', messages: [] })
     await expect(first).resolves.toBe('forked-thread')
     await expect(second).resolves.toBe('')
+  })
+
+  it.each(['failed', 'interrupted', undefined])('lets the official server validate a %s target without blocking the whole thread', async (turnStatus) => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      model: 'gpt-5.5', modelProvider: 'openai', inProgress: true, activeTurnId: 'turn-new',
+      messages: [{ id: 'old', role: 'assistant', text: 'history', turnId: 'turn-old', turnStatus }],
+      hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+    gatewayMocks.forkThreadAtTurn.mockResolvedValue({
+      threadId: 'forked-thread', cwd: '/tmp/project', model: 'gpt-5.5', messages: [],
+    })
+    const state = useDesktopState()
+    state.primeSelectedThread('source-thread')
+    await state.loadMessages('source-thread')
+    await expect(state.forkThreadFromTurn('source-thread', 'turn-old')).resolves.toBe('forked-thread')
+    expect(gatewayMocks.forkThreadAtTurn).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves failure feedback and allows a manual retry after the request settles', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [], inProgress: true, activeTurnId: 'turn-new', hasMoreOlder: false, turnIndexByTurnId: {},
+    })
+    gatewayMocks.forkThreadAtTurn
+      .mockRejectedValueOnce(new Error('official server temporarily unavailable'))
+      .mockResolvedValueOnce({ threadId: 'forked-thread', cwd: '/tmp/project', model: 'gpt-5.5', messages: [] })
+    const state = useDesktopState()
+    state.primeSelectedThread('source-thread')
+    await state.loadMessages('source-thread')
+    await expect(state.forkThreadFromTurn('source-thread', 'turn-old')).resolves.toBe('')
+    expect(state.selectedForkStatusByTurnId.value['turn-old']).toEqual({
+      state: 'failed', error: 'official server temporarily unavailable',
+    })
+    expect(state.selectedThreadId.value).toBe('source-thread')
+    await expect(state.forkThreadFromTurn('source-thread', 'turn-old')).resolves.toBe('forked-thread')
+    expect(gatewayMocks.forkThreadAtTurn).toHaveBeenCalledTimes(2)
   })
 })
 

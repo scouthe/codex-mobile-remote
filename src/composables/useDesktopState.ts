@@ -96,6 +96,16 @@ function forkStatusKey(threadId: string, turnId: string): string {
   return `${threadId.trim()}\u0000${turnId.trim()}`
 }
 
+function settleTurnMessages(messages: UiMessage[], turnId: string, status: NonNullable<UiMessage['turnStatus']>): UiMessage[] {
+  let changed = false
+  const next = messages.map((message) => {
+    if (message.turnId !== turnId || (message.turnStatus && message.turnStatus !== 'inProgress')) return message
+    changed = true
+    return { ...message, turnStatus: status }
+  })
+  return changed ? next : messages
+}
+
 export function findAdjacentThreadId(threads: UiThread[], threadId: string): string {
   const targetIndex = threads.findIndex((thread) => thread.id === threadId)
   if (targetIndex < 0) return ''
@@ -2045,6 +2055,23 @@ export function useDesktopState() {
       ...taskSnapshotsByThreadId.value,
       [threadId]: next,
     }
+    // Completion events and shared-session markers are authoritative before
+    // message hydration catches up. Settle this turn's cached messages now so
+    // the Fork action does not remain blocked by a stale inProgress row.
+    if (next.terminalTurnId && next.terminalTurnId !== next.activeTurnId
+      && (next.terminalTurnId !== previous?.terminalTurnId || previous?.activeTurnId === next.terminalTurnId)) {
+      const params = asRecord(observation.notification?.params)
+      const rawStatus = readString(asRecord(params?.turn)?.status) || readString(params?.status)
+      const status = rawStatus === 'interrupted' || next.state === 'canceled' ? 'interrupted'
+        : rawStatus === 'failed' || next.state === 'failed' ? 'failed' : 'completed'
+      setPersistedMessagesForThread(threadId, settleTurnMessages(persistedMessagesByThreadId.value[threadId] ?? [], next.terminalTurnId, status))
+      for (const source of [liveAgentMessagesByThreadId, liveCommandsByThreadId, livePlanMessagesByThreadId, liveFileChangeMessagesByThreadId]) {
+        const current = source.value[threadId]
+        if (!current) continue
+        const settled = settleTurnMessages(current, next.terminalTurnId, status)
+        if (settled !== current) source.value = { ...source.value, [threadId]: settled }
+      }
+    }
     // Reducer observations also drive sidebar indicators.  Keeping this
     // invalidation here prevents activity/queue/request notifications from
     // updating only the selected task while other rows retain stale flags.
@@ -3138,6 +3165,12 @@ export function useDesktopState() {
     eventUnreadByThreadId.value = pruneThreadStateMap(eventUnreadByThreadId.value, activeThreadIds)
     inProgressById.value = pruneThreadStateMap(inProgressById.value, activeThreadIds)
     taskSnapshotsByThreadId.value = pruneThreadStateMap(taskSnapshotsByThreadId.value, activeThreadIds)
+    const keptForkStatuses = Object.entries(forkStatusByKey.value).filter(([key, status]) =>
+      status.state === 'creating' || activeThreadIds.has(key.split('\u0000')[0] ?? ''),
+    )
+    if (keptForkStatuses.length !== Object.keys(forkStatusByKey.value).length) {
+      forkStatusByKey.value = Object.fromEntries(keptForkStatuses)
+    }
     for (const threadId of queueMutationVersionByThreadId.keys()) {
       if (!activeThreadIds.has(threadId)) queueMutationVersionByThreadId.delete(threadId)
     }
@@ -3420,6 +3453,11 @@ export function useDesktopState() {
   }
 
   function setPersistedMessagesForThread(threadId: string, nextMessages: UiMessage[]): void {
+    const snapshot = taskSnapshotsByThreadId.value[threadId]
+    if (snapshot?.terminalTurnId && snapshot.terminalTurnId !== snapshot.activeTurnId) {
+      const status = snapshot.state === 'failed' ? 'failed' : snapshot.state === 'canceled' ? 'interrupted' : 'completed'
+      nextMessages = settleTurnMessages(nextMessages, snapshot.terminalTurnId, status)
+    }
     const previous = persistedMessagesByThreadId.value[threadId] ?? []
     if (areMessageArraysEqual(previous, nextMessages)) return
     persistedMessagesByThreadId.value = {
@@ -4793,18 +4831,21 @@ export function useDesktopState() {
         || taskSnapshotsByThreadId.value[taskThreadId]?.activeTurnId
         || ''
       : ''
+    const terminalTurnId = taskThreadId ? taskSnapshotsByThreadId.value[taskThreadId]?.terminalTurnId ?? '' : ''
     const isStaleTurnNotification = Boolean(
       taskThreadId
       && incomingTurnId
-      && currentTurnId
-      && incomingTurnId !== currentTurnId
+      && ((currentTurnId && incomingTurnId !== currentTurnId)
+        || (terminalTurnId && incomingTurnId === terminalTurnId && incomingTurnId !== currentTurnId))
       && isTurnScopedNotification(notification.method)
       && notification.method !== 'turn/started',
     )
     // Do not feed stale frames into either the reducer or imperative live
     // maps.  The subscription-level cursor has already consumed the frame;
     // passing it to the reducer would let activity notifications replace the
-    // current active turn before the guard returns.
+    // current active turn before the guard returns. After completion, delayed
+    // item frames must also stay out of the imperative maps or they would
+    // recreate an inProgress message for an already-terminal turn.
     if (isStaleTurnNotification) {
       return
     }
@@ -6216,8 +6257,8 @@ export function useDesktopState() {
   }
 
   function setForkStatus(threadId: string, turnId: string, status: ThreadForkStatus | null): void {
+    if (!threadId.trim() || !turnId.trim()) return
     const key = forkStatusKey(threadId, turnId)
-    if (!key) return
     const current = forkStatusByKey.value[key]
     if (!status) {
       if (!current) return
@@ -7477,6 +7518,9 @@ export function useDesktopState() {
     liveReasoningTextByThreadId.value = {}
     liveCommandsByThreadId.value = {}
     liveFileChangeMessagesByThreadId.value = {}
+    // Keep in-flight guards until their RPC settles; restarting observation
+    // must not allow a second request for the same target.
+    forkStatusByKey.value = Object.fromEntries(Object.entries(forkStatusByKey.value).filter(([, status]) => status.state === 'creating'))
     taskSnapshotsByThreadId.value = {}
     threadGoalByThreadId.value = {}
     threadGoalLoadingByThreadId.value = {}

@@ -713,6 +713,7 @@
               <div
                 v-if="showCopyResponseButton(message) || showEditMessageButton(message)"
                 class="message-toolbar"
+                :class="{ 'message-toolbar-status': forkStatusForMessage(message) }"
                 :data-role="message.role"
               >
                 <button
@@ -730,20 +731,16 @@
                   v-if="showForkResponseButton(message)"
                   type="button"
                   class="message-fork-button"
-                  :disabled="forkStatusForMessage(message)?.state === 'creating'"
+                  :disabled="isForkTargetRunning(message) || forkStatusForMessage(message)?.state === 'creating'"
                   :aria-busy="forkStatusForMessage(message)?.state === 'creating'"
-                  :aria-label="forkStatusForMessage(message)?.state === 'creating' ? t('Creating…') : t('Fork thread from this response')"
-                  :data-tooltip="forkStatusForMessage(message)?.state === 'creating' ? t('Creating…') : t('Fork thread from this response')"
+                  :aria-label="forkButtonLabel(message)"
+                  :data-tooltip="forkButtonLabel(message)"
                   @click="forkResponse(message.id)"
                 >
                   <IconTablerArrowsDiagonal class="icon-svg message-fork-icon" :class="{ 'message-fork-icon-loading': forkStatusForMessage(message)?.state === 'creating' }" />
                 </button>
-                <span
-                  v-if="forkStatusForMessage(message)?.state === 'failed'"
-                  class="message-fork-error"
-                  role="alert"
-                >
-                  {{ t(forkStatusForMessage(message)?.error ?? '') }}
+                <span v-if="forkStatusForMessage(message)?.state === 'creating'" class="message-fork-progress" role="status">
+                  {{ t('Creating…') }}
                 </span>
                 <button
                   v-if="showCopyResponseButton(message)"
@@ -758,6 +755,9 @@
                   <span class="message-copy-label">{{ copiedResponseAnchorId === message.id ? 'Copied' : 'Copy' }}</span>
                 </button>
               </div>
+              <p v-if="forkStatusForMessage(message)?.state === 'failed'" class="message-fork-error" role="alert">
+                {{ t(forkStatusForMessage(message)?.error ?? '') }}
+              </p>
             </article>
           </div>
         </div>
@@ -2052,6 +2052,17 @@ function forkStatusForMessage(message: UiMessage): ThreadForkStatus | null {
   const turnId = forkableTurnIdByAnchorId.value[message.id]
   if (!turnId) return null
   return props.forkStatusByTurnId?.[turnId] ?? null
+}
+
+function isForkTargetRunning(message: UiMessage): boolean {
+  return message.turnStatus === 'inProgress'
+}
+
+function forkButtonLabel(message: UiMessage): string {
+  if (isForkTargetRunning(message)) return t('This response is still running. Finish it before creating a fork.')
+  return forkStatusForMessage(message)?.state === 'creating'
+    ? t('Creating…')
+    : t('Fork thread from this response')
 }
 
 function mergeFileChangeDiff(first: string, second: string): string {
@@ -5118,6 +5129,14 @@ onBeforeUnmount(() => {
   @apply opacity-100;
 }
 
+.message-toolbar-status {
+  @apply opacity-100;
+}
+
+.message-fork-progress {
+  @apply text-xs text-slate-500;
+}
+
 .message-copy-button {
   @apply inline-flex items-center gap-0.5 rounded-full border border-slate-200 bg-white/90 px-1.25 py-0.5 text-[9px] font-medium leading-none text-slate-500 transition hover:border-slate-300 hover:bg-white hover:text-slate-900;
 }
@@ -5135,7 +5154,8 @@ onBeforeUnmount(() => {
 }
 
 .message-fork-error {
-  @apply max-w-[min(32rem,70vw)] text-xs font-medium leading-5 text-rose-600;
+  @apply mt-1 max-w-full break-words text-xs font-medium leading-5 text-rose-600;
+  overflow-wrap: anywhere;
 }
 
 .message-fork-button::after {
