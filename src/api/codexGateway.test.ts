@@ -172,6 +172,18 @@ describe('forkThreadAtTurn', () => {
     await expect(forkThreadAtTurn('source-thread-1', 'turn-1'))
       .rejects.toThrow('This response is still running. Finish it before creating a fork.')
   })
+
+  it('preserves an invalid target-turn error instead of calling it in progress', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: { message: 'last_turn_id does not exist in this thread' },
+    }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    await expect(forkThreadAtTurn('source-thread-1', 'turn-missing'))
+      .rejects.toThrow('last_turn_id does not exist in this thread')
+  })
 })
 
 describe('thread goal RPCs', () => {

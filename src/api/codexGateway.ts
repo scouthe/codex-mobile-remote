@@ -2279,7 +2279,7 @@ function normalizeForkTargetError(error: unknown, threadId: string, turnId: stri
     `Failed to fork thread ${threadId} at turn ${turnId}`,
     'thread/fork',
   )
-  if (/last[_ ]?turn[_ ]?id|turn.*(?:in progress|running)|(?:in progress|running).*turn/i.test(normalized.message)) {
+  if (/(?:last[_ ]?turn[_ ]?id[^\n.]*|(?:target\s+)?turn[^\n.]*)\b(?:in progress|running)\b|\b(?:in progress|running)\b[^\n.]*(?:target\s+)?turn/i.test(normalized.message)) {
     return new CodexApiError('This response is still running. Finish it before creating a fork.', {
       code: normalized.code,
       method: normalized.method,
