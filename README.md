@@ -1,21 +1,20 @@
-# 🔥 codexapp
+# Codex Remote · codex-mobile-remote
 
-### 🚀 Run Codex App UI Anywhere: Linux, Windows, or Termux on Android 🚀
+通过网页或 Android App，远程使用 Linux 主机上的 Codex，并与连接同一官方 app-server 的 Codex Desktop 同步。
 
-[![npm](https://img.shields.io/npm/v/codexapp?style=for-the-badge&logo=npm&logoColor=white)](https://www.npmjs.com/package/codexapp)
-[![platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20Android-blue?style=for-the-badge)](#-quick-start)
+[![GitHub Release](https://img.shields.io/github/v/release/scouthe/codex-mobile-remote?style=for-the-badge)](https://github.com/scouthe/codex-mobile-remote/releases)
 [![node](https://img.shields.io/badge/Node-18%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![license](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](./LICENSE)
 
-> **Codex UI in your browser. No drama. One command.**
->  
-> **Yes, that is your Codex desktop app experience exposed over web UI. Yes, it runs cross-platform.**
+最新功能以本仓库 `main` 为准。推荐使用[源码部署](#本地部署教程源码方式)；
+[Releases](https://github.com/scouthe/codex-mobile-remote/releases) 中的 APK 和 Linux 包是单独发布的版本，
+合并到 `main` 不会自动更新这些安装包。上游 npm 包 `codexapp` 也不代表本仓库的最新代码。
 
-## 本分支相对原仓库的修改与优化
+## 相对原仓库的修改与优化
 
-本仓库是在上游 `codex-mobile` 基础上维护的 Codex 专用远程显示与交互分支，
-重点是让浏览器（手机、桌面端）和同一台机器上的官方 Codex 客户端共享真实的
-Codex 会话，而不是把项目变成另一个独立的多模型平台。
+本仓库基于 [friuns2/codex-mobile](https://github.com/friuns2/codex-mobile)，
+主要部署在运行官方 Codex CLI 的 Linux 主机上。网页、Android App 和 Windows
+Codex Desktop 通过各自的连接方式使用同一台主机上的官方服务。
 
 - **官方 app-server 共享连接**：默认连接
   `$CODEX_HOME/app-server-control/app-server-control.sock`，通过官方
@@ -24,36 +23,98 @@ Codex 会话，而不是把项目变成另一个独立的多模型平台。
   `codex app-server --listen unix://`，等待 socket 就绪后再连接；不会启动旧版
   standalone 替代服务，也不会创建第二套 Codex 会话状态。
 - **跨客户端同步**：网页端与官方 Codex 客户端共享项目、历史对话、运行状态、审批/输入请求和任务事件；
-  支持 Desktop/手机同时观察同一任务。
+  支持 Desktop/手机同时观察同一任务，网页创建的新对话和标题可在 Desktop 中识别。
 - **任务与发送稳定性**：统一排队、发送、引导（steer）、停止（interrupt）路由，处理重复提交、
   服务重启恢复、writer 冲突和空闲会话误入队列等情况。
 - **历史记录与切换性能**：项目/线程分页、快速状态投影、延迟加载大型历史对话，减少切换会话时的卡顿和状态回退。
-- **移动端体验**：任务活动时间线、运行中状态展示、审批和用户输入卡片、侧栏状态同步，以及输入框安全区域优化。
-- **访问保护**：公网密码登录连续失败 5 次后冷却 10 分钟；单次文件附件上传请求上限为 25 MB。
+- **按回复创建分支（Fork）**：使用官方 `thread/fork`，保留截至所选轮次的历史；
+  后续轮次正在运行时仍可从历史已结束回复创建分支，只限制目标轮次正在执行。
+  提供创建进度、失败原因和重复点击保护，新分支无需发送消息即可出现在会话列表中。
+- **目标与失败重试**：接入官方 `thread/goal/*`，同步目标状态；对可重试的临时故障提供倒计时和手动立即重试。
+- **移动端阅读**：思考、进度说明和命令过程默认折叠，最终回复单独展示；
+  到达历史顶部时自动加载更早消息，右侧提示词导航支持手机先预览再跳转。
+- **Android 客户端**：保存多个内网、公网或 Tailscale 地址，启动时探测并选择响应最快的可达地址；
+  连接失败后可打开配置修改地址。App 专用本地对话缓存加快首次显示，服务器仍是最新状态来源。
+- **终端与文件**：在主机项目目录运行交互式终端，浏览、编辑文件及导入导出项目。
+- **星桥公网访问**：首次设置网页密码后，输入管理员发放的激活码，自动绑定设备并配置 FRPC；
+  支持分配 HTTPS 地址、续费、重启连接和停止公网访问。
+- **访问保护**：首次打开网页可设置密码或选择仅局域网模式；密码登录连续失败 5 次后冷却 10 分钟。
+  单次文件附件上传请求体上限为 25 MiB。
 - **兼容原有功能**：保留上游的项目管理、Skills、文件浏览、导入导出、Telegram 和隧道能力；
-  账号刷新所需的临时隔离 app-server 仍然保留。
+  账号刷新所需的临时隔离 app-server 仍然保留。已移除未使用的 Composio SDK、Firebase
+  登录依赖和旧的无关展示页，GitHub Device Login 及调用外部 CLI 的 Composio 功能仍保留。
 
-## Linux 一键安装（推荐）
+## 当前功能与使用入口
 
-Linux 用户不需要安装 pnpm、拉取源码或手动创建 systemd 服务。发布版本提供
-安装脚本和预构建运行包，脚本只安装 Codex Remote 自身，并继续使用本机已经配置
-好的官方 Codex CLI、`CODEX_HOME` 和 app-server socket。
+| 功能 | 使用方式与边界 |
+| --- | --- |
+| 对话与任务状态 | 侧栏显示活动状态；任务中心区分 `queued`、`starting`、`running`、`waiting_approval`、`waiting_user_input`、`steering`、`completed`、`failed`、`canceled`。 |
+| 发送 / 引导 / 停止 | 普通发送在已有任务执行时默认排队；显式引导调用 `turn/steer`，停止调用 `turn/interrupt`。审批和输入请求通过对应卡片处理。 |
+| 从回复 Fork | 点击助手回复下方的双箭头；历史已完成、失败或中断轮次可以创建分支，正在执行的目标轮次不可用。原线程继续运行。 |
+| 目标模式 | 在输入框 `+` 菜单打开 Goal，保存、编辑、暂停/恢复或清除目标；需要官方服务支持目标接口。 |
+| 临时故障重试 | 网页提交的请求遇到可恢复故障时显示重试倒计时和立即重试按钮；不对所有错误或其他客户端请求盲目重放。 |
+| 对话内跳转 | 右侧竖排短线对应已加载的用户提示词；桌面悬停预览、点击跳转，手机点击先预览，再点标记或预览卡片跳转。 |
+| 更早历史 | 手机滚动到顶部自动加载；已有缓存优先展开。大型对话分批读取，未加载的历史不会一次性全部渲染。 |
+| Android 缓存 | 仅 App 启用 IndexedDB 快照，最多 20 个线程、每线程 200 条消息；按服务器 origin 隔离，在设置中可清除。不是完整离线运行模式。 |
+| 项目终端 | 线程页顶部终端入口或 `Ctrl+J` / `Cmd+J`，支持 PTY、多标签和项目快捷命令；命令执行在 Codex 主机上，需要 `node-pty` 可用。 |
+| 项目与文件 | 选择已有目录、新建或导入项目，浏览/编辑主机文件，导入导出包含对话历史的项目 ZIP。 |
+| 远程连接 | 局域网直接访问；Tailscale 私网访问；星桥经 FRP + HTTPS 公网访问。多地址择优连接不等于把多台主机的线程汇总到一个页面。 |
+
+### 当前架构
+
+```text
+浏览器 / Android App
+    ├── 局域网地址
+    ├── Tailscale 地址 / Serve HTTPS
+    └── 星桥公网 HTTPS → 中转服务器 → 本机 FRPC
+                                  ↓
+                    Linux：codexapp :5900
+                                  ↓
+                    官方 codex app-server proxy
+                                  ↓
+                    官方 app-server 共享 socket
+                                  ↑
+                    Windows Codex Desktop 经 SSH 连接
+```
+
+关闭 Windows Desktop 不等于停止主机上的官方 app-server；各客户端的同步以连接到
+同一官方服务为前提。星桥管理员后台和公网 FRPS/Caddy 属于独立部署，当前仓库包含用户端接入能力。
+
+## Linux 一键安装脚本（需要发布包）
+
+仓库提供安装脚本及 Linux 运行包构建流程。使用预构建包时不需要 pnpm 或手动创建
+systemd 服务；仍需要预先安装 Node.js 和能正常使用的官方 Codex CLI。
+脚本只安装 Codex Remote 自身，并使用本机的 `CODEX_HOME` 和官方 app-server socket。
+
+先在 [Releases](https://github.com/scouthe/codex-mobile-remote/releases) 中确认目标版本有
+`codexapp-linux-amd64.tar.gz`（或对应架构包）和 `SHA256SUMS`；如果只有 APK，
+请使用下面的源码部署方式。脚本存在不代表最新 Release 已上传 Linux 运行包。
 
 先下载脚本并检查内容，再执行：
 
 ```bash
-curl -fsSL https://github.com/scouthe/codex-mobile-remote/releases/latest/download/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/scouthe/codex-mobile-remote/main/install.sh -o install.sh
 less install.sh
 bash install.sh
 ```
 
 安装脚本会检查 Linux 架构、Node.js 18+ 和官方 `codex` 命令，安装到
-`~/.local/share/codexapp`，创建用户级 `codexapp-5900.service` 并输出局域网地址。
-它不会修改 `~/.codex/auth.json`、`config.toml`、项目记录或官方 app-server。
+`~/.local/share/codexapp`；用户级 systemd 可用时创建 `codexapp-5900.service`，
+否则回退为后台进程，并输出局域网地址。后台进程回退不提供 systemd 自动重启保障。
+它不会修改 `~/.codex/auth.json`、`config.toml`、项目记录或官方 Codex 安装。
+运行时仍会按需引导尚未启动的官方 app-server。默认关闭 Cloudflare 自动隧道。
 
 首次打开网页时完成访问密码设置，然后进入“设置 → 星桥”输入管理员发放的激活码，
 即可由现有 StarBridge 流程配置 FRPC 并获得公网访问地址。公网使用必须设置网页
 访问密码；不设置密码时只能用于受信任的局域网环境。
+
+指定有 Linux 运行包的 Release 标签时，可使用：
+
+```bash
+CODEXAPP_VERSION="vX.Y.Z" bash install.sh
+```
+
+将 `vX.Y.Z` 替换为实际有对应 Linux 运行包的标签。
 
 离线安装时，将对应架构的发布包放在本机：
 
@@ -64,11 +125,15 @@ CODEXAPP_ARCHIVE="$PWD/codexapp-linux-amd64.tar.gz" bash install.sh
 离线包也可以通过 `CODEXAPP_SHA256=<sha256>` 做强校验；发布包对应的校验值位于
 同一 Release 的 `SHA256SUMS` 文件中。
 
-默认端口和安装目录可以调整：
+默认端口和安装目录可以调整，例如局域网测试：
 
 ```bash
 CODEXAPP_PORT=5910 CODEXAPP_INSTALL_ROOT="$HOME/.local/share/codexapp-test" bash install.sh
 ```
+
+星桥当前下发并校验 `localPort=5900`，需要公网激活时请保持默认 5900。
+安装器的 service 名固定为 `codexapp-5900.service`；在已有部署旁测试时设置
+`CODEXAPP_SKIP_SERVICE=1`，避免覆盖已使用的 unit。
 
 网络受限时，可以把 `CODEXAPP_RELEASE_BASE_URL` 指向管理员提供的 HTTPS 发布镜像；
 安装脚本仍会优先校验发布包的 `SHA256SUMS`：
@@ -87,8 +152,8 @@ CODEXAPP_RELEASE_BASE_URL="https://mirror.example/releases" bash install.sh
 
 需要准备：
 
-- Linux、macOS 或 Windows；
-- Node.js 18 或更高版本；
+- Linux 主机，使用官方 app-server Unix socket；
+- Node.js 18 或更高版本，推荐 Node.js 22；
 - `pnpm` 10；
 - 已安装并能正常运行的官方 Codex CLI。
 
@@ -123,21 +188,22 @@ pnpm install
 pnpm run build
 ```
 
-更新已有部署时，使用：
+更新已有源码部署时，在工作区干净的前提下使用：
 
 ```bash
 git pull --ff-only
 pnpm install
 pnpm run build
+systemctl --user restart codexapp-5900.service
 ```
 
 ### 3. 启动本地服务
 
-首次启动建议不要传 `--password` 或 `--no-password`，让网页端完成访问方式
-设置：
+先在终端验证服务能正常启动，不传 `--password` 或 `--no-password`，让网页端完成访问方式
+设置；已有 Codex 登录或 provider 配置时使用 `--no-login` 跳过自动登录引导：
 
 ```bash
-node dist-cli/index.js --no-tunnel --port 5900
+node dist-cli/index.js --no-login --no-tunnel --no-open --port 5900
 ```
 
 打开终端中显示的地址，通常是：
@@ -146,6 +212,9 @@ node dist-cli/index.js --no-tunnel --port 5900
 本机：      http://127.0.0.1:5900
 局域网：    http://<这台电脑的局域网 IP>:5900
 ```
+
+服务默认监听 `0.0.0.0:5900`，因此可通过本机、局域网和 Tailscale IP 访问。
+这条前台命令适合检查启动情况；长期运行请使用第 5 步的 systemd，避免依赖 SSH 或工具终端。
 
 首次打开时可以选择：
 
@@ -164,13 +233,21 @@ node dist-cli/index.js --no-tunnel --port 5900
 curl -fsS http://127.0.0.1:5900/codex-api/app-server/status
 ```
 
-正常响应应包含：
+响应结构如下（`running` 和 `generation` 随连接状态变化）：
 
 ```json
 {
-  "mode": "shared-proxy"
+  "data": {
+    "mode": "shared-proxy",
+    "running": false,
+    "socketAvailable": true
+  },
+  "generation": 0
 }
 ```
+
+`data.running` 表示 codexapp 的官方 proxy 子进程是否已启动；首次 RPC 前可以为 `false`，
+它不是官方服务是否存活的直接标志。确认模式、socket 可用性，并用实际请求验证连接。
 
 默认 socket 是：
 
@@ -193,7 +270,8 @@ node dist-cli/index.js \
 
 ### 5. 让服务在后台常驻（Linux）
 
-源码构建完成后，可以安装仓库提供的用户级 systemd 示例：
+结束第 3 步的前台检查进程（`Ctrl+C`）后，再安装仓库提供的用户级 systemd 示例，
+避免两个进程争用 5900：
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -207,6 +285,24 @@ install -m 0644 deploy/systemd/codexapp-5900.service \
 - `ExecStart` 使用的 Node.js 是否是本机实际路径；
 - `CODEX_HOME` 是否和官方 Codex CLI 使用的目录一致；
 - 示例不带 `--no-password`；首次打开页面时选择设置密码或仅局域网使用。
+
+长期部署建议添加自动恢复配置：
+
+```bash
+systemctl --user edit codexapp-5900.service
+```
+
+在打开的编辑器中写入：
+
+```ini
+[Service]
+Restart=always
+RestartSec=2
+```
+
+仓库示例及安装器当前使用 `Restart=on-failure`；上述本机 override 改为 `always`，
+可以覆盖程序收到信号后以退出码 0 正常退出的情况。执行 `systemctl --user stop`
+仍会保持停止，不会被自动拉起。
 
 然后启动：
 
@@ -223,10 +319,17 @@ journalctl --user -u codexapp-5900.service -f
 systemctl --user restart codexapp-5900.service
 ```
 
-如果希望退出 SSH 后服务仍然运行，可以为用户会话开启 linger：
+为用户开启 linger，使服务可在开机后、未登录或退出 SSH 时继续运行：
 
 ```bash
 sudo loginctl enable-linger "$USER"
+```
+
+部署后确认 `systemctl --user status` 显示 `active (running)`，并检查首页和认证设置：
+
+```bash
+curl -I http://127.0.0.1:5900/
+curl -fsS http://127.0.0.1:5900/auth/status
 ```
 
 ### 6. 配置手机或其他客户端
@@ -243,6 +346,8 @@ Android 原生客户端需要填写完整的 `codexapp` 地址，例如：
 http://192.168.1.148:5900
 ```
 
+使用私网 HTTP 地址时，需要在 App 中允许未加密 HTTP；公网连接使用 HTTPS。
+
 如果使用 Tailscale，请先让手机和 Linux 主机加入同一个 tailnet，再按照
 [Tailscale Serve 部署教程](#tailscale-serve-deployment-private-remote-access)
 发布 `5900`。如果使用星桥公网中转，在网页 Settings → StarBridge 中输入
@@ -256,11 +361,28 @@ http://192.168.1.148:5900
 ss -ltnp | rg ':5900'
 ```
 
-停止旧的 systemd 实例后再启动：
+如果已经由 systemd 托管，更新后直接重启，不要再另开一个 `node` 或 `nohup` 进程：
+
+```bash
+systemctl --user restart codexapp-5900.service
+```
+
+只有切回前台调试时才停止 systemd：
 
 ```bash
 systemctl --user stop codexapp-5900.service
 ```
+
+`5900` 连接被拒绝时检查服务和日志：
+
+```bash
+systemctl --user status codexapp-5900.service --no-pager
+journalctl --user -u codexapp-5900.service -n 80 --no-pager
+ss -ltnp | rg ':5900'
+```
+
+如果 `MainPID=0`、服务为 `inactive`，使用 `systemctl --user start codexapp-5900.service`
+恢复。代码更新、服务重启和官方 app-server 重启是不同操作；仅更新网页功能一般只需重启 5900。
 
 页面提示前端资源缺失：
 
@@ -285,7 +407,7 @@ app-server socket。不要再额外启动一个独立的 app-server，否则会�
 ```bash
 pnpm install
 pnpm run build
-node dist-cli/index.js --no-tunnel --port 5900
+node dist-cli/index.js --no-login --no-tunnel --no-open --port 5900
 ```
 
 默认情况下不需要手动查找或填写 app-server socket。只要官方 Codex CLI 和登录配置正常，
@@ -313,29 +435,40 @@ You run one command. It starts a local web server. You open it from your machine
 ---
 
 ## ⚡ Quick Start
-> **The main event.**
+
+Use this repository's source checkout for the current fork features:
 
 ```bash
-# 🔓 Start the shared web bridge (uses the official socket by default)
-npx codexapp --no-tunnel --port 5900
+git clone https://github.com/scouthe/codex-mobile-remote.git
+cd codex-mobile-remote
+pnpm install
+pnpm run build
+node dist-cli/index.js --no-login --no-tunnel --no-open --port 5900
 
 # 🌐 Then open in browser
 # http://localhost:5900
 ```
 
-By default, `codexapp` now also starts:
+The service binds to `0.0.0.0:5900`. Configure the web password on first access,
+then use systemd for persistent Linux deployments. The public npm package
+`codexapp` belongs to the upstream distribution; `npx codexapp` does not install
+this repository's current `main`.
+
+Cloudflare Tunnel is a retained optional integration. The CLI's legacy auto
+mode tries to enable it when a Tailscale IP is detected. The installer, systemd
+example, and recommended commands use `--no-tunnel` explicitly. To opt in:
 
 ```bash
-cloudflared tunnel --url http://localhost:<port>
+node dist-cli/index.js --tunnel --port 5900
 ```
 
-It prints the tunnel URL, terminal QR code, and password together in startup output.  
-Use `--no-tunnel` to disable this behavior.
+When available, cloudflared forwards to the local web port and prints the tunnel
+URL and QR code. This is separate from Tailscale Serve and StarBridge.
 
 If you are using a provider or AI gateway that is already authenticated and do not want `codexapp` to force `codex login` during startup, use:
 
 ```bash
-npx codexapp --no-login
+node dist-cli/index.js --no-login --no-tunnel --port 5900
 ```
 
 ### Use the official Codex app-server (required)
@@ -346,7 +479,7 @@ command, so Desktop and the web UI share provider configuration, permissions,
 conversation state, and task events:
 
 ```bash
-npx codexapp --no-tunnel --port 5900
+node dist-cli/index.js --no-login --no-tunnel --port 5900
 ```
 
 The official app-server socket is used directly. If it is not running yet,
@@ -355,7 +488,8 @@ waits for the standard socket, and then connects through the official proxy.
 You can use the equivalent CLI option to point at a non-default socket:
 
 ```bash
-npx codexapp --app-server-socket "$HOME/.codex/app-server-control/app-server-control.sock"
+node dist-cli/index.js --no-login --no-tunnel \
+  --app-server-socket "${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
 ```
 
 By default codexapp uses `$CODEX_HOME/app-server-control/app-server-control.sock`
@@ -371,7 +505,8 @@ codexapp reconnects through the proxy. Check the active mode with:
 curl http://127.0.0.1:5900/codex-api/app-server/status
 ```
 
-The response reports `mode: "shared-proxy"`. Do not change the Windows Desktop
+The response reports `data.mode: "shared-proxy"`; `data.running` describes the
+bridge's proxy child, not a standalone app-server. Do not change the Windows Desktop
 connection or the official app-server startup command.
 
 ### Keep the web service running (Linux)
@@ -389,16 +524,21 @@ systemctl --user enable --now codexapp-5900.service
 
 The unit expects this checkout at `~/common/codex-mobile-remote` and Node.js
 22.22.1 under `~/.nvm`; adjust `WorkingDirectory`, `ExecStart`, and `PATH` if
-your local paths differ. Check or restart it with:
+your local paths differ. See [the source deployment guide](#5-让服务在后台常驻linux)
+for a `Restart=always` override and login linger. Check or restart it with:
 
 ```bash
 systemctl --user status codexapp-5900.service
 systemctl --user restart codexapp-5900.service
 ```
 
-All launch examples below use the official app-server socket described above.
-The only automatic child process is the official Codex app-server itself; the
-web bridge always connects through `codex app-server proxy`.
+The main bridge always connects through `codex app-server proxy`; it bootstraps
+the official shared service only when needed. Account refresh can still use an
+isolated temporary app-server. Optional terminals and relay services create
+their own subprocesses.
+
+The following platform commands describe the upstream npm package, not the
+recommended installation route for this fork:
 
 ### Linux 🐧
 ```bash
@@ -441,9 +581,24 @@ existing web UI and shared-observer protocol, so it can display the same project
 conversation history, task progress, queue, approvals, and user-input requests.
 
 The remote client does not install Termux, Node.js, Codex CLI, or a second
-app-server on the phone. It supports a saved HTTPS/Tailscale endpoint, secure
-credential storage, reconnect after network changes, native notifications, file
-picker, share-sheet intake, clipboard, and Android back navigation.
+app-server on the phone. It saves multiple LAN, public HTTPS, and Tailscale
+addresses, probes them on launch, and selects the fastest reachable endpoint.
+Connection settings remain accessible after a failed connection so addresses
+can be selected, added, or corrected. It also provides encrypted credential
+storage, reconnect after network changes, native notifications, file picker,
+share-sheet intake, clipboard, and Android back navigation.
+
+App-only conversation snapshots are cached in IndexedDB by server origin,
+bounded to 20 threads and 200 messages per thread. Cached content appears first,
+then the server revision is checked. Ordinary browsers do not enable this
+conversation snapshot cache. Clear it from **Settings → Clear App conversation
+cache** without deleting connection profiles.
+
+Use the connection settings button in the top toolbar to manage addresses.
+Updating the Vue conversation UI or cache logic requires rebuilding the host's
+web assets and refreshing/reopening the App; changes to Kotlin/native connection
+handling require installing a new APK. See [Releases](https://github.com/scouthe/codex-mobile-remote/releases)
+for published APKs; an older APK does not necessarily contain the newest native features.
 
 Build a debug APK from the repository root:
 
@@ -553,7 +708,7 @@ Confirm that the bridge is attached to the official shared app-server:
 curl -fsS http://127.0.0.1:5900/codex-api/app-server/status
 ```
 
-The response should report `mode: "shared-proxy"` and a usable configured
+The response should report `data.mode: "shared-proxy"` and a usable configured
 socket. If the official app-server is not running, codexapp can bootstrap the
 official process when the first request arrives; it never starts a separate
 standalone replacement server.
@@ -604,16 +759,16 @@ cd android
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Open **Codex Remote**, enter the complete `https://...ts.net` URL, and tap
-**Connect**. The APK stores the endpoint and optional codexapp password for
+Open **Codex Remote**, save the complete `https://...ts.net` URL, and tap
+**Connect fastest** (or select an address manually). The APK stores addresses and optional codexapp passwords for
 future launches, reconnects after Wi-Fi/Tailscale changes, and keeps Codex
 execution on the computer. It does not install Codex CLI or another
 app-server on Android.
 
-If the server was started with `--no-password` (as in the included private
-systemd unit), leave the password field empty. That option is appropriate only
-when the Tailscale tailnet is trusted; never combine it with a public Funnel or
-an unauthenticated public reverse proxy.
+The included systemd unit preserves first-run password setup and does not use
+`--no-password`. Enter the codexapp password if configured, or leave the App's
+password field empty and sign in through the page. Tailscale connectivity and
+the codexapp web password are separate controls.
 
 ### 5. iPhone / iPad Safari
 
@@ -631,7 +786,7 @@ tailscale serve status
 
 # Local bridge and official app-server health
 curl -fsS http://127.0.0.1:5900/codex-api/app-server/status
-curl -fsS https://<machine>.<your-tailnet>.ts.net/codex-api/app-server/status
+curl -fsS "https://<machine>.<your-tailnet>.ts.net/codex-api/app-server/status"
 ```
 
 - If the local URL works but the HTTPS URL does not, check that both devices
@@ -639,17 +794,17 @@ curl -fsS https://<machine>.<your-tailnet>.ts.net/codex-api/app-server/status
 - If the page loads but Codex requests fail, check the local status response,
   the official socket path, and `journalctl --user -u codexapp-5900.service`.
 - If Android asks for a password, that is the codexapp authentication layer,
-  not a Tailscale password. Supply the server password or use the documented
-  trusted-tailnet configuration.
+  not a Tailscale password. Supply the password chosen during first-run web
+  setup; it can also be changed in web Settings.
 
 ---
 
 ## ✨ Features
 > **The payload.**
 
-- 🚀 One-command launch with `npx codexapp`
+- 🚀 Source deployment and a Linux installer for published runtime archives
 - 🌍 Cross-platform support for Linux, Windows, and Termux on Android
-- 🖥️ Browser-first Codex UI flow on `http://localhost:18923`
+- 🖥️ Browser-first Codex UI on `http://localhost:5900`
 - 🌐 LAN-friendly access from other devices on the same network
 - 🧪 Remote/headless-friendly setup for server-based Codex usage
 - 🔌 Works with reverse proxies and tunneling setups
@@ -669,7 +824,7 @@ Set these environment variables before starting `codexapp`:
 export TELEGRAM_BOT_TOKEN="<your-telegram-bot-token>"
 export TELEGRAM_ALLOWED_USER_IDS="<your-telegram-user-id>,<optional-second-id>"
 export TELEGRAM_DEFAULT_CWD="$PWD" # optional, defaults to current working directory
-npx codexapp
+node dist-cli/index.js --no-login --no-tunnel --port 5900
 ```
 
 `TELEGRAM_ALLOWED_USER_IDS` is required for safe access. Only allowlisted Telegram user IDs can use the bridge. If no allowed user IDs are configured, incoming Telegram messages are rejected.
@@ -696,20 +851,16 @@ Outgoing assistant messages are sent with Telegram `parse_mode=HTML` for formatt
 
 ---
 
-## 🧩 Recent Product Features (from main commits)
-> **Not just launch. Actual UX upgrades.**
+## Current conversation workflow
 
-- 🗂️ Searchable project picker in new-thread flow
-- ➕ "Create Project" button next to "Select folder" with browser prompt
-- 📌 New projects get pinned to top automatically
-- 🧠 Smart default new-project name suggestion via server-side free-directory scan (`New Project (N)`)
-- 🔄 Project order persisted globally to workspace roots state
-- 🧵 Optimistic in-progress threads preserved during refresh/poll cycles
-- 📱 Mobile drawer sidebar in desktop layout (teleported overlay + swipe-friendly structure)
-- 🎛️ Skills Hub mobile-friendly spacing/toolbar layout improvements
-- 🪟 Skill detail modal tuned for mobile sheet-style behavior
-- 🧪 Skills Hub event typing fix for `SkillCard` select emit compatibility
-- 🎙️ Voice dictation flow in composer (`hold to dictate` -> transcribe -> append text)
+- Share the official app-server with Codex Desktop, including web-created threads and their names.
+- Queue ordinary messages during active work; use separate steer and interrupt actions.
+- Fork through a historical completed reply while a later turn runs, with creation feedback and duplicate-click protection.
+- Fold commentary and command details beneath a per-turn process summary while keeping final answers visible.
+- Jump between loaded prompts using the vertical rail; touch devices preview before jumping.
+- Automatically load older messages on mobile and restore bounded App-only conversation snapshots.
+- Manage goals through the official Goal API when supported, and retry eligible transient failures from the web client.
+- Keep the service under user systemd, and access it through LAN, Tailscale, or the activated StarBridge relay.
 
 ---
 
@@ -724,7 +875,7 @@ Outgoing assistant messages are sent with Telegram `parse_mode=HTML` for formatt
 | 🌐 LAN sharing | Open UI from another device on same network |
 | 🧰 Headless workflows | Keep terminal + browser split for productivity |
 | 🔌 Custom routing | Put behind reverse proxy/tunnel if needed |
-| ⚡ Fast experiments | `npx` run without full global setup |
+| ⚡ Fast experiments | Build this checkout and run `node dist-cli/index.js` |
 
 ---
 
@@ -782,6 +933,30 @@ on the Ubuntu host. codexapp does not replace or reconfigure the Desktop client.
 | `npx` fails | Update npm/node, then retry |
 | Termux install fails | `pkg update && pkg upgrade` then reinstall `nodejs` |
 | Can’t open from other device | Check firewall, bind address, and LAN routing |
+
+## 验证与发布
+
+验证源码构建和单元测试：
+
+```bash
+pnpm run test:unit
+pnpm run build
+```
+
+分功能的手动验收记录见 [tests.md](./tests.md) 和 [tests/](./tests/)。
+
+GitHub Actions 当前仅手动触发。`Build Linux installer` 构建运行包，填写
+`release_tag` 时发布到 Release；不填写时只生成 Actions artifact。`Build Android remote client`
+构建 APK artifact，在 `main` 上执行不会自动创建 APK Release。
+
+维护者也可以在 Linux 本机构建离线运行包：
+
+```bash
+scripts/build-linux-release.sh release
+```
+
+输出包含对应架构的 `codexapp-linux-*.tar.gz` 和 `SHA256SUMS`。
+修改 Web 前端和桥接逻辑后需要重新构建主机资源；仅修改 README 不需要重启 5900。
 
 ---
 
