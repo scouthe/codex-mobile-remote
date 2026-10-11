@@ -52,6 +52,23 @@ async function upload(endpoint: string, chunks: Buffer[], chunked = false): Prom
 }
 
 describe('local file upload limit', () => {
+  it('allows extensionless mobile images to be uploaded and previewed', async () => {
+    const endpoint = await listen()
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5KsAAAAASUVORK5CYII=', 'base64')
+    const payload = Buffer.concat([
+      Buffer.from('--test-boundary\r\nContent-Disposition: form-data; name="file"; filename="1000002551"\r\nContent-Type: image/png\r\n\r\n'),
+      png, Buffer.from('\r\n--test-boundary--\r\n'),
+    ])
+    const response = await upload(endpoint, [payload])
+    expect(response.status).toBe(200)
+    const filePath = (JSON.parse(response.body) as { path: string }).path
+    uploadDirectories.push(dirname(filePath))
+    expect(await readFile(filePath)).toEqual(png)
+    const preview = await fetch(`${endpoint}/codex-local-image?path=${encodeURIComponent(filePath)}`)
+    expect(preview.status).toBe(200)
+    expect(preview.headers.get('content-type')).toContain('image/png')
+  })
+
   it('keeps ordinary multipart uploads working', async () => {
     const endpoint = await listen()
     const payload = Buffer.from('--test-boundary\r\nContent-Disposition: form-data; name="file"; filename="sample.txt"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--test-boundary--\r\n')

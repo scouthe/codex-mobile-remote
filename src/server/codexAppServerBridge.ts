@@ -7712,6 +7712,11 @@ function handleFileUpload(req: IncomingMessage, res: ServerResponse): void {
         break
       }
       if (!fileData) { setJson(res, 400, { error: 'No file in request' }); return }
+      // Android document providers can supply a numeric/extensionless name.
+      // Preview and localImage resolution require a supported image suffix.
+      const imageMime = inferImageMimeTypeFromBytes(fileData)
+      const imageExtension = imageMime ? extensionFromMimeType(imageMime) : ''
+      if (imageExtension && !/\.(?:png|jpe?g|gif|webp|avif|bmp|svg)$/iu.test(fileName)) fileName += imageExtension
       const uploadDir = join(tmpdir(), 'codex-web-uploads')
       await mkdir(uploadDir, { recursive: true })
       const destDir = await mkdtemp(join(uploadDir, 'f-'))

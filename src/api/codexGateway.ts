@@ -4378,7 +4378,8 @@ export async function removeComposerPrompt(path: string): Promise<boolean> {
 
 const FILE_UPLOAD_TIMEOUT_MS = 60_000
 
-export async function uploadFile(file: File): Promise<string | null> {
+export async function uploadFile(file: File): Promise<string> {
+  if (file.size >= 25 * 1024 * 1024) throw new Error('File is too large (maximum 25 MiB).')
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), FILE_UPLOAD_TIMEOUT_MS)
   try {
@@ -4389,11 +4390,18 @@ export async function uploadFile(file: File): Promise<string | null> {
       body: form,
       signal: controller.signal,
     })
-    if (!resp.ok) return null
-    const data = (await resp.json()) as { path?: string }
-    return data.path ?? null
-  } catch {
-    return null
+    if (resp.status === 413) throw new Error('File is too large (maximum 25 MiB).')
+    if (resp.status === 401 || resp.headers.get('content-type')?.includes('text/html')) {
+      throw new Error('Sign in again before uploading files.')
+    }
+    const data = await resp.json().catch(() => null) as { path?: unknown; error?: unknown } | null
+    if (!resp.ok) throw new Error(typeof data?.error === 'string' ? data.error : 'Upload failed. Please try again.')
+    if (typeof data?.path !== 'string' || !data.path.trim()) throw new Error('Upload returned an invalid response. Please try again.')
+    return data.path
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('Upload timed out. Check the connection and try again.')
+    if (error instanceof TypeError) throw new Error('Upload failed. Check the connection and try again.')
+    throw error
   } finally {
     clearTimeout(timeoutId)
   }

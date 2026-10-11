@@ -1,6 +1,11 @@
 @import "tailwindcss";
 @import "highlight.js/styles/github-dark.css";
 
+.thread-composer-attachment-status { margin: 0 0 8px; padding: 6px 10px; font-size: 13px; color: #475569; overflow-wrap: anywhere; }
+.thread-composer-attachment-status.has-error { color: #b91c1c; }
+:root.dark .thread-composer-attachment-status { color: #cbd5e1; }
+:root.dark .thread-composer-attachment-status.has-error { color: #fca5a5; }
+
 :root.dark {
   color-scheme: dark;
 }

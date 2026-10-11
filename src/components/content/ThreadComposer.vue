@@ -1,5 +1,9 @@
 <template>
   <form class="thread-composer" @submit.prevent="onSubmit(isTurnInProgress ? activeInProgressMode : 'steer')">
+    <p v-if="attachmentFeedbackText || attachmentErrorText" class="thread-composer-attachment-status" :class="{ 'has-error': attachmentBatchStats?.failed || attachmentErrorText }" role="status" aria-live="polite">
+      {{ attachmentFeedbackText }}
+      <span v-if="attachmentErrorText"> {{ attachmentErrorText }}</span>
+    </p>
     <p v-if="dictationErrorText" class="thread-composer-dictation-error">
       {{ dictationErrorText }}
     </p>
@@ -27,7 +31,7 @@
     >
       <div v-if="selectedImages.length > 0" class="thread-composer-attachments">
         <div v-for="image in selectedImages" :key="image.id" class="thread-composer-attachment">
-          <img class="thread-composer-attachment-image" :src="image.url" :alt="image.name || 'Selected image'" />
+          <img class="thread-composer-attachment-image" :src="image.url" :alt="image.name || 'Selected image'" @error="onSelectedImageError(image.id)" />
           <button
             class="thread-composer-attachment-remove"
             type="button"
@@ -577,6 +581,7 @@ const folderUploadGroups = ref<FolderUploadGroup[]>([])
 const dictationFeedback = ref('')
 const pendingAttachmentCount = ref(0)
 const attachmentBatchStats = ref<AttachmentBatchStats | null>(null)
+const attachmentErrorText = ref('')
 const isDragActive = ref(false)
 const {
   state: dictationState,
@@ -1047,6 +1052,7 @@ function replaceDraftState(payload: ComposerDraftPayload): void {
   folderUploadGroups.value = []
   dictationFeedback.value = ''
   attachmentBatchStats.value = null
+  attachmentErrorText.value = ''
   pendingAttachmentCount.value = 0
   isAttachMenuOpen.value = false
   closeFileMention()
@@ -1324,6 +1330,7 @@ function beginAttachmentBatch(total: number): void {
   const current = attachmentBatchStats.value
   const completed = current ? current.succeeded + current.failed : 0
   if (!current || completed >= current.total) {
+    attachmentErrorText.value = ''
     attachmentBatchStats.value = { total, succeeded: 0, failed: 0 }
     return
   }
@@ -1345,6 +1352,11 @@ function recordAttachmentBatchResult(result: 'success' | 'failure'): void {
 
 function createAttachmentId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function onSelectedImageError(imageId: string): void {
+  if (!selectedImages.value.some((image) => image.id === imageId)) return
+  attachmentErrorText.value = t('Image uploaded, but preview failed. Try a PNG, JPEG or WebP image.')
 }
 
 function createPastedImageName(file: File): string {
@@ -1403,8 +1415,9 @@ async function attachImageFile(file: File, sessionToken: number): Promise<void> 
       },
     ]
     recordAttachmentBatchResult('success')
-  } catch {
+  } catch (error) {
     if (sessionToken === attachmentSessionToken) {
+      attachmentErrorText.value = t(error instanceof Error ? error.message : 'Upload failed. Please try again.')
       recordAttachmentBatchResult('failure')
     }
   } finally {
@@ -1421,10 +1434,15 @@ async function attachUploadedFile(file: File, sessionToken: number): Promise<voi
       recordAttachmentBatchResult('failure')
       return
     }
-    addFileAttachment(serverPath)
+    if (/\.(?:png|jpe?g|gif|webp|avif|bmp|svg)$/iu.test(serverPath)) {
+      selectedImages.value = [...selectedImages.value, { id: createAttachmentId(), name: file.name, url: `/codex-local-image?path=${encodeURIComponent(serverPath)}` }]
+    } else {
+      addFileAttachment(serverPath)
+    }
     recordAttachmentBatchResult('success')
-  } catch {
+  } catch (error) {
     if (sessionToken === attachmentSessionToken) {
+      attachmentErrorText.value = t(error instanceof Error ? error.message : 'Upload failed. Please try again.')
       recordAttachmentBatchResult('failure')
     }
   } finally {

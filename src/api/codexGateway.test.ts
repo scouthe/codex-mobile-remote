@@ -13,7 +13,51 @@ import {
   setThreadGoal,
   startThread,
   startThreadTurn,
+  uploadFile,
 } from './codexGateway'
+
+describe('attachment upload feedback', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  })
+
+  const image = () => new File(['image'], 'camera.png', { type: 'image/png' })
+
+  it('returns the saved path for preview and submission', async () => {
+    const fetch = vi.fn(async () => Response.json({ path: '/tmp/uploads/camera.png' }))
+    vi.stubGlobal('fetch', fetch)
+    expect(await uploadFile(image())).toBe('/tmp/uploads/camera.png')
+    expect(fetch.mock.calls).toHaveLength(1)
+  })
+
+  it.each([
+    [413, 'application/json', '{}', 'maximum 25 MiB'],
+    [401, 'application/json', '{}', 'Sign in again'],
+    [200, 'text/html', '<html>login</html>', 'Sign in again'],
+    [500, 'application/json', '{"error":"Disk is full"}', 'Disk is full'],
+    [200, 'application/json', '{}', 'invalid response'],
+  ])('reports HTTP %s instead of silently dropping the attachment', async (status, type, body, expected) => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, { status, headers: { 'Content-Type': type } })))
+    await expect(uploadFile(image())).rejects.toThrow(expected)
+  })
+
+  it('reports connection failures', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+    await expect(uploadFile(image())).rejects.toThrow('Check the connection')
+  })
+
+  it('reports a timeout and cancels the pending upload', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn((_input: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+    })))
+    const assertion = expect(uploadFile(image())).rejects.toThrow('Upload timed out')
+    await vi.advanceTimersByTimeAsync(60_000)
+    await assertion
+    expect(vi.getTimerCount()).toBe(0)
+  })
+})
 
 function mockRpcFetch(): { requests: Array<{ method: string, params: Record<string, unknown> }> } {
   const requests: Array<{ method: string, params: Record<string, unknown> }> = []

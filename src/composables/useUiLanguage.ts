@@ -5,6 +5,13 @@ export type UiLanguage = 'en' | 'zh-CN'
 const UI_LANGUAGE_STORAGE_KEY = 'codex-web-local.ui-language.v1'
 
 const zhCN: Record<string, string> = {
+  'Image uploaded, but preview failed. Try a PNG, JPEG or WebP image.': '图片已上传，但预览失败。请尝试 PNG、JPEG 或 WebP 图片。',
+  'File is too large (maximum 25 MiB).': '文件过大，请选择小于 25 MiB 的文件。',
+  'Sign in again before uploading files.': '登录已失效，请重新登录后上传。',
+  'Upload failed. Please try again.': '上传失败，请重试。',
+  'Upload returned an invalid response. Please try again.': '上传响应异常，请重试。',
+  'Upload timed out. Check the connection and try again.': '上传超时，请检查网络后重试。',
+  'Upload failed. Check the connection and try again.': '上传失败，请检查网络后重试。',
   'English': 'English',
   'Simplified Chinese': '简体中文',
   'Search threads': '搜索线程',
