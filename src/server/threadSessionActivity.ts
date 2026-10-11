@@ -27,12 +27,20 @@ export type ThreadSessionActivity = {
 type CachedActivity = {
   size: number
   mtimeMs: number
+  ctimeMs: number
+  dev: number
+  ino: number
   activity: ThreadSessionActivity
-  /** Start offset for the next append scan. */
+  /** Byte after the last complete JSONL record, not necessarily the EOF. */
   scanOffset: number
+  scanAnchor: Buffer
+  /** False for stale files that were deliberately never scanned. */
+  canScanAppend: boolean
 }
 
 const SESSION_TAIL_BYTES = 4 * 1024 * 1024
+const MAX_CACHED_SESSION_ACTIVITIES = 512
+const APPEND_ANCHOR_BYTES = 64
 // A running Codex task appends to its session log regularly.  Avoid opening
 // hundreds of historical multi-megabyte logs on the first list request while
 // still covering long-running tasks and laptops that sleep overnight.
@@ -80,22 +88,38 @@ function readTimestamp(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-async function readSessionTail(path: string, size: number): Promise<string> {
-  return await readSessionRange(path, Math.max(0, size - SESSION_TAIL_BYTES), size)
-}
-
-async function readSessionRange(path: string, start: number, end: number): Promise<string> {
+async function readSessionRange(path: string, start: number, end: number): Promise<Buffer> {
   const file = await open(path, 'r')
   try {
     const safeStart = Math.max(0, Math.trunc(start))
     const safeEnd = Math.max(safeStart, Math.trunc(end))
     const length = safeEnd - safeStart
-    if (length <= 0) return ''
+    if (length <= 0) return Buffer.alloc(0)
     const buffer = Buffer.allocUnsafe(length)
-    const { bytesRead } = await file.read(buffer, 0, length, safeStart)
-    return buffer.subarray(0, bytesRead).toString('utf8')
+    let totalBytesRead = 0
+    while (totalBytesRead < length) {
+      const { bytesRead } = await file.read(buffer, totalBytesRead, length - totalBytesRead, safeStart + totalBytesRead)
+      if (bytesRead === 0) break
+      totalBytesRead += bytesRead
+    }
+    return buffer.subarray(0, totalBytesRead)
   } finally {
     await file.close()
+  }
+}
+
+function scanCompleteRecords(
+  bytes: Buffer,
+  start: number,
+  contentStart: number,
+  initial?: Omit<ThreadSessionActivity, 'revision'>,
+): Pick<CachedActivity, 'scanOffset' | 'scanAnchor'> & { parsed: Omit<ThreadSessionActivity, 'revision'> } {
+  const completeEnd = bytes.lastIndexOf(0x0a) + 1
+  return {
+    parsed: parseSessionActivity(bytes.subarray(Math.min(contentStart, completeEnd), completeEnd).toString('utf8'), initial),
+    scanOffset: start + completeEnd,
+    // Copy the small anchor so the cache does not retain the full read buffer.
+    scanAnchor: Buffer.from(bytes.subarray(Math.max(0, completeEnd - APPEND_ANCHOR_BYTES), completeEnd)),
   }
 }
 
@@ -182,75 +206,114 @@ function parseSessionActivity(
 
 export class ThreadSessionActivityReader {
   private readonly cache = new Map<string, CachedActivity>()
+  private readonly inFlight = new Map<string, Promise<ThreadSessionActivity>>()
 
-  async read(path: string): Promise<ThreadSessionActivity> {
+  read(path: string): Promise<ThreadSessionActivity> {
     const normalizedPath = path.trim()
-    if (!normalizedPath) return unknownActivity()
+    if (!normalizedPath) return Promise.resolve(unknownActivity())
+    const existing = this.inFlight.get(normalizedPath)
+    if (existing) return existing
 
+    // Coalesce stat as well as file reads, but only while a read is in flight.
+    // A later caller always stats again and observes newly appended records.
+    const pending = this.readCurrent(normalizedPath).finally(() => {
+      if (this.inFlight.get(normalizedPath) === pending) this.inFlight.delete(normalizedPath)
+    })
+    this.inFlight.set(normalizedPath, pending)
+    return pending
+  }
+
+  private remember(path: string, value: CachedActivity): void {
+    this.cache.delete(path)
+    this.cache.set(path, value)
+    while (this.cache.size > MAX_CACHED_SESSION_ACTIVITIES) {
+      const oldestPath = this.cache.keys().next().value
+      if (oldestPath === undefined) break
+      this.cache.delete(oldestPath)
+    }
+  }
+
+  private async readCurrent(normalizedPath: string): Promise<ThreadSessionActivity> {
     try {
       // A stat first avoids opening directories and lets us skip rereading a
       // large session file when the desktop task has not appended anything.
       const metadata = await stat(normalizedPath)
-      if (!metadata.isFile()) return unknownActivity()
-      const metadataRevision = `${Math.max(0, Math.trunc(metadata.size))}:${Math.max(0, Math.trunc(metadata.mtimeMs))}`
-      const cached = this.cache.get(normalizedPath)
-      if (cached && cached.size === metadata.size && cached.mtimeMs === metadata.mtimeMs) {
-        return cached.activity
+      if (!metadata.isFile()) {
+        this.cache.delete(normalizedPath)
+        return unknownActivity()
       }
+      const metadataRevision = `${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}:${metadata.dev}:${metadata.ino}`
+      const cached = this.cache.get(normalizedPath)
       if (metadata.mtimeMs < Date.now() - SESSION_ACTIVITY_SCAN_WINDOW_MS) {
         // An old log can tell us nothing reliable about a currently running
         // process.  Preserve the distinction between unknown and an explicit
         // terminal marker so callers do not clear a fresh app-server status.
         const activity = unknownActivity(`${metadataRevision}:stale`)
-        this.cache.set(normalizedPath, {
+        this.remember(normalizedPath, {
           size: metadata.size,
           mtimeMs: metadata.mtimeMs,
+          ctimeMs: metadata.ctimeMs,
+          dev: metadata.dev,
+          ino: metadata.ino,
           activity,
-          scanOffset: metadata.size,
+          scanOffset: 0,
+          scanAnchor: Buffer.alloc(0),
+          canScanAppend: false,
         })
         return activity
       }
-      let parsed: Omit<ThreadSessionActivity, 'revision'>
+      const sameFile = cached && cached.dev === metadata.dev && cached.ino === metadata.ino
+      if (sameFile && cached.size === metadata.size && cached.mtimeMs === metadata.mtimeMs && cached.ctimeMs === metadata.ctimeMs) {
+        this.remember(normalizedPath, cached)
+        return cached.activity
+      }
+      let scanned: ReturnType<typeof scanCompleteRecords> | undefined
       const canScanAppend = Boolean(
-        cached
-        && metadata.size >= cached.size
+        sameFile
+        && cached.canScanAppend
+        && metadata.size > cached.size
         && metadata.mtimeMs >= cached.mtimeMs
-        && cached.activity.known,
       )
       if (canScanAppend && cached) {
         // Session logs are append-only.  Retain the last known marker state
         // and parse only new bytes; otherwise a verbose task can push its
         // original task_started record out of the tail and look unknown.
-        const delta = parseSessionActivity(await readSessionRange(
-          normalizedPath,
-          Math.max(0, Math.min(cached.scanOffset, metadata.size)),
-          metadata.size,
-        ), cached.activity)
-        parsed = delta
-      } else {
-        parsed = parseSessionActivity(await readSessionTail(normalizedPath, metadata.size))
-        if (!parsed.known) {
-          // The marker can be far from the tail in a long-running session.
-          // This full scan happens only once per file revision; subsequent
-          // appends use the incremental path above.
-          parsed = parseSessionActivity(await readFile(normalizedPath, 'utf8'))
+        const start = cached.scanOffset - cached.scanAnchor.length
+        const bytes = await readSessionRange(normalizedPath, start, metadata.size)
+        if (bytes.subarray(0, cached.scanAnchor.length).equals(cached.scanAnchor)) {
+          scanned = scanCompleteRecords(bytes, start, cached.scanAnchor.length, cached.activity)
         }
       }
+      if (!scanned) {
+        const start = Math.max(0, metadata.size - SESSION_TAIL_BYTES)
+        const bytes = await readSessionRange(normalizedPath, start, metadata.size)
+        // A nonzero tail offset can start inside a record. Discard that first
+        // fragment; a missing marker below triggers one complete scan.
+        scanned = scanCompleteRecords(bytes, start, start > 0 ? bytes.indexOf(0x0a) + 1 : 0)
+        if (!scanned.parsed.known && start > 0) {
+          // Remember a completed scan even when it finds no activity marker.
+          // Later appends then inspect only new bytes, not the entire file.
+          const allBytes = await readFile(normalizedPath)
+          scanned = scanCompleteRecords(allBytes.subarray(0, metadata.size), 0, 0)
+        }
+      }
+      const parsed = scanned.parsed
       const revision = `${metadataRevision}:${parsed.lastEventAt ?? ''}`
       const activity: ThreadSessionActivity = { ...parsed, revision }
-      this.cache.set(normalizedPath, {
+      this.remember(normalizedPath, {
         size: metadata.size,
         mtimeMs: metadata.mtimeMs,
+        ctimeMs: metadata.ctimeMs,
+        dev: metadata.dev,
+        ino: metadata.ino,
         activity,
-        // Session writes are JSONL records and Codex appends complete records
-        // in one write.  Start the next scan exactly at the previous EOF so
-        // old terminal markers cannot overwrite a newer active state.  A
-        // partial final record is ignored and will be recovered by the next
-        // revision read once Codex appends its newline.
-        scanOffset: metadata.size,
+        scanOffset: scanned.scanOffset,
+        scanAnchor: scanned.scanAnchor,
+        canScanAppend: true,
       })
       return activity
     } catch {
+      this.cache.delete(normalizedPath)
       return unknownActivity()
     }
   }
