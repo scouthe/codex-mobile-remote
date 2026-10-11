@@ -6,6 +6,13 @@
 :root.dark .thread-composer-attachment-status { color: #cbd5e1; }
 :root.dark .thread-composer-attachment-status.has-error { color: #fca5a5; }
 
+.message-math-inline { overflow-wrap: normal; }
+.message-math-inline .katex { font-size: 1.08em; }
+.message-math-block { min-width: 0; max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+.message-math-block .katex-display { margin: 0.65em 0; text-align: left; }
+.message-math-block .katex-display > .katex { text-align: left; }
+.message-math-inline .katex, .message-math-block .katex { color: inherit; }
+
 :root.dark {
   color-scheme: dark;
 }

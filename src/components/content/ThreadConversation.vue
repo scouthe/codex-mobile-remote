@@ -369,7 +369,7 @@
                 <div
                   v-else
                   class="message-text-flow"
-                  v-memo="[message.id, message.text, props.cwd, highlightCacheVersion, markdownImageFailureVersion]"
+                  v-memo="[message.id, message.text, props.cwd, highlightCacheVersion, mathCacheVersion, markdownImageFailureVersion]"
                 >
                   <template v-for="(block, blockIndex) in getMessageBlocks(message)" :key="`block-${blockIndex}`">
                     <p v-if="block.kind === 'paragraph'" class="message-text">
@@ -378,6 +378,7 @@
                         <strong v-else-if="segment.kind === 'bold'" class="message-bold-text">{{ segment.value }}</strong>
                         <em v-else-if="segment.kind === 'italic'" class="message-italic-text">{{ segment.value }}</em>
                         <s v-else-if="segment.kind === 'strikethrough'" class="message-strikethrough-text">{{ segment.value }}</s>
+                        <span v-else-if="segment.kind === 'math'" class="message-math-inline" v-html="renderMathHtml(segment)" />
                         <a
                           v-else-if="segment.kind === 'file'"
                           class="message-file-link"
@@ -412,6 +413,7 @@
                         <strong v-else-if="segment.kind === 'bold'" class="message-bold-text">{{ segment.value }}</strong>
                         <em v-else-if="segment.kind === 'italic'" class="message-italic-text">{{ segment.value }}</em>
                         <s v-else-if="segment.kind === 'strikethrough'" class="message-strikethrough-text">{{ segment.value }}</s>
+                        <span v-else-if="segment.kind === 'math'" class="message-math-inline" v-html="renderMathHtml(segment)" />
                         <a
                           v-else-if="segment.kind === 'file'"
                           class="message-file-link"
@@ -441,6 +443,7 @@
                         <strong v-else-if="segment.kind === 'bold'" class="message-bold-text">{{ segment.value }}</strong>
                         <em v-else-if="segment.kind === 'italic'" class="message-italic-text">{{ segment.value }}</em>
                         <s v-else-if="segment.kind === 'strikethrough'" class="message-strikethrough-text">{{ segment.value }}</s>
+                        <span v-else-if="segment.kind === 'math'" class="message-math-inline" v-html="renderMathHtml(segment)" />
                         <a
                           v-else-if="segment.kind === 'file'"
                           class="message-file-link"
@@ -478,6 +481,7 @@
                             <strong v-else-if="segment.kind === 'bold'" class="message-bold-text">{{ segment.value }}</strong>
                             <em v-else-if="segment.kind === 'italic'" class="message-italic-text">{{ segment.value }}</em>
                             <s v-else-if="segment.kind === 'strikethrough'" class="message-strikethrough-text">{{ segment.value }}</s>
+                            <span v-else-if="segment.kind === 'math'" class="message-math-inline" v-html="renderMathHtml(segment)" />
                             <a
                               v-else-if="segment.kind === 'file'"
                               class="message-file-link"
@@ -527,6 +531,7 @@
                                 <strong v-else-if="segment.kind === 'bold'" class="message-bold-text">{{ segment.value }}</strong>
                                 <em v-else-if="segment.kind === 'italic'" class="message-italic-text">{{ segment.value }}</em>
                                 <s v-else-if="segment.kind === 'strikethrough'" class="message-strikethrough-text">{{ segment.value }}</s>
+                                <span v-else-if="segment.kind === 'math'" class="message-math-inline" v-html="renderMathHtml(segment)" />
                                 <a
                                   v-else-if="segment.kind === 'file'"
                                   class="message-file-link"
@@ -565,6 +570,7 @@
                                 <strong v-else-if="segment.kind === 'bold'" class="message-bold-text">{{ segment.value }}</strong>
                                 <em v-else-if="segment.kind === 'italic'" class="message-italic-text">{{ segment.value }}</em>
                                 <s v-else-if="segment.kind === 'strikethrough'" class="message-strikethrough-text">{{ segment.value }}</s>
+                                <span v-else-if="segment.kind === 'math'" class="message-math-inline" v-html="renderMathHtml(segment)" />
                                 <a
                                   v-else-if="segment.kind === 'file'"
                                   class="message-file-link"
@@ -592,6 +598,7 @@
                         </tbody>
                       </table>
                     </div>
+                    <div v-else-if="block.kind === 'math'" class="message-math-block" v-html="renderMathHtml(block)" />
                     <div v-else-if="block.kind === 'codeBlock'" class="message-code-block">
                       <div v-if="block.language" class="message-code-language">{{ block.language }}</div>
                       <pre class="message-code-pre"><code class="hljs" v-html="renderCachedHighlightedCodeAsHtml(block.language, block.value)"></code></pre>
@@ -1017,6 +1024,7 @@ import {
 import { buildTurnProcessPresentation, formatTurnProcessLabel } from '../../task/turnProcessPresentation'
 import { buildConversationTurnKeys, buildEditableConversationTurns } from '../../task/conversationTurnIdentity'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
+import { splitMathSegments, type MathSegment } from '../../utils/mathSegments'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
 import IconTablerArrowUp from '../icons/IconTablerArrowUp.vue'
@@ -1458,7 +1466,9 @@ const CODE_LANGUAGE_ALIASES: Record<string, string> = {
   'c#': 'csharp',
   ps1: 'powershell',
 }
+type MathFormula = Extract<MathSegment, { kind: 'math' }> & { format?: 'bold' | 'italic' | 'strikethrough' }
 type InlineSegment =
+  | MathFormula
   | { kind: 'text'; value: string }
   | { kind: 'bold'; value: string }
   | { kind: 'italic'; value: string }
@@ -1476,6 +1486,7 @@ type ListItem = {
   children?: MessageBlock[]
 }
 type MessageBlock =
+  | Extract<MathSegment, { kind: 'math' }>
   | { kind: 'paragraph'; value: string }
   | { kind: 'heading'; level: number; value: string }
   | { kind: 'blockquote'; value: string }
@@ -1495,6 +1506,10 @@ let conversationScrollPromise: Promise<void> | null = null
 const trackedPendingImages = new WeakSet<HTMLImageElement>()
 const highlightJsModule = ref<HighlightJsModule | null>(null)
 const highlightCacheVersion = ref(0)
+const mathCacheVersion = ref(0)
+let mathRenderer: typeof import('../../utils/mathRenderer').renderMath | null = null
+let mathRendererLoader: Promise<void> | null = null
+let conversationDisposed = false
 const markdownImageFailureVersion = ref(0)
 let highlightJsLoader: Promise<void> | null = null
 const MESSAGE_BLOCK_CACHE_LIMIT = 300
@@ -2872,6 +2887,36 @@ function splitTextByFileUrls(
 }
 
 function parseInlineSegmentsUncached(text: string): InlineSegment[] {
+  const parts = splitMathSegments(text)
+  if (!parts.some((part) => part.kind === 'math')) return parsePlainInlineSegments(text)
+  // Shield LaTeX from Markdown, but let Markdown keep its surrounding emphasis.
+  let prefix = '\uE000math'
+  while (text.includes(prefix)) prefix += '_'
+  const tokens = new Map<string, MathFormula>()
+  const shielded = parts.map((part) => {
+    if (part.kind === 'text') return part.value
+    const token = `${prefix}${tokens.size}\uE001`
+    tokens.set(token, part)
+    return token
+  }).join('')
+  return parsePlainInlineSegments(shielded).flatMap((segment): InlineSegment[] => {
+    if (segment.kind !== 'text' && segment.kind !== 'bold' && segment.kind !== 'italic' && segment.kind !== 'strikethrough') return [segment]
+    const result: InlineSegment[] = []
+    let cursor = 0
+    while (cursor < segment.value.length) {
+      const start = segment.value.indexOf(prefix, cursor)
+      if (start < 0) { result.push({ ...segment, value: segment.value.slice(cursor) }); break }
+      if (start > cursor) result.push({ ...segment, value: segment.value.slice(cursor, start) })
+      const end = segment.value.indexOf('\uE001', start) + 1
+      const formula = tokens.get(segment.value.slice(start, end))!
+      result.push({ ...formula, format: segment.kind === 'text' ? undefined : segment.kind })
+      cursor = end
+    }
+    return result
+  })
+}
+
+function parsePlainInlineSegments(text: string): InlineSegment[] {
   const hasInlineCodeMarker = text.includes('`')
   const linkFirstSegments = splitTextByFileUrls(text, {
     applyMarkdownMarkers: !hasInlineCodeMarker,
@@ -3263,8 +3308,20 @@ function splitMarkdownTableRow(line: string): string[] | null {
   const cells: string[] = []
   let current = ''
   let codeFenceLength = 0
+  const mathByStart = new Map<number, Extract<MathSegment, { kind: 'math' }>>()
+  let offset = 0
+  for (const segment of splitMathSegments(content)) {
+    if (segment.kind === 'math') mathByStart.set(offset, segment)
+    offset += segment.kind === 'math' ? segment.raw.length : segment.value.length
+  }
 
   for (let index = 0; index < content.length; index += 1) {
+    const math = mathByStart.get(index)
+    if (math) {
+      current += math.raw
+      index += math.raw.length - 1
+      continue
+    }
     const character = content[index]
 
     if (character === '\\' && content[index + 1] === '|') {
@@ -3681,6 +3738,12 @@ function parseTextBlocks(text: string): MessageBlock[] {
 }
 
 function parseNonCodeMessageBlocks(text: string): MessageBlock[] {
+  return splitMathSegments(text, true).flatMap((segment): MessageBlock[] => (
+    segment.kind === 'math' ? [segment] : parseNonMathMessageBlocks(segment.value)
+  ))
+}
+
+function parseNonMathMessageBlocks(text: string): MessageBlock[] {
   if (!text.includes('![') || !text.includes('](')) {
     return parseTextBlocks(text)
   }
@@ -3783,6 +3846,31 @@ function escapeHtml(value: string): string {
     .replace(/'/gu, '&#39;')
 }
 
+function renderMathHtml(segment: MathFormula): string {
+  if (!mathRenderer && !mathRendererLoader) {
+    mathRendererLoader = import('../../utils/mathRenderer').then(async (module) => {
+      if (conversationDisposed) return
+      mathRenderer = module.renderMath
+      markdownHtmlCache.clear()
+      mathCacheVersion.value += 1
+      await scheduleConversationScroll()
+      // Local KaTeX fonts can resize the layout after the first render.
+      if (document.fonts) await document.fonts.ready
+      if (!conversationDisposed) await scheduleConversationScroll()
+    }).catch(() => { /* Keep the escaped source readable if the chunk cannot load. */ })
+  }
+  if (mathRenderer) {
+    try {
+      const html = mathRenderer(segment.value, segment.display)
+      if (segment.format === 'bold') return `<strong>${html}</strong>`
+      if (segment.format === 'italic') return `<em>${html}</em>`
+      if (segment.format === 'strikethrough') return `<s>${html}</s>`
+      return html
+    } catch { /* Invalid math remains readable. */ }
+  }
+  return escapeHtml(segment.raw)
+}
+
 function normalizeCodeLanguage(language: string): string {
   const token = language.trim().split(/\s+/u)[0]?.toLowerCase() ?? ''
   if (!token) return ''
@@ -3840,6 +3928,9 @@ function renderInlineSegmentsAsHtml(text: string): string {
       if (segment.kind === 'strikethrough') {
         return `<s class="message-strikethrough-text">${escapeHtml(segment.value)}</s>`
       }
+      if (segment.kind === 'math') {
+        return `<span class="message-math-inline">${renderMathHtml(segment)}</span>`
+      }
       if (segment.kind === 'file') {
         return `<a class="message-file-link" href="${escapeHtml(toBrowseUrl(segment.path))}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(segment.path)}">${escapeHtml(segment.displayPath)}</a>`
       }
@@ -3869,6 +3960,9 @@ function tableCellAlignmentStyle(alignment: TableAlignment): string {
 }
 
 function renderMessageBlockAsHtml(block: MessageBlock): string {
+  if (block.kind === 'math') {
+    return `<div class="message-math-block">${renderMathHtml(block)}</div>`
+  }
   if (block.kind === 'paragraph') {
     return `<p class="message-text">${renderInlineSegmentsAsHtml(block.value)}</p>`
   }
@@ -3931,7 +4025,7 @@ function renderMessageBlockAsHtml(block: MessageBlock): string {
 }
 
 function renderMarkdownBlocksAsHtml(text: string): string {
-  const cacheKey = `${props.cwd}\u0000${highlightCacheVersion.value}\u0000${text}`
+  const cacheKey = `${props.cwd}\u0000${highlightCacheVersion.value}\u0000${mathCacheVersion.value}\u0000${text}`
   const cached = markdownHtmlCache.get(cacheKey)
   if (cached && cached.text === text && cached.cwd === props.cwd && cached.highlightVersion === highlightCacheVersion.value) {
     markdownHtmlCache.delete(cacheKey)
@@ -4799,6 +4893,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  conversationDisposed = true
   navigationJumpSequence += 1
   clearRenderCaches()
   if (conversationScrollFrame) {

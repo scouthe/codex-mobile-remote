@@ -9,6 +9,7 @@ Return to the [manual test index](../../tests.md).
 | Section |
 | --- |
 | [Mobile image selection, preview and upload feedback](mobile-image-upload-feedback.md) |
+| [Local mathematical formula rendering](mobile-math-rendering.md) |
 | [Codex thread deep links render as local web thread URLs](codex-thread-deep-links-render-as-local-web-thread-urls.md) |
 | [Bold-wrapped Markdown links render without literal markers](bold-wrapped-markdown-links-render-without-literal-markers.md) |
 | [Composer expands long drafts to full screen](composer-expands-long-drafts-to-full-screen.md) |
