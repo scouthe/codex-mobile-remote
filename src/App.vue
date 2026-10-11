@@ -2617,7 +2617,17 @@ async function flushAndroidShare(): Promise<void> {
       composer.appendTextToDraft(payload.text)
     }
     if (files.length > 0) {
-      composer.attachIncomingFiles(files)
+      const looseFiles = files.filter(file => !file.webkitRelativePath)
+      const folders = new Map<string, File[]>()
+      for (const file of files) {
+        if (!file.webkitRelativePath) continue
+        const folder = file.webkitRelativePath.split('/')[0]!
+        const group = folders.get(folder)
+        if (group) group.push(file)
+        else folders.set(folder, [file])
+      }
+      if (looseFiles.length) composer.attachIncomingFiles(looseFiles)
+      for (const folder of folders.values()) composer.attachFolderFiles(folder)
     }
     androidBridge.clearPendingShare()
   } finally {

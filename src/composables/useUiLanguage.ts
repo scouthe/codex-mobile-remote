@@ -5,6 +5,8 @@ export type UiLanguage = 'en' | 'zh-CN'
 const UI_LANGUAGE_STORAGE_KEY = 'codex-web-local.ui-language.v1'
 
 const zhCN: Record<string, string> = {
+  'Update the Android App to select folders.': '请更新安卓 App 后再选择文件夹。',
+  'Could not open the folder picker.': '无法打开文件夹选择器。',
   'Image uploaded, but preview failed. Try a PNG, JPEG or WebP image.': '图片已上传，但预览失败。请尝试 PNG、JPEG 或 WebP 图片。',
   'File is too large (maximum 25 MiB).': '文件过大，请选择小于 25 MiB 的文件。',
   'Sign in again before uploading files.': '登录已失效，请重新登录后上传。',

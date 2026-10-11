@@ -60,7 +60,7 @@
             class="thread-composer-folder-chip-remove"
             type="button"
             :aria-label="`Remove folder ${group.name}`"
-            :disabled="isInteractionDisabled"
+            :disabled="isInteractionDisabled || group.isUploading"
             @click="removeFolderAttachment(group.id)"
           >×</button>
         </span>
@@ -423,6 +423,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { getCodexAndroidBridge } from '../../native/codexAndroid'
 import type { ThreadGoal } from '../../api/appServerDtos'
 import type {
   CollaborationModeKind,
@@ -521,6 +522,7 @@ export type ThreadComposerExposed = {
   appendTextToDraft: (text: string) => void
   /** Attach files supplied by a native share intent or another host shell. */
   attachIncomingFiles: (files: FileList | File[]) => void
+  attachFolderFiles: (files: FileList | File[]) => void
   hasUnsavedDraft: () => boolean
 }
 
@@ -550,6 +552,7 @@ type SelectedImage = {
   id: string
   name: string
   url: string
+  serverPath?: string
 }
 
 type FolderUploadGroup = {
@@ -558,6 +561,7 @@ type FolderUploadGroup = {
   total: number
   processed: number
   filePaths: string[]
+  imageIds: string[]
   isUploading: boolean
 }
 
@@ -1252,11 +1256,25 @@ function triggerCameraCapture(): void {
 }
 
 function triggerFolderPicker(): void {
+  const native = getCodexAndroidBridge()
+  if (native) {
+    isAttachMenuOpen.value = false
+    if (!native.openFolderPicker) {
+      attachmentErrorText.value = t('Update the Android App to select folders.')
+    } else {
+      try { native.openFolderPicker() } catch { attachmentErrorText.value = t('Could not open the folder picker.') }
+    }
+    return
+  }
   folderPickerInputRef.value?.click()
 }
 
 function removeImage(id: string): void {
+  const image = selectedImages.value.find((item) => item.id === id)
   selectedImages.value = selectedImages.value.filter((image) => image.id !== id)
+  folderUploadGroups.value = folderUploadGroups.value.map(group => group.imageIds.includes(id)
+    ? { ...group, imageIds: group.imageIds.filter(imageId => imageId !== id), filePaths: group.filePaths.filter(path => path !== image?.serverPath) }
+    : group)
 }
 
 function removeSkill(path: string): void {
@@ -1284,6 +1302,8 @@ function removeFolderAttachment(groupId: string): void {
   if (!group) return
   const toRemove = new Set(group.filePaths)
   fileAttachments.value = fileAttachments.value.filter((a) => !toRemove.has(a.fsPath))
+  const imageIds = new Set(group.imageIds)
+  selectedImages.value = selectedImages.value.filter((image) => !imageIds.has(image.id))
   folderUploadGroups.value = folderUploadGroups.value.filter((item) => item.id !== groupId)
 }
 
@@ -1476,10 +1496,13 @@ function hasFilePayload(dataTransfer: DataTransfer | null): boolean {
   return Array.from(dataTransfer.types ?? []).includes('Files')
 }
 
-async function addFolderFiles(files: FileList | null): Promise<void> {
+async function addFolderFiles(files: FileList | File[] | null): Promise<void> {
   if (!files || files.length === 0) return
   const generation = draftGeneration.value
+  const sessionToken = attachmentSessionToken
   const rows = Array.from(files)
+  beginAttachmentBatch(rows.length)
+  if (!beginAttachmentWork(sessionToken)) return
   const firstRelativePath = (rows[0] as File & { webkitRelativePath?: string }).webkitRelativePath || rows[0].name
   const folderName = firstRelativePath.split('/').filter(Boolean)[0] || 'Folder'
   const groupId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
@@ -1491,6 +1514,7 @@ async function addFolderFiles(files: FileList | null): Promise<void> {
       total: rows.length,
       processed: 0,
       filePaths: [],
+      imageIds: [],
       isUploading: true,
     },
   ]
@@ -1502,27 +1526,37 @@ async function addFolderFiles(files: FileList | null): Promise<void> {
     ))
   }
 
-  for (const file of rows) {
-    try {
-      const serverPath = await uploadFile(file)
-      if (generation !== draftGeneration.value) return
-      if (serverPath) {
+  try {
+    for (const file of rows) {
+      try {
+        const serverPath = await uploadFile(file)
+        if (generation !== draftGeneration.value) return
         const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
-        addFileAttachment(serverPath, relativePath)
+        let imageId: string | null = null
+        if (isImageFile(file) || /\.(?:png|jpe?g|gif|webp|avif|bmp|svg)$/iu.test(serverPath)) {
+          imageId = createAttachmentId()
+          selectedImages.value = [...selectedImages.value, { id: imageId, name: relativePath, serverPath, url: `/codex-local-image?path=${encodeURIComponent(serverPath)}` }]
+        } else {
+          addFileAttachment(serverPath, relativePath)
+        }
         updateGroup((group) => ({
           ...group,
           processed: group.processed + 1,
           filePaths: [...group.filePaths, serverPath],
+          imageIds: imageId ? [...group.imageIds, imageId] : group.imageIds,
         }))
-        continue
+        recordAttachmentBatchResult('success')
+      } catch (error) {
+        if (generation !== draftGeneration.value) return
+        attachmentErrorText.value = t(error instanceof Error ? error.message : 'Upload failed. Please try again.')
+        recordAttachmentBatchResult('failure')
+        updateGroup((group) => ({ ...group, processed: group.processed + 1 }))
       }
-      updateGroup((group) => ({ ...group, processed: group.processed + 1 }))
-    } catch {
-      updateGroup((group) => ({ ...group, processed: group.processed + 1 }))
     }
+  } finally {
+    updateGroup((group) => ({ ...group, isUploading: false }))
+    finishAttachmentWork(sessionToken)
   }
-
-  updateGroup((group) => ({ ...group, isUploading: false }))
 }
 
 function clearInputValue(inputRefEl: HTMLInputElement | null): void {
@@ -1888,6 +1922,7 @@ defineExpose<ThreadComposerExposed>({
   hydrateDraft,
   appendTextToDraft,
   attachIncomingFiles: (files: FileList | File[]) => attachIncomingFiles(files),
+  attachFolderFiles: (files: FileList | File[]) => { void addFolderFiles(files) },
   hasUnsavedDraft: () => hasUnsavedDraft.value,
 })
 

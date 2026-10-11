@@ -9,6 +9,7 @@ Return to the [manual test index](../../tests.md).
 
 | Section |
 | --- |
+| [Android photo, file and folder selection](file-and-folder-picker.md) |
 | [Bridge contract, task notifications, and share intake](bridge-contract-task-notifications-and-share-intake.md) |
 | [Android conversation startup snapshot cache](android-conversation-startup-snapshot-cache.md) |
 

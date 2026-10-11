@@ -63,12 +63,9 @@ export function sharedContentToFile(value: unknown): AndroidSharedFileReadResult
     // SharedArrayBuffer in newer lib definitions.
     const fileBuffer = new ArrayBuffer(bytes.byteLength)
     new Uint8Array(fileBuffer).set(bytes)
-    return {
-      file: new File([fileBuffer], parsed.name, {
-        type: parsed.mimeType,
-        lastModified: Date.now(),
-      }),
-    }
+    const file = new File([fileBuffer], parsed.name, { type: parsed.mimeType, lastModified: Date.now() })
+    if (parsed.relativePath) Object.defineProperty(file, 'webkitRelativePath', { value: parsed.relativePath })
+    return { file }
   } catch {
     return { file: null, error: 'file-constructor-unavailable' }
   }

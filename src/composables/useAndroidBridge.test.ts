@@ -15,6 +15,13 @@ afterEach(() => {
 })
 
 describe('useAndroidBridge', () => {
+  it('preserves native folder paths on browser Files without altering image bytes', async () => {
+    const result = sharedContentToFile({ name: 'photo.png', mimeType: 'image/png', base64: 'aGVsbG8=', relativePath: 'project/images/photo.png' })
+    expect(result.file?.webkitRelativePath).toBe('project/images/photo.png')
+    expect(result.file?.type).toBe('image/png')
+    await expect(result.file?.text()).resolves.toBe('hello')
+    expect(sharedContentToFile({ name: 'x', mimeType: 'text/plain', base64: '', relativePath: '../x' }).file).toBeNull()
+  })
   it('deduplicates notification payloads and resets after clearing', () => {
     const updates: Array<{ state: string; title?: string; detail?: string }> = []
     let cleared = 0

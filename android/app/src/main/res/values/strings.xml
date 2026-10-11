@@ -57,4 +57,7 @@
     <string name="notification_task_default_detail">Open Codex Remote to view progress</string>
     <string name="notification_stop_monitoring">Stop monitoring</string>
     <string name="shared_file_default_name">shared-file</string>
+    <string name="folder_empty">This folder contains no files.</string>
+    <string name="file_picker_failed">Could not open the file picker.</string>
+    <string name="folder_failed">Could not attach folder: %1$s</string>
 </resources>

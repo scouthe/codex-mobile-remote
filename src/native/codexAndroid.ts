@@ -53,6 +53,7 @@ export type CodexAndroidSharedContent = {
   name: string
   mimeType: string
   base64: string
+  relativePath?: string
 }
 
 export type CodexAndroidContentError = {
@@ -78,6 +79,7 @@ export type CodexAndroidBridge = {
   getPendingShare?: () => string
   readSharedContent?: (uri: string) => string
   clearPendingShare?: () => void
+  openFolderPicker?: () => void
 }
 
 declare global {
@@ -216,7 +218,9 @@ export function parseSharedContent(value: unknown): CodexAndroidSharedContent | 
   // Empty base64 is valid for an empty shared file, so do not trim/reject it.
   const base64 = readString(record.base64)
   if (!name || !mimeType || base64 === null) return null
-  return { name, mimeType, base64 }
+  const relativePath = readTrimmedString(record.relativePath)
+  if (relativePath && (relativePath.startsWith('/') || relativePath.includes('\\') || relativePath.split('/').some(part => !part || part === '.' || part === '..'))) return null
+  return { name, mimeType, base64, ...(relativePath ? { relativePath } : {}) }
 }
 
 function isFunction(value: unknown): value is (...args: never[]) => unknown {
@@ -245,6 +249,7 @@ export function getCodexAndroidBridge(scope?: unknown): CodexAndroidBridge | nul
     'getPendingShare',
     'readSharedContent',
     'clearPendingShare',
+    'openFolderPicker',
   ]
   for (const methodName of methodNames) {
     const method = candidate[methodName]

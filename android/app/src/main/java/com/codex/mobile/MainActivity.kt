@@ -34,6 +34,7 @@ import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
@@ -47,6 +48,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.util.UUID
+import java.util.concurrent.Executors
 
 /**
  * A lightweight native shell for a codexapp instance running on the user's
@@ -92,6 +94,8 @@ class MainActivity : AppCompatActivity() {
     private var editingProfileId: String? = null
     private var currentBaseUri: Uri? = null
     private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+    private val folderExecutor = Executors.newSingleThreadExecutor()
+    private var folderPickerActive = false
     private var mainFrameFailed = false
     private var pageReady = false
     private var passwordAttempted = false
@@ -112,6 +116,7 @@ class MainActivity : AppCompatActivity() {
         val uri: Uri,
         val name: String,
         val mimeType: String,
+        val relativePath: String? = null,
     )
 
     private val fileChooserLauncher = registerForActivityResult(
@@ -121,11 +126,49 @@ class MainActivity : AppCompatActivity() {
         fileChooserCallback = null
         callback?.onReceiveValue(
             if (result.resultCode == RESULT_OK) {
-                WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+                FileChooserSelection.read(result.resultCode, result.data)
             } else {
                 null
             },
         )
+    }
+
+    private val folderPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val tree = result.data?.data
+        if (result.resultCode != RESULT_OK || tree == null) {
+            folderPickerActive = false
+        } else {
+            folderExecutor.execute {
+                try {
+                    val files = FolderSelection.collect(contentResolver, tree)
+                    runOnUiThread {
+                        if (isDestroyed) return@runOnUiThread
+                        folderPickerActive = false
+                        if (files.isEmpty()) {
+                            Toast.makeText(this, R.string.folder_empty, Toast.LENGTH_LONG).show()
+                        } else {
+                            synchronized(shareLock) {
+                                files.forEach { file ->
+                                    pendingShareUris[file.uri.toString()] = SharedContent(
+                                        file.uri, file.name, file.mimeType, file.relativePath,
+                                    )
+                                }
+                                shareDispatched = false
+                            }
+                            dispatchPendingShare()
+                        }
+                    }
+                } catch (error: Exception) {
+                    runOnUiThread {
+                        if (isDestroyed) return@runOnUiThread
+                        folderPickerActive = false
+                        Toast.makeText(this, getString(R.string.folder_failed, error.message.orEmpty()), Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
     }
 
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -207,6 +250,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        folderExecutor.shutdownNow()
         connectionManager.stop()
         endpointSelector.shutdown()
         fileChooserCallback?.onReceiveValue(null)
@@ -393,7 +437,9 @@ class MainActivity : AppCompatActivity() {
                     Log.w(TAG, "Unable to open file chooser", error)
                     this@MainActivity.fileChooserCallback = null
                     filePathCallback.onReceiveValue(null)
-                    false
+                    // The callback was consumed; false would make WebView call it again.
+                    Toast.makeText(this@MainActivity, R.string.file_picker_failed, Toast.LENGTH_LONG).show()
+                    true
                 }
             }
 
@@ -893,6 +939,7 @@ class MainActivity : AppCompatActivity() {
                 .put("name", item.name)
                 .put("mimeType", item.mimeType)
                 .put("base64", Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP))
+                .put("relativePath", item.relativePath ?: JSONObject.NULL)
                 .toString()
         } catch (error: Exception) {
             JSONObject().put("error", error.message ?: "unreadable").toString()
@@ -992,6 +1039,20 @@ class MainActivity : AppCompatActivity() {
             synchronized(shareLock) {
                 pendingShareText = null
                 pendingShareUris.clear()
+            }
+        }
+
+        @JavascriptInterface
+        fun openFolderPicker() {
+            runOnUiThread {
+                if (isDestroyed || folderPickerActive) return@runOnUiThread
+                folderPickerActive = true
+                try {
+                    folderPickerLauncher.launch(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE))
+                } catch (error: Exception) {
+                    folderPickerActive = false
+                    Toast.makeText(this@MainActivity, getString(R.string.folder_failed, error.message.orEmpty()), Toast.LENGTH_LONG).show()
+                }
             }
         }
     }

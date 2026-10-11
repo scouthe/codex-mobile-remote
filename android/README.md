@@ -31,6 +31,9 @@ adds the pieces that are awkward or unreliable in a browser:
 - restores WebView cookies for a long-lived login session;
 - retries after Tailscale/Wi-Fi transitions with bounded backoff;
 - opens the Android document picker for file attachments;
+- accepts single/multiple gallery results from both data URIs and ClipData;
+- opens the system directory picker for folder attachments, preserving nested
+  paths and image thumbnails (requires App 0.3.1 or newer);
 - accepts Android share intents and exposes their content to the web UI;
 - exposes a small `window.CodexAndroid` bridge for client identity and task
   notifications.
@@ -117,6 +120,7 @@ window.CodexAndroid.clearTaskState()
 window.CodexAndroid.getPendingShare()
 window.CodexAndroid.readSharedContent(uri)
 window.CodexAndroid.clearPendingShare()
+window.CodexAndroid.openFolderPicker()
 ```
 
 The activity also dispatches `codex-native-ready`, `codex-native-share`,
@@ -125,6 +129,13 @@ The activity also dispatches `codex-native-ready`, `codex-native-share`,
 values are the shared observer states (`queued`, `starting`, `running`,
 `waiting_approval`, `waiting_user_input`, `steering`, `completed`, `failed`,
 and `canceled`).
+
+Folder selection enumerates metadata on a background thread and uses the
+existing share intake to read only granted document URIs. It accepts at most
+200 files and 1,024 directories, with 20 MiB per file and 40 MiB known aggregate
+size. The share reader also enforces actual-byte limits. Images are submitted
+as image inputs; other files retain relative paths. Older APKs display an
+upgrade hint instead of silently opening an unsupported folder input.
 
 ## Security notes
 

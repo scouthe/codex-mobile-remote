@@ -12,6 +12,13 @@ import {
 } from './codexAndroid'
 
 describe('Codex Android bridge contract', () => {
+  it('exposes a callable native folder picker and retains its receiver', () => {
+    let opened = 0
+    const fake = { counter: 1, openFolderPicker() { opened += this.counter } }
+    getCodexAndroidBridge({ CodexAndroid: fake })?.openFolderPicker?.()
+    expect(opened).toBe(1)
+    expect(getCodexAndroidBridge({ CodexAndroid: { openFolderPicker: false } })).toBeNull()
+  })
   it('keeps the event names and task states aligned with the Android shell', () => {
     expect(CODEX_ANDROID_EVENTS).toEqual({
       ready: 'codex-native-ready',

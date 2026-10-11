@@ -18,8 +18,8 @@ android {
         // Remote mode does not execute downloaded binaries, so it can target
         // the current Android security model instead of relying on W^X bypasses.
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.3.0"
+        versionCode = 5
+        versionName = "0.3.1"
     }
 
     buildTypes {
@@ -55,4 +55,5 @@ dependencies {
     implementation("androidx.webkit:webkit:1.12.1")
     implementation("com.google.android.material:material:1.12.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.17")
 }
