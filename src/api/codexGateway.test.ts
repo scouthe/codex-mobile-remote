@@ -6,6 +6,7 @@ import {
   getThreadFastDetail,
   getThreadGoal,
   getThreadLiveState,
+  getOlderThreadMessages,
   listDirectoryComposioConnectors,
   resumeThread,
   forkThreadAtTurn,
@@ -40,6 +41,26 @@ function mockRpcFetch(): { requests: Array<{ method: string, params: Record<stri
 
   return { requests }
 }
+
+describe('official cursor history metadata', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('preserves the older-page flag without inventing absolute turn indexes', async () => {
+    const result = {
+      thread: { id: 't', turns: [{ id: 'turn-20', status: 'completed', items: [{ type: 'agentMessage', id: 'a', text: 'answer' }] }] },
+      threadTurnStartIndexKnown: false, hasMoreOlder: true, partial: true,
+    }
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ result, hasMoreOlder: true, threadTurnStartIndexKnown: false }), { status: 200 })))
+    const latest = await getThreadDetail('t')
+    expect(latest).toMatchObject({ hasMoreOlder: true, turnIndexByTurnId: {}, partial: true })
+    expect(latest.messages[0]).toMatchObject({ turnId: 'turn-20', text: 'answer' })
+    expect(latest.messages[0].turnIndex).toBeUndefined()
+    const older = await getOlderThreadMessages('t', 'turn-21')
+    expect(older.hasMoreOlder).toBe(true)
+    expect(older.turnIndexByTurnId).toEqual({})
+    expect(older.messages[0].turnIndex).toBeUndefined()
+  })
+})
 
 describe('startThreadTurn collaboration mode payloads', () => {
   afterEach(() => {

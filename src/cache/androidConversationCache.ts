@@ -13,13 +13,15 @@ export type AndroidConversationCacheRecord = {
   sessionRevision: string
   updatedAtIso: string
   hasMoreOlder: boolean
+  /** Retained content is incomplete and must be hydrated even when the revision matches. */
+  requiresHydration: boolean
   messages: UiMessage[]
   savedAt: number
 }
 
 const DATABASE_NAME = 'codex-remote-android'
 const DATABASE_VERSION = 1
-const RENDER_FORMAT_VERSION = 2
+const RENDER_FORMAT_VERSION = 3
 const STORE_NAME = 'conversation-snapshots'
 const MAX_CACHED_THREADS = 20
 // Keep several render-window pages locally so mobile history can expand from
@@ -70,26 +72,49 @@ function sanitizeMessage(message: UiMessage): UiMessage {
   return sanitized
 }
 
-function boundSnapshotMessages(messages: UiMessage[]): UiMessage[] {
-  const bounded = messages
-    .filter((message) => message.messageType !== 'userMessage.optimistic')
-    .slice(-MAX_CACHED_MESSAGES)
-    .map(sanitizeMessage)
-  // A single unusually large thread should not consume an unbounded portion
-  // of WebView storage. Drop the oldest cached rows until the serialized
-  // snapshot is within the per-thread budget; the server remains authoritative
-  // for anything omitted here.
-  while (bounded.length > 1) {
-    let serializedLength = 0
-    try {
-      serializedLength = JSON.stringify(bounded).length
-    } catch {
+export function boundAndroidConversationMessages(
+  messages: UiMessage[],
+  maxBytes = MAX_CACHED_BYTES_PER_THREAD,
+): { messages: UiMessage[]; hasDroppedMessages: boolean; requiresHydration: boolean } {
+  const retained: UiMessage[] = []
+  const encoder = new TextEncoder()
+  let serializedBytes = 2 // JSON array brackets.
+  let requiresHydration = false
+  let firstDroppedMessage: UiMessage | undefined
+
+  // Serialize each candidate once, newest first. Stop at the first omitted
+  // persisted row so the result remains a contiguous suffix, not a history
+  // with holes. Large metadata on even a single row cannot bypass the budget.
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!
+    if (message.messageType === 'userMessage.optimistic') continue
+    if (retained.length >= MAX_CACHED_MESSAGES) {
+      firstDroppedMessage = message
       break
     }
-    if (serializedLength <= MAX_CACHED_BYTES_PER_THREAD) break
-    bounded.shift()
+    const sanitized = sanitizeMessage(message)
+    const nextBytes = encoder.encode(JSON.stringify(sanitized)).byteLength + (retained.length > 0 ? 1 : 0)
+    if (serializedBytes + nextBytes > maxBytes) {
+      firstDroppedMessage = message
+      break
+    }
+    retained.push(sanitized)
+    serializedBytes += nextBytes
+    requiresHydration ||= sanitized.text !== message.text
+      || sanitized.rawPayload !== message.rawPayload
+      || sanitized.commandExecution?.aggregatedOutput !== message.commandExecution?.aggregatedOutput
   }
-  return bounded
+  retained.reverse()
+
+  if (firstDroppedMessage) {
+    const firstRetainedTurnId = retained[0]?.turnId
+    // History pagination uses beforeTurnId. It cannot recover the start of a
+    // partially cached turn, or rows whose turn boundary is unknown.
+    requiresHydration ||= !firstRetainedTurnId
+      || !firstDroppedMessage.turnId
+      || firstRetainedTurnId === firstDroppedMessage.turnId
+  }
+  return { messages: retained, hasDroppedMessages: Boolean(firstDroppedMessage), requiresHydration }
 }
 
 function openDatabase(): Promise<IDBDatabase | null> {
@@ -149,6 +174,7 @@ export async function readAndroidConversationCache(threadId: string): Promise<An
           sessionRevision: value.sessionRevision,
           updatedAtIso: value.updatedAtIso,
           hasMoreOlder: value.hasMoreOlder === true,
+          requiresHydration: value.requiresHydration === true,
           messages: Array.isArray(value.messages) ? value.messages : [],
           savedAt: typeof value.savedAt === 'number' ? value.savedAt : 0,
         })
@@ -167,15 +193,15 @@ export async function readAndroidConversationCache(threadId: string): Promise<An
 /** Save a bounded snapshot. This operation is deliberately best-effort. */
 export async function writeAndroidConversationCache(
   threadId: string,
-  snapshot: Pick<AndroidConversationCacheRecord, 'sessionRevision' | 'updatedAtIso' | 'hasMoreOlder' | 'messages'>,
+  snapshot: Pick<AndroidConversationCacheRecord, 'sessionRevision' | 'updatedAtIso' | 'hasMoreOlder' | 'messages'> & {
+    /** Preserve incompleteness when writing rows restored from an unhydrated cache. */
+    requiresHydration?: boolean
+  },
 ): Promise<void> {
   const origin = currentOrigin()
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId || !isAndroidWebView() || !origin) return
 
-  const database = await openDatabase()
-  if (!database) return
-  const messages = boundSnapshotMessages(snapshot.messages)
   const record: StoredRecord = {
     key: cacheKey(origin, normalizedThreadId),
     origin,
@@ -183,10 +209,27 @@ export async function writeAndroidConversationCache(
     renderFormatVersion: RENDER_FORMAT_VERSION,
     sessionRevision: snapshot.sessionRevision.trim(),
     updatedAtIso: snapshot.updatedAtIso.trim(),
-    hasMoreOlder: snapshot.hasMoreOlder === true,
-    messages,
+    hasMoreOlder: false,
+    requiresHydration: false,
+    messages: [],
     savedAt: Date.now(),
   }
+  try {
+    // Include record metadata in the 4 MiB budget. Both booleans start false
+    // (one byte longer than true), so changing either cannot exceed it.
+    const metadataBytes = new TextEncoder().encode(JSON.stringify(record)).byteLength - 2
+    if (metadataBytes + 2 > MAX_CACHED_BYTES_PER_THREAD) return
+    const bounded = boundAndroidConversationMessages(snapshot.messages, MAX_CACHED_BYTES_PER_THREAD - metadataBytes)
+    record.messages = bounded.messages
+    record.hasMoreOlder = snapshot.hasMoreOlder === true || bounded.hasDroppedMessages
+    record.requiresHydration = snapshot.requiresHydration === true || bounded.requiresHydration
+  } catch {
+    // Unserializable messages must not turn best-effort caching into an
+    // unhandled rejection, nor replace a previously usable snapshot.
+    return
+  }
+  const database = await openDatabase()
+  if (!database) return
 
   await new Promise<void>((resolve) => {
     try {
@@ -260,4 +303,5 @@ export async function clearAndroidConversationCache(): Promise<void> {
 export const ANDROID_CONVERSATION_CACHE_LIMITS = {
   maxThreads: MAX_CACHED_THREADS,
   maxMessagesPerThread: MAX_CACHED_MESSAGES,
+  maxBytesPerThread: MAX_CACHED_BYTES_PER_THREAD,
 } as const

@@ -8,6 +8,9 @@ Return to the [manual test index](../../tests.md).
 
 | Section |
 | --- |
+| [Official history pages and shared list reads](official-history-pages-and-shared-list-reads.md) |
+| [Android cache byte budget and completeness](android-cache-byte-budget-and-completeness.md) |
+| [Session activity coalescing and append scans](session-activity-coalescing-and-append-scans.md) |
 | [Pinned threads remain visible during background pagination](pinned-threads-remain-visible-during-background-pagination.md) |
 | [Thread archive recovery and sidebar pruning](thread-archive-recovery-and-sidebar-pruning.md) |
 | [Unread thread cutoff state](unread-thread-cutoff-state.md) |

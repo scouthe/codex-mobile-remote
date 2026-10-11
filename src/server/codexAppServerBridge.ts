@@ -51,6 +51,8 @@ import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { ThreadSessionBroker } from './threadSessionBroker.js'
 import { ThreadSessionActivityReader, type ThreadSessionActivity } from './threadSessionActivity.js'
+import { countTurnsFromTarget, invalidateThreadHistoryPages, readOfficialThreadPage } from './threadHistoryPager.js'
+import { ThreadListSupplementCache } from './threadListSupplementCache.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
@@ -1139,6 +1141,7 @@ function mergeStreamTurnErrorsIntoThreadResult(appServer: AppServerProcess, resu
 async function readThreadSnapshotForObserver(
   appServer: AppServerProcess,
   threadId: string,
+  allowLegacyTail = true,
 ): Promise<unknown> {
   // `thread/read(includeTurns:false)` is a cheap metadata lookup and does not
   // force app-server to deserialize the complete rollout.  Always ask the
@@ -1150,6 +1153,18 @@ async function readThreadSnapshotForObserver(
   let metadataThread = asRecord(metadataRecord?.thread)
   let sessionPath = readNonEmptyString(metadataThread?.path)
 
+  const officialPage = await readOfficialThreadPage(appServer, threadId, THREAD_RESPONSE_TURN_LIMIT)
+  if (officialPage && metadataRecord && metadataThread) {
+    return mergeStreamTurnErrorsIntoThreadResult(appServer, {
+      ...metadataRecord,
+      thread: { ...metadataThread, turns: officialPage.turns },
+      threadTurnStartIndexKnown: false,
+      hasMoreOlder: officialPage.hasMoreOlder,
+      partial: officialPage.hasMoreOlder,
+      fullHydrationDeferred: false,
+    })
+  }
+
   if (!sessionPath || !isAbsolute(sessionPath)) {
     metadataResult = appServer.getThreadSummarySnapshot(threadId)
     metadataRecord = asRecord(metadataResult)
@@ -1157,7 +1172,7 @@ async function readThreadSnapshotForObserver(
     sessionPath = readNonEmptyString(metadataThread?.path)
   }
 
-  if (sessionPath && isAbsolute(sessionPath)) {
+  if (allowLegacyTail && sessionPath && isAbsolute(sessionPath)) {
     try {
       const sessionStat = await stat(sessionPath)
       if (sessionStat.isFile() && sessionStat.size > OBSERVER_FULL_READ_MAX_BYTES) {
@@ -2101,12 +2116,17 @@ ${archivedPredicate};
   }
 }
 
-export function mergeImportedThreadsIntoThreadListResult(result: unknown): unknown {
+const threadListSupplementCache = new ThreadListSupplementCache()
+
+export function mergeImportedThreadsIntoThreadListResult(
+  result: unknown,
+  supplementalThreads?: Array<Record<string, unknown>>,
+): unknown {
   const record = asRecord(result)
   const data = Array.isArray(record?.data) ? record.data : null
   if (!record || !data) return result
   const importedById = new Map<string, Record<string, unknown>>()
-  for (const thread of listImportedThreadsFromStateDb()) {
+  for (const thread of supplementalThreads ?? listImportedThreadsFromStateDb()) {
     const id = readNonEmptyString(thread.id)
     if (id) importedById.set(id, thread)
   }
@@ -7971,6 +7991,7 @@ function createProxyProcessDuplex(child: ChildProcessWithoutNullStreams): Duplex
 }
 
 export class AppServerProcess {
+  private readonly pendingThreadLists = new Map<string, Promise<unknown>>()
   private process: ChildProcessWithoutNullStreams | null = null
   /**
    * The official server is deliberately separate from the proxy child.  It
@@ -8772,6 +8793,26 @@ export class AppServerProcess {
   }
 
   async rpc(method: string, params: unknown): Promise<unknown> {
+    if (method !== 'thread/list') {
+      const mutatesThread = method.startsWith('thread/') && !['thread/read', 'thread/turns/list', 'thread/items/list', 'thread/goal/get'].includes(method)
+      if (mutatesThread) this.pendingThreadLists.clear()
+      try {
+        return await this.executeRpc(method, params)
+      } finally {
+        if (mutatesThread) this.pendingThreadLists.clear()
+      }
+    }
+    const key = JSON.stringify(params)
+    const pending = this.pendingThreadLists.get(key)
+    if (pending) return pending
+    const request = this.executeRpc(method, params).finally(() => {
+      if (this.pendingThreadLists.get(key) === request) this.pendingThreadLists.delete(key)
+    })
+    this.pendingThreadLists.set(key, request)
+    return request
+  }
+
+  private async executeRpc(method: string, params: unknown): Promise<unknown> {
     // Read-only observer polling must not keep a bridge-owned child alive
     // forever.  In particular, the web UI refreshes thread/list frequently;
     // canceling the release timer for every poll would leave an idle child
@@ -8780,13 +8821,21 @@ export class AppServerProcess {
     // the current initialized writer session.
     const isReadOnlyRpc = method === 'thread/list'
       || method === 'thread/read'
+      || method === 'thread/turns/list'
+      || method === 'thread/items/list'
       || method.endsWith('/read')
       || method === 'config/read'
     if (!isReadOnlyRpc) this.cancelIdleWriterRelease()
     await this.ensureOfficialAppServer()
     this.disposeIfConfigChanged()
     await this.ensureInitialized()
+    if (method === 'thread/rollback' || method === 'thread/archive') {
+      invalidateThreadHistoryPages(this, readNonEmptyString(asRecord(params)?.threadId))
+    }
     const result = await this.call(method, params)
+    if (method === 'thread/rollback' || method === 'thread/archive') {
+      invalidateThreadHistoryPages(this, readNonEmptyString(asRecord(params)?.threadId))
+    }
     if (method === 'thread/list' || (method === 'thread/read' && asRecord(params)?.includeTurns !== true)) {
       this.rememberThreadSummaries(result)
     }
@@ -10152,11 +10201,27 @@ export function createCodexBridgeMiddleware(options: { passwordConfigured?: bool
                 await threadBroker.ensureWriterReady(rpcThreadId, async () => {
                   await ensureThreadReadyForMutation(appServer, rpcThreadId)
                 })
-                const result = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
+                let mutationParams = rpcParams
+                const targetTurnId = readNonEmptyString(asRecord(rpcParams)?.targetTurnId)
+                if (body.method === 'thread/rollback' && targetTurnId) {
+                  let numTurns = await countTurnsFromTarget(appServer, rpcThreadId, targetTurnId)
+                  if (numTurns === null) {
+                    const legacy = asRecord(await appServer.rpc('thread/read', { threadId: rpcThreadId, includeTurns: true }))
+                    const turns = asRecord(legacy?.thread)?.turns
+                    if (!Array.isArray(turns)) throw new Error('Unable to locate the selected turn')
+                    const index = turns.findIndex((turn) => asRecord(turn)?.id === targetTurnId)
+                    if (index < 0) throw new Error('The selected turn no longer exists. Reload before editing.')
+                    numTurns = turns.length - index
+                  }
+                  mutationParams = { threadId: rpcThreadId, numTurns }
+                }
+                const result = await callRpcWithArchiveRecovery(appServer, body.method, mutationParams)
                 threadBroker.claimWriter(rpcThreadId, { clientId, clientType })
                 return result
               },
             )
+          } else if (rpcThreadId && body.method === 'thread/read' && asRecord(rpcParams)?.includeTurns === true) {
+            rpcResult = await readThreadSnapshotForObserver(appServer, rpcThreadId, false)
           } else {
             rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, rpcParams)
           }
@@ -10200,8 +10265,18 @@ export function createCodexBridgeMiddleware(options: { passwordConfigured?: bool
         const errorMergedResult = THREAD_METHODS_WITH_TURNS.has(body.method)
           ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
           : trimmedResult
+        // Missing/imported forks are a first-page supplement. Appending the
+        // same database rows on every cursor page repeats SQL, log scans and
+        // payloads without adding history to the client.
+        const listParams = asRecord(body.params)
+        const supplementedResult = body.method === 'thread/list' && !listParams?.cursor && listParams?.archived !== true
+          ? mergeImportedThreadsIntoThreadListResult(errorMergedResult, await threadListSupplementCache.get(
+            join(getCodexHomeDir(), 'state_5.sqlite'),
+            listImportedThreadsFromStateDb,
+          ).catch(() => []))
+          : errorMergedResult
         const listMergedResult = body.method === 'thread/list'
-          ? await mergeSessionActivityIntoThreadListResult(mergeImportedThreadsIntoThreadListResult(errorMergedResult), appServer.getSessionActivityReader())
+          ? await mergeSessionActivityIntoThreadListResult(supplementedResult, appServer.getSessionActivityReader())
           : errorMergedResult
         const activityMergedResult = body.method === 'thread/read' || body.method === 'thread/resume'
           ? await mergeSessionActivityIntoThreadResult(listMergedResult, appServer.getSessionActivityReader())
@@ -10232,6 +10307,27 @@ export function createCodexBridgeMiddleware(options: { passwordConfigured?: bool
           const limit = Math.max(1, Math.min(50, Number.parseInt(limitRaw, 10) || THREAD_RESPONSE_TURN_LIMIT))
           if (!threadId) {
             setJson(res, 400, { error: 'Missing threadId' })
+            return
+          }
+
+          const officialPage = await readOfficialThreadPage(appServer, threadId, limit, beforeTurnId)
+          if (officialPage) {
+            const metadata = asRecord(await readCurrentThreadMetadata(appServer, threadId))
+            const thread = asRecord(metadata?.thread)
+            if (!thread) throw new Error('Thread metadata is unavailable')
+            const pageResult = mergeStreamTurnErrorsIntoThreadResult(appServer, {
+              ...metadata,
+              thread: { ...thread, turns: officialPage.turns },
+              threadTurnStartIndexKnown: false,
+              hasMoreOlder: officialPage.hasMoreOlder,
+              partial: officialPage.hasMoreOlder,
+            })
+            const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', pageResult)
+            setJson(res, 200, {
+              result: await mergeSessionSkillInputsIntoThreadResult(sanitized),
+              threadTurnStartIndexKnown: false,
+              hasMoreOlder: officialPage.hasMoreOlder,
+            })
             return
           }
 
@@ -10561,11 +10657,11 @@ export function createCodexBridgeMiddleware(options: { passwordConfigured?: bool
             partial: rawThreadRecord?.partial === true || typeof rawThreadRecord?.threadTurnStartIndex === 'number',
             ...(threadTurnStartIndexKnown ? { threadTurnStartIndex } : {}),
             threadTurnStartIndexKnown,
-            hasMoreOlder: (typeof rawThreadRecord?.threadTurnStartIndex === 'number'
+            hasMoreOlder: typeof rawThreadRecord?.hasMoreOlder === 'boolean' ? rawThreadRecord.hasMoreOlder : (typeof rawThreadRecord?.threadTurnStartIndex === 'number'
               && Math.trunc(rawThreadRecord.threadTurnStartIndex) > 0)
               || sessionSize > FAST_THREAD_SESSION_TAIL_BYTES
               || turns.length >= THREAD_RESPONSE_TURN_LIMIT,
-            fullHydrationDeferred: sessionSize > OBSERVER_FULL_READ_MAX_BYTES,
+            fullHydrationDeferred: rawThreadRecord?.fullHydrationDeferred === false ? false : sessionSize > OBSERVER_FULL_READ_MAX_BYTES,
             ownerClientId: null,
             liveStateError: null,
             isInProgress,

@@ -52,6 +52,13 @@ const gatewayMocks = vi.hoisted(() => ({
   subscribeCodexNotifications: vi.fn(),
 }))
 
+const cacheMocks = vi.hoisted(() => ({
+  readAndroidConversationCache: vi.fn(),
+  writeAndroidConversationCache: vi.fn(),
+  isAndroidConversationCacheEnabled: vi.fn(),
+}))
+vi.mock('../cache/androidConversationCache', () => cacheMocks)
+
 vi.mock('../api/codexGateway', () => ({
   ...gatewayMocks,
   getBackgroundThreadListLimit: vi.fn(() => 100),
@@ -92,6 +99,8 @@ function installTestWindow(initialStorage: Record<string, string> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  cacheMocks.readAndroidConversationCache.mockResolvedValue(null)
+  cacheMocks.isAndroidConversationCacheEnabled.mockReturnValue(false)
   gatewayMocks.getThreadFastDetail.mockRejectedValue(new Error('fast snapshot not configured in test'))
   gatewayMocks.getThreadLiveState.mockRejectedValue(new Error('live state not configured in test'))
   gatewayMocks.getThreadQueueState.mockResolvedValue({})
@@ -115,6 +124,66 @@ describe('automatic turn retry classification', () => {
     expect(isRetryableTurnErrorMessage('invalid request parameter')).toBe(false)
     expect(isRetryableTurnErrorMessage('thread already has an active writer')).toBe(false)
     expect(isRetryableTurnErrorMessage('request canceled by user')).toBe(false)
+  })
+})
+
+describe('incomplete Android history restoration', () => {
+  it('retains complete command rows when a bounded live preview omits them', async () => {
+    installTestWindow()
+    const user = { id: 'u', turnId: 't1', role: 'user', text: 'do work' }
+    const assistant = { id: 'a', turnId: 't1', role: 'assistant', text: 'done' }
+    const command = { id: 'cmd', turnId: 't1', role: 'system', text: 'tool output', messageType: 'commandExecution' }
+    const detail = { messages: [user, command, assistant], hasMoreOlder: true, partial: true, turnIndexByTurnId: {}, inProgress: false, activeTurnId: '' }
+    gatewayMocks.getThreadDetail.mockResolvedValueOnce(detail)
+    const state = useDesktopState()
+    state.primeSelectedThread('preview-thread')
+    await state.loadMessages('preview-thread', { force: true })
+    gatewayMocks.getThreadLiveState.mockResolvedValueOnce({ ...detail, messages: [user, assistant], fullHydrationDeferred: true })
+    await state.loadMessages('preview-thread', { force: true, preferLiveState: true })
+    expect(state.messages.value.map((message) => message.id)).toContain('cmd')
+  })
+
+  it('drops a rolled-back suffix when official pages have turn IDs but no indexes', async () => {
+    installTestWindow()
+    const message = (id: number) => ({ id: `m-${id}`, turnId: `t-${id}`, role: 'assistant', text: `${id}` })
+    const detail = (start: number) => ({
+      messages: Array.from({ length: 10 }, (_, i) => message(start + i)),
+      hasMoreOlder: true, partial: true, turnIndexByTurnId: {}, inProgress: false, activeTurnId: '',
+    })
+    gatewayMocks.getThreadDetail.mockResolvedValueOnce(detail(90)).mockResolvedValueOnce(detail(88))
+    const state = useDesktopState()
+    state.primeSelectedThread('rollback-thread')
+    await state.loadMessages('rollback-thread', { force: true })
+    await state.loadMessages('rollback-thread', { force: true })
+    expect(state.messages.value.map((message) => message.turnId)).toEqual(Array.from({ length: 10 }, (_, i) => `t-${88 + i}`))
+  })
+
+  it('replaces a matching but clipped cache with complete page items and keeps older pagination', async () => {
+    installTestWindow()
+    const cachedThread = thread('cached-thread', '/tmp/project')
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [{ projectName: 'project', threads: [cachedThread] }], nextCursor: null })
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    state.primeSelectedThread('cached-thread')
+    cacheMocks.readAndroidConversationCache.mockResolvedValueOnce({
+      threadId: 'cached-thread', sessionRevision: '', updatedAtIso: cachedThread.updatedAtIso,
+      hasMoreOlder: true, requiresHydration: true,
+      messages: [
+        { id: 'older', turnId: 'old', role: 'assistant', text: 'clipped older response' },
+        { id: 'recent', turnId: 'new', role: 'assistant', text: 'clipped latest response' },
+      ],
+    })
+    gatewayMocks.getThreadDetail.mockRejectedValueOnce(new Error('temporarily unavailable')).mockResolvedValueOnce({
+      messages: [{ id: 'recent', turnId: 'new', role: 'assistant', text: 'complete latest response' }],
+      hasMoreOlder: true, partial: true, turnIndexByTurnId: {}, inProgress: false, activeTurnId: '',
+    })
+    await expect(state.loadMessages('cached-thread')).rejects.toThrow('temporarily unavailable')
+    expect(state.messages.value.map((message) => message.text)).toContain('clipped latest response')
+    await state.loadMessages('cached-thread', { force: true })
+    expect(gatewayMocks.getThreadFastDetail).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledTimes(2)
+    expect(state.messages.value.map((message) => message.text)).toEqual(['complete latest response'])
+    expect(state.hasMoreOlderMessages.value).toBe(true)
   })
 })
 

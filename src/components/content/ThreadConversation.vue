@@ -1015,6 +1015,7 @@ import {
   shouldRenderLiveOverlay,
 } from '../../task/mobileConversationVisibility'
 import { buildTurnProcessPresentation, formatTurnProcessLabel } from '../../task/turnProcessPresentation'
+import { buildConversationTurnKeys, buildEditableConversationTurns } from '../../task/conversationTurnIdentity'
 import { copyTextToClipboard, copyTextWithSelectionFallback } from '../../utils/clipboard'
 
 import IconTablerArrowBackUp from '../icons/IconTablerArrowBackUp.vue'
@@ -1970,6 +1971,8 @@ function buildCopyableMessageContent(message: UiMessage): string {
   return sections.join('\n\n').trim()
 }
 
+const conversationTurnKeys = computed(() => buildConversationTurnKeys(props.messages))
+
 const copyableResponseContentByAnchorId = computed<Record<string, string>>(() => {
   const groupedResponses = new Map<string, { anchorMessageId: string; parts: string[] }>()
 
@@ -1980,9 +1983,7 @@ const copyableResponseContentByAnchorId = computed<Record<string, string>>(() =>
     const content = buildCopyableMessageContent(message)
     if (!content) continue
 
-    const responseKey = typeof message.turnIndex === 'number'
-      ? `turn:${message.turnIndex}`
-      : `message:${message.id}`
+    const responseKey = conversationTurnKeys.value.get(message.id) ?? `message:${message.id}`
     const existing = groupedResponses.get(responseKey)
     if (existing) {
       existing.anchorMessageId = message.id
@@ -2112,8 +2113,9 @@ const anchoredFileChangeSummaryByAnchorId = computed<Record<string, TurnFileChan
   const fileChangeMessagesByTurnKey = new Map<string, UiMessage[]>()
 
   for (const message of props.messages) {
-    if (isCopyableAssistantMessage(message) && typeof message.turnIndex === 'number') {
-      assistantAnchorIdByTurnKey.set(`turn:${message.turnIndex}`, message.id)
+    const turnKey = conversationTurnKeys.value.get(message.id)
+    if (isCopyableAssistantMessage(message) && turnKey) {
+      assistantAnchorIdByTurnKey.set(turnKey, message.id)
       if (Array.isArray(message.fileChanges) && message.fileChanges.length > 0) {
         assistantSummaryByAnchorId.set(message.id, {
           changes: aggregateFileChanges(message.fileChanges),
@@ -2125,10 +2127,10 @@ const anchoredFileChangeSummaryByAnchorId = computed<Record<string, TurnFileChan
     }
 
     if (!isFileChangeMessage(message)) continue
-    const turnKey = typeof message.turnIndex === 'number' ? `turn:${message.turnIndex}` : `message:${message.id}`
-    const current = fileChangeMessagesByTurnKey.get(turnKey)
+    const fileChangeKey = turnKey ?? `message:${message.id}`
+    const current = fileChangeMessagesByTurnKey.get(fileChangeKey)
     if (current) current.push(message)
-    else fileChangeMessagesByTurnKey.set(turnKey, [message])
+    else fileChangeMessagesByTurnKey.set(fileChangeKey, [message])
   }
 
   const summaries: Record<string, TurnFileChangeSummary> = {}
@@ -2158,15 +2160,16 @@ const standaloneFileChangeSummaryByMessageId = computed<Record<string, TurnFileC
   const fileChangeMessagesByTurnKey = new Map<string, UiMessage[]>()
 
   for (const message of props.messages) {
-    if (isCopyableAssistantMessage(message) && typeof message.turnIndex === 'number') {
-      assistantAnchorIdByTurnKey.set(`turn:${message.turnIndex}`, message.id)
+    const turnKey = conversationTurnKeys.value.get(message.id)
+    if (isCopyableAssistantMessage(message) && turnKey) {
+      assistantAnchorIdByTurnKey.set(turnKey, message.id)
     }
 
     if (!isFileChangeMessage(message)) continue
-    const turnKey = typeof message.turnIndex === 'number' ? `turn:${message.turnIndex}` : `message:${message.id}`
-    const current = fileChangeMessagesByTurnKey.get(turnKey)
+    const fileChangeKey = turnKey ?? `message:${message.id}`
+    const current = fileChangeMessagesByTurnKey.get(fileChangeKey)
     if (current) current.push(message)
-    else fileChangeMessagesByTurnKey.set(turnKey, [message])
+    else fileChangeMessagesByTurnKey.set(fileChangeKey, [message])
   }
 
   const summaries: Record<string, TurnFileChangeSummary> = {}
@@ -2571,16 +2574,7 @@ function forkResponse(anchorMessageId: string): void {
   })
 }
 
-const editableTurnIdByMessageId = computed<Record<string, string>>(() => {
-  const next: Record<string, string> = {}
-  for (const message of props.messages) {
-    if (message.role !== 'user' || typeof message.turnIndex !== 'number') continue
-    const turnId = typeof message.turnId === 'string' && message.turnId.length > 0 ? message.turnId : ''
-    if (!turnId || message.text.trim().length === 0) continue
-    next[message.id] = turnId
-  }
-  return next
-})
+const editableTurnIdByMessageId = computed(() => buildEditableConversationTurns(props.messages))
 
 function showEditMessageButton(message: UiMessage): boolean {
   return typeof editableTurnIdByMessageId.value[message.id] === 'string'

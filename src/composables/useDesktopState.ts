@@ -760,8 +760,17 @@ function mergeMessages(
     .map((message) => message.turnIndex)
     .filter((turnIndex): turnIndex is number => typeof turnIndex === 'number' && Number.isFinite(turnIndex))
   const earliestIncomingTurnIndex = incomingTurnIndexes.length > 0 ? Math.min(...incomingTurnIndexes) : null
-  const shouldPreserveMissingMessage = (message: UiMessage): boolean => {
-    if (options.preserveOnlyOlder !== true || earliestIncomingTurnIndex === null) return true
+  const incomingTurnIds = new Set(incoming.map((message) => message.turnId).filter(Boolean))
+  const firstCoveredPreviousIndex = previous.findIndex((message) => incomingTurnIds.has(message.turnId))
+  const shouldPreserveMissingMessage = (message: UiMessage, previousIndex: number): boolean => {
+    if (options.preserveOnlyOlder !== true || isOptimisticUserMessage(message)) return true
+    if (earliestIncomingTurnIndex === null && incomingTurnIds.size > 0) {
+      // An official cursor page has stable IDs, not absolute indexes. Keep
+      // only the prefix before the first covered turn; missing rows after
+      // that boundary may have been removed by a Desktop rollback.
+      return firstCoveredPreviousIndex >= 0 && previousIndex < firstCoveredPreviousIndex
+    }
+    if (earliestIncomingTurnIndex === null) return true
     const turnIndex = message.turnIndex
     // Messages without a turn index (optimistic/live rows from older bridge
     // versions) are retained conservatively; indexed rows in the projected
@@ -790,7 +799,7 @@ function mergeMessages(
       previousIncomingAnchor = matchingIncomingIndex
       continue
     }
-    if (!shouldPreserveMissingMessage(previousMessage)) continue
+    if (!shouldPreserveMissingMessage(previousMessage, previousIndex)) continue
     if (isOptimisticUserMessage(previousMessage) && hasEquivalentUserMessage(previousMessage, incoming)) continue
 
     const turnIndex = previousMessage.turnIndex
@@ -1534,6 +1543,7 @@ export function useDesktopState() {
   // validates it against the server revision before deciding whether a full
   // thread/read is still required. Ordinary browsers never populate this map.
   const androidCacheRestoreAttemptedByThreadId = new Set<string>()
+  const androidCacheNeedsHydrationByThreadId = new Set<string>()
   const androidCacheWriteTimerByThreadId = new Map<string, ReturnType<typeof setTimeout>>()
   const livePlanMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
   const liveAgentMessagesByThreadId = ref<Record<string, UiMessage[]>>({})
@@ -3476,6 +3486,7 @@ export function useDesktopState() {
     const timer = setTimeout(() => {
       androidCacheWriteTimerByThreadId.delete(threadId)
       void writeAndroidConversationCache(threadId, {
+        requiresHydration: androidCacheNeedsHydrationByThreadId.has(threadId),
         sessionRevision: loadedSessionRevisionByThreadId.value[threadId] ?? currentThreadSessionRevision(threadId),
         updatedAtIso: currentThreadVersion(threadId),
         hasMoreOlder: hasMoreOlderMessagesByThreadId.value[threadId] === true,
@@ -5686,6 +5697,7 @@ export function useDesktopState() {
           androidCacheRestoreAttemptedByThreadId.add(threadId)
           restoredAndroidCache = await readAndroidConversationCache(threadId)
           if (restoredAndroidCache && (persistedMessagesByThreadId.value[threadId] ?? []).length === 0) {
+            if (restoredAndroidCache.requiresHydration) androidCacheNeedsHydrationByThreadId.add(threadId)
             // Restore only persisted conversation rows. Live overlays, task
             // state, queues, and pending requests always come from the server.
             persistedMessagesByThreadId.value = {
@@ -5724,9 +5736,10 @@ export function useDesktopState() {
           ? sessionRevision === restoredAndroidCache.sessionRevision
           : Boolean(version && restoredAndroidCache.updatedAtIso && version === restoredAndroidCache.updatedAtIso)
       )
-      const shouldPreferLiveState = options.preferLiveState === true
+      const cacheNeedsHydration = androidCacheNeedsHydrationByThreadId.has(threadId)
+      const shouldPreferLiveState = options.preferLiveState === true && !cacheNeedsHydration
       const canReuseLoadedMessages =
-        options.force !== true && cacheRevisionMatches && !hasSessionRevisionChange
+        !cacheNeedsHydration && options.force !== true && cacheRevisionMatches && !hasSessionRevisionChange
         && loadedMessagesByThreadId.value[threadId] === true &&
         (
           loadedRecently ||
@@ -5775,7 +5788,7 @@ export function useDesktopState() {
         // paint, then hydrate commands and older turns asynchronously.  A
         // forced refresh always bypasses this path so it remains authoritative
         // after a task completes or a stream gap is detected.
-        if (options.fast !== false && options.force !== true) {
+        if (!cacheNeedsHydration && options.fast !== false && options.force !== true) {
           try {
             detail = await getThreadFastDetail(threadId)
             loadedFastSnapshot = detail.partial === true
@@ -5785,7 +5798,7 @@ export function useDesktopState() {
         } else {
           detail = await getThreadDetail(threadId)
         }
-        if (detail.inProgress && !loadedFastSnapshot) {
+        if (detail.inProgress && !loadedFastSnapshot && !cacheNeedsHydration) {
           try {
             // The live endpoint merges the app-server snapshot with items and
             // command output observed since the last persisted read.  It is a
@@ -5928,7 +5941,14 @@ export function useDesktopState() {
       markThreadMessagesPersisted(threadId, nextMessages)
       replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
       rebindLiveFileChangeTurnIndices(threadId)
-      const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+      const cachedPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+      // Truncated cache rows are only a preview. After a successful official
+      // page read, keep its complete items and paginate omitted older turns.
+      // Retaining clipped rows here would make their missing text permanent.
+      const previousPersisted = cacheNeedsHydration
+        ? cachedPersisted.filter((message) => message.messageType === 'userMessage.optimistic')
+        : cachedPersisted
+      if (cacheNeedsHydration) androidCacheNeedsHydrationByThreadId.delete(threadId)
       const incomingProjectionIsPartial = detail.hasMoreOlder === true
         || detail.partial === true
         || detail.fullHydrationDeferred === true
@@ -5942,7 +5962,10 @@ export function useDesktopState() {
           || (liveStateErrorObserved && nextMessages.length === 0)
           || (options.silent === true && options.force !== true)
           || hasOptimisticUserMessages(previousPersisted),
-        preserveOnlyOlder: incomingProjectionIsPartial,
+        // A fast session-tail projection may omit command/skill items inside
+        // a covered turn. Only complete official turn pages replace that
+        // window authoritatively; bounded previews must retain richer rows.
+        preserveOnlyOlder: incomingProjectionIsPartial && !loadedFastSnapshot && detail.fullHydrationDeferred !== true,
       })
       setPersistedMessagesForThread(threadId, mergedMessages)
 
@@ -6976,12 +6999,7 @@ export function useDesktopState() {
 
     const persisted = persistedMessagesByThreadId.value[threadId] ?? []
     const matchedMessage = persisted.find((message) => message.turnId === turnId)
-    const turnIndex = typeof matchedMessage?.turnIndex === 'number' ? matchedMessage.turnIndex : -1
-    if (turnIndex < 0) return
-    const maxTurnIndex = persisted.reduce((max, m) => (typeof m.turnIndex === 'number' && m.turnIndex > max ? m.turnIndex : max), -1)
-    if (maxTurnIndex < 0 || turnIndex > maxTurnIndex) return
-    const numTurns = maxTurnIndex - turnIndex + 1
-    if (numTurns < 1) return
+    if (!matchedMessage) return
 
     isRollingBack.value = true
     error.value = ''
@@ -6990,7 +7008,7 @@ export function useDesktopState() {
       if (threadCwd) {
         await revertThreadFileChanges(threadId, turnId, threadCwd)
       }
-      const nextMessages = await rollbackThread(threadId, numTurns)
+      const nextMessages = await rollbackThread(threadId, turnId)
       setPersistedMessagesForThread(threadId, nextMessages)
       setLiveAgentMessagesForThread(threadId, [])
       clearLiveReasoningForThread(threadId)
@@ -7511,6 +7529,7 @@ export function useDesktopState() {
     shouldAutoScrollOnNextAgentEvent = false
     persistedMessagesByThreadId.value = {}
     androidCacheRestoreAttemptedByThreadId.clear()
+    androidCacheNeedsHydrationByThreadId.clear()
     for (const timer of androidCacheWriteTimerByThreadId.values()) clearTimeout(timer)
     androidCacheWriteTimerByThreadId.clear()
     livePlanMessagesByThreadId.value = {}

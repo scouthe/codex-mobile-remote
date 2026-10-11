@@ -17,6 +17,7 @@ function installFakeSharedBridge(options: {
   rejectDuplicateResume?: boolean
   rejectResumeWithActiveWriter?: boolean
   threadListResult?: unknown
+  threadTurnPages?: Record<string, { data: unknown[]; nextCursor: string | null }>
   threadReadResults?: unknown[]
   threadSummarySnapshot?: unknown
 } = {}) {
@@ -61,6 +62,12 @@ function installFakeSharedBridge(options: {
       }
       if (method === 'thread/list') {
         return options.threadListResult ?? { data: [] }
+      }
+      if (method === 'thread/turns/list') {
+        const cursor = (params as { cursor?: string | null }).cursor ?? ''
+        const page = options.threadTurnPages?.[cursor]
+        if (page) return page
+        throw new Error('Method not found')
       }
       if (method === 'config/read') {
         return { config: { model: 'gpt-5.5', model_provider: 'openai', model_providers: {} } }
@@ -138,6 +145,50 @@ afterEach(() => {
 })
 
 describe('shared thread observer HTTP path', () => {
+  it('uses full-item official pages for current and older history without a full rollout read', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-official-history-'))
+    const previousHome = process.env.CODEX_HOME
+    process.env.CODEX_HOME = directory
+    const turn = (id: string) => ({ id, status: 'completed', itemsView: 'full', items: [{ type: 'agentMessage', id: `message-${id}`, text: id }] })
+    const fake = installFakeSharedBridge({
+      threadReadResults: [{ thread: { id: 'shared-thread', turns: [], path: null, status: { type: 'idle' } } }],
+      threadTurnPages: {
+        '': { data: [turn('3'), turn('2')], nextCursor: 'older' },
+        older: { data: [turn('1')], nextCursor: null },
+      },
+    })
+    const instance = createServer()
+    const server = createHttpServer(instance.app)
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Missing test address')
+      const endpoint = `http://127.0.0.1:${address.port}`
+      const latest = await fetch(`${endpoint}/codex-api/rpc`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: 'thread/read', params: { threadId: 'shared-thread', includeTurns: true } }),
+      })
+      expect(latest.status).toBe(200)
+      const latestPayload = await latest.json() as { result: { thread: { turns: Array<{ id: string }> } } }
+      expect(latestPayload.result).toMatchObject({ threadTurnStartIndexKnown: false, hasMoreOlder: true })
+      expect(latestPayload.result.thread.turns.map((item: { id: string }) => item.id)).toEqual(['2', '3'])
+      const older = await fetch(`${endpoint}/codex-api/thread-turn-page?threadId=shared-thread&beforeTurnId=2&limit=30`)
+      expect(older.status).toBe(200)
+      const olderPayload = await older.json() as { result: { thread: { turns: Array<{ id: string }> } } }
+      expect(olderPayload).toMatchObject({ threadTurnStartIndexKnown: false, hasMoreOlder: false })
+      expect(olderPayload.result.thread.turns.map((item: { id: string }) => item.id)).toEqual(['1'])
+      expect(fake.calls.filter((call) => call.method === 'thread/read').every((call) => (call.params as { includeTurns: boolean }).includeTurns === false)).toBe(true)
+      expect(fake.calls.filter((call) => call.method === 'thread/turns/list')).toHaveLength(2)
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      instance.dispose()
+      fake.restore()
+      if (previousHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = previousHome
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   it('serializes queue remove and reorder mutations from concurrent clients', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'codex-mobile-queue-'))
     const previousCodexHome = process.env.CODEX_HOME
@@ -953,9 +1004,9 @@ describe('shared thread observer HTTP path', () => {
       })
 
       expect(response.status).toBe(200)
-      expect(fake.calls.map((call) => call.method)).toEqual(['thread/resume', 'thread/read', 'thread/read'])
+      expect(fake.calls.map((call) => call.method)).toEqual(['thread/resume', 'thread/read', 'thread/turns/list', 'thread/read'])
       expect((fake.calls[1]?.params as { includeTurns?: boolean })?.includeTurns).toBe(false)
-      expect((fake.calls[2]?.params as { includeTurns?: boolean })?.includeTurns).toBe(true)
+      expect((fake.calls[3]?.params as { includeTurns?: boolean })?.includeTurns).toBe(true)
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
       instance.dispose()

@@ -919,7 +919,8 @@ async function getThreadMessagesV2(threadId: string): Promise<UiMessage[]> {
     threadId,
     includeTurns: true,
   })
-  return normalizeThreadMessagesV2(payload, readThreadTurnStartIndex(payload))
+  const messages = normalizeThreadMessagesV2(payload, readThreadTurnStartIndex(payload))
+  return asRecord(payload)?.threadTurnStartIndexKnown === false ? omitUnknownTurnIndexes(messages) : messages
 }
 
 async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
@@ -942,6 +943,7 @@ async function getThreadDetailV2(threadId: string): Promise<{
   sessionRevision?: string
   sessionActivityKnown?: boolean
   partial?: boolean
+  fullHydrationDeferred?: boolean
   taskState?: TaskState
   error?: string | null
 }> {
@@ -951,6 +953,9 @@ async function getThreadDetailV2(threadId: string): Promise<{
   })
   const startTurnIndex = readThreadTurnStartIndex(payload)
   const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
+  const pageMetadata = asRecord(payload)
+  const turnIndexesKnown = pageMetadata?.threadTurnStartIndexKnown !== false
+  const hasMoreOlder = typeof pageMetadata?.hasMoreOlder === 'boolean' ? pageMetadata.hasMoreOlder : startTurnIndex > 0
   const rawThread = asRecord(payload.thread)
   const rawRevision = rawThread?.sessionRevision ?? rawThread?.revision
   const sessionRevision = typeof rawRevision === 'string'
@@ -978,13 +983,14 @@ async function getThreadDetailV2(threadId: string): Promise<{
   return {
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
-    messages: normalized,
+    messages: turnIndexesKnown ? normalized : omitUnknownTurnIndexes(normalized),
     inProgress: readThreadInProgressFromResponse(payload),
     activeTurnId: readActiveTurnIdFromResponse(payload),
     ...(terminalTurnId ? { terminalTurnId } : {}),
-    hasMoreOlder: startTurnIndex > 0,
-    ...(startTurnIndex > 0 ? { partial: true } : {}),
-    turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+    hasMoreOlder,
+    ...(hasMoreOlder || pageMetadata?.partial === true ? { partial: true } : {}),
+    ...(typeof pageMetadata?.fullHydrationDeferred === 'boolean' ? { fullHydrationDeferred: pageMetadata.fullHydrationDeferred } : {}),
+    turnIndexByTurnId: turnIndexesKnown ? buildTurnIndexByTurnId(payload, startTurnIndex) : {},
     ...(sessionRevision ? { sessionRevision } : {}),
     ...(sessionActivityKnown ? { sessionActivityKnown: true } : {}),
     taskState,
@@ -1182,19 +1188,22 @@ async function getOlderThreadMessagesV2(threadId: string, beforeTurnId: string, 
     result?: ThreadReadResponse
     hasMoreOlder?: unknown
     startTurnIndex?: unknown
+    threadTurnStartIndexKnown?: unknown
   }
   if (!payload.result) {
     throw new Error('Older thread page response did not include a thread result')
   }
   const startTurnIndex = Math.max(0, Math.floor(typeof payload.startTurnIndex === 'number' ? payload.startTurnIndex : 0))
+  const indexesKnown = payload.threadTurnStartIndexKnown !== false
+  const normalized = normalizeThreadMessagesV2(payload.result, startTurnIndex)
 
   return {
-    messages: normalizeThreadMessagesV2(payload.result, startTurnIndex),
+    messages: indexesKnown ? normalized : omitUnknownTurnIndexes(normalized),
     inProgress: readThreadInProgressFromResponse(payload.result),
     activeTurnId: readActiveTurnIdFromResponse(payload.result),
     hasMoreOlder: payload.hasMoreOlder === true,
     startTurnIndex,
-    turnIndexByTurnId: buildTurnIndexByTurnId(payload.result, startTurnIndex),
+    turnIndexByTurnId: indexesKnown ? buildTurnIndexByTurnId(payload.result, startTurnIndex) : {},
   }
 }
 
@@ -1249,6 +1258,7 @@ export async function getThreadDetail(threadId: string): Promise<{
   sessionRevision?: string
   sessionActivityKnown?: boolean
   partial?: boolean
+  fullHydrationDeferred?: boolean
   taskState?: TaskState
   error?: string | null
 }> {
@@ -1452,7 +1462,7 @@ export async function getThreadLiveState(threadId: string): Promise<ThreadLiveSt
       ...(typeof record?.finishedAt === 'string' ? { finishedAt: record.finishedAt } : {}),
       ...(typeof record?.error === 'string' ? { error: record.error } : record?.error === null ? { error: null } : {}),
       ...(timeline ? { timeline } : {}),
-      ...(record?.fullHydrationDeferred === true ? { fullHydrationDeferred: true } : {}),
+      ...(typeof record?.fullHydrationDeferred === 'boolean' ? { fullHydrationDeferred: record.fullHydrationDeferred } : {}),
     }
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load live thread state ${normalizedThreadId}`, 'thread-live-state')
@@ -2105,14 +2115,16 @@ export async function resumeThread(threadId: string): Promise<ResumedThread> {
     const payload = await callRpc<ThreadResumeResponse>('thread/resume', { threadId })
     const startTurnIndex = readThreadTurnStartIndex(payload)
     const messages = normalizeThreadMessagesV2(payload, startTurnIndex)
+    const page = asRecord(payload)
+    const indexesKnown = page?.threadTurnStartIndexKnown !== false
     return {
       model: normalizeThreadModelFromPayload(payload),
       modelProvider: normalizeThreadModelProviderFromPayload(payload),
-      messages,
+      messages: indexesKnown ? messages : omitUnknownTurnIndexes(messages),
       inProgress: readThreadInProgressFromResponse(payload),
       activeTurnId: readActiveTurnIdFromResponse(payload),
-      hasMoreOlder: startTurnIndex > 0,
-      turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+      hasMoreOlder: typeof page?.hasMoreOlder === 'boolean' ? page.hasMoreOlder : startTurnIndex > 0,
+      turnIndexByTurnId: indexesKnown ? buildTurnIndexByTurnId(payload, startTurnIndex) : {},
     }
   })()
 
@@ -2161,8 +2173,9 @@ export async function clearThreadGoal(threadId: string): Promise<void> {
   await callRpc('thread/goal/clear', { threadId })
 }
 
-export async function rollbackThread(threadId: string, numTurns: number): Promise<UiMessage[]> {
-  const payload = await callRpc<ThreadReadResponse>('thread/rollback', { threadId, numTurns })
+export async function rollbackThread(threadId: string, target: number | string): Promise<UiMessage[]> {
+  const params = typeof target === 'string' ? { threadId, targetTurnId: target } : { threadId, numTurns: target }
+  const payload = await callRpc<ThreadReadResponse>('thread/rollback', params)
   return normalizeThreadMessagesV2(payload, readThreadTurnStartIndex(payload))
 }
 
