@@ -458,7 +458,7 @@ class MainActivity : AppCompatActivity() {
         showSelecting(profiles.size)
         endpointSelector.select(profiles) { selected, results ->
             if (selected == null) {
-                showConfiguration(getString(R.string.error_connection))
+                showConfiguration(getString(R.string.error_no_reachable_servers))
                 return@select
             }
             val reachableCount = results.count { it.reachable }
@@ -472,6 +472,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun connect(profile: RemoteConnectionStore.Profile) {
+        endpointSelector.cancel()
         currentProfile = profile
         editingProfileId = profile.id
         currentBaseUri = Uri.parse(profile.baseUrl)

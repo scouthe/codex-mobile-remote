@@ -25,8 +25,8 @@ The WebView keeps the existing Vue UI and WebSocket/SSE protocol. Native code
 adds the pieces that are awkward or unreliable in a browser:
 
 - remembers multiple server addresses and their labels;
-- probes LAN, public, and Tailscale addresses in parallel and connects to the
-  fastest reachable endpoint on launch;
+- probes LAN, public, and Tailscale addresses in parallel and promptly connects
+  to a usable endpoint on launch, without waiting for stalled addresses;
 - stores an optional codexapp password in the Android Keystore;
 - restores WebView cookies for a long-lived login session;
 - retries after Tailscale/Wi-Fi transitions with bounded backoff;
@@ -66,9 +66,30 @@ Termux bootstrap, a bundled server asset, or any local Codex runtime helper.
    Leave it blank when the server trusts the Tailscale identity or when you
    prefer the in-page login form.
 4. Tap **Save address**, then **Connect fastest**. On the next launch the app
-   probes all saved addresses and selects the one with the lowest response
-   latency. A server response such as 401 still counts as reachable; the saved
-   password (if present) is applied by the WebView afterward.
+   probes all saved addresses. After the first usable response, it allows a
+   120 ms race window and selects the lowest measured latency among the usable
+   responses received. Selection ends immediately if every probe has finished,
+   and always has a 3 second total budget independent of DNS and socket timeouts.
+   Unfinished probes are canceled when an address is selected, when settings are
+   opened, or when another selection starts. All failures leave the saved-address
+   form editable instead of navigating to an arbitrary address.
+
+The lightweight probe reads `/auth/status`; it does not query or start the
+Codex app-server and never sends a saved password. It recognizes the Codex
+status JSON, the existing login page, and the first-run setup page. HTTP 401
+counts as an authentication challenge. HTTP 403 only qualifies when its body
+is the Codex login page: the LAN-only public-access denial and generic forbidden
+pages are excluded, as are redirects, 404, 429 and 5xx responses. The WebView
+continues to apply the saved password or display the in-page login afterward.
+
+At most 16 probes run concurrently (the saved-profile limit), with at most
+16 KiB inspected per response. The 120 ms window avoids waiting seconds for
+offline alternatives while allowing near-simultaneous responses to compete;
+the 3 second budget bounds a fully failed selection. Platform DNS lookups may
+finish after cancellation, but their results cannot navigate the WebView or
+extend that budget. Connection cleanup runs off the UI thread.
+
+Run the selection and HTTP-probe regression tests with `./gradlew testDebugUnitTest`.
 
 Open connection settings at any time to add, edit, use, or delete an address.
 The old single-address format is migrated automatically on first launch after
