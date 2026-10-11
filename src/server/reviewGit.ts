@@ -81,6 +81,45 @@ type DetectedBaseBranch = {
   gitRef: string
 }
 
+const UNTRACKED_DIFF_CONCURRENCY = 4
+let activeUntrackedDiffs = 0
+const untrackedDiffWaiters: Array<() => void> = []
+const pendingReviewReads = new Map<string, Promise<unknown>>()
+
+// Only share work while a request is running. Completed snapshots must not
+// hide changes made by the editor, Codex, or a separate Git client.
+function shareReviewRead<T>(key: string, read: () => Promise<T>): Promise<T> {
+  const pending = pendingReviewReads.get(key)
+  if (pending) return pending as Promise<T>
+  const request = read().finally(() => {
+    if (pendingReviewReads.get(key) === request) pendingReviewReads.delete(key)
+  })
+  pendingReviewReads.set(key, request)
+  return request
+}
+
+// Clear every cwd alias, including subdirectories of the mutated repository.
+// In-flight callers still receive their response, but new readers cannot join
+// a snapshot that started before the mutation.
+export function invalidateReviewReads(): void {
+  pendingReviewReads.clear()
+}
+
+async function withUntrackedDiffSlot<T>(operation: () => Promise<T>): Promise<T> {
+  if (activeUntrackedDiffs >= UNTRACKED_DIFF_CONCURRENCY) {
+    await new Promise<void>((resolve) => untrackedDiffWaiters.push(resolve))
+  } else {
+    activeUntrackedDiffs += 1
+  }
+  try {
+    return await operation()
+  } finally {
+    const next = untrackedDiffWaiters.shift()
+    if (next) next()
+    else activeUntrackedDiffs -= 1
+  }
+}
+
 function getNodeErrorCode(error: unknown): string {
   return typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : ''
 }
@@ -322,11 +361,11 @@ async function listUntrackedPaths(repoRoot: string): Promise<string[]> {
 }
 
 async function diffUntrackedFile(repoRoot: string, path: string): Promise<string> {
-  const result = await runCommandResult(
+  const result = await withUntrackedDiffSlot(() => runCommandResult(
     'git',
     ['diff', '--no-index', '--no-ext-diff', '--patch', '--', '/dev/null', path],
     { cwd: repoRoot },
-  )
+  ))
 
   if (result.code !== 0 && result.code !== 1) {
     const details = [result.stderr, result.stdout].filter(Boolean).join('\n')
@@ -463,9 +502,20 @@ async function buildWorkspaceDiff(repoRoot: string, workspaceView: ReviewWorkspa
     }
   }
 
-  const untrackedDiffs = await Promise.all(
-    (await listUntrackedPaths(repoRoot)).map(async (path) => await diffUntrackedFile(repoRoot, path)),
-  )
+  const untrackedPaths = await listUntrackedPaths(repoRoot)
+  const untrackedDiffs = new Array<string>(untrackedPaths.length)
+  let nextPathIndex = 0
+  // A small worker pool preserves ls-files order without queuing one process
+  // per file. The shared slots also bound concurrent requests for other repos.
+  await Promise.all(Array.from(
+    { length: Math.min(UNTRACKED_DIFF_CONCURRENCY, untrackedPaths.length) },
+    async () => {
+      while (nextPathIndex < untrackedPaths.length) {
+        const index = nextPathIndex++
+        untrackedDiffs[index] = await diffUntrackedFile(repoRoot, untrackedPaths[index]!)
+      }
+    },
+  ))
 
   return [trackedDiff, ...untrackedDiffs]
     .map((chunk) => chunk.trim())
@@ -917,7 +967,12 @@ async function applyAllAction(repoRoot: string, action: ReviewAction, workspaceV
 async function initializeGitRepository(cwd: string): Promise<void> {
   const normalizedCwd = normalizeInputCwd(cwd)
   await ensureDirectory(normalizedCwd)
-  await runCommand('git', ['init'], { cwd: normalizedCwd })
+  invalidateReviewReads()
+  try {
+    await runCommand('git', ['init'], { cwd: normalizedCwd })
+  } finally {
+    invalidateReviewReads()
+  }
 }
 
 async function applyReviewAction(payload: unknown): Promise<ReviewSnapshot> {
@@ -953,13 +1008,18 @@ async function applyReviewAction(payload: unknown): Promise<ReviewSnapshot> {
     throw new Error('Not a Git repository')
   }
 
-  if (level === 'all') {
-    await applyAllAction(repoRoot, action, workspaceView)
-  } else {
-    if (!patch.trim()) {
-      throw new Error('Missing patch payload')
+  invalidateReviewReads()
+  try {
+    if (level === 'all') {
+      await applyAllAction(repoRoot, action, workspaceView)
+    } else {
+      if (!patch.trim()) {
+        throw new Error('Missing patch payload')
+      }
+      await applyPatchAction(repoRoot, action, workspaceView, patch)
     }
-    await applyPatchAction(repoRoot, action, workspaceView, patch)
+  } finally {
+    invalidateReviewReads()
   }
 
   return await buildReviewSnapshot(normalizedCwd, scope, workspaceView)
@@ -981,7 +1041,10 @@ export async function handleReviewRoutes(
 
     try {
       setJson(res, 200, {
-        data: await buildReviewSummary(cwd, workspaceView),
+        data: await shareReviewRead(
+          JSON.stringify(['summary', normalizeInputCwd(cwd), 'workspace', workspaceView, '', '']),
+          () => buildReviewSummary(cwd, workspaceView),
+        ),
       })
     } catch (error) {
       setJson(res, 500, { error: getErrorMessage(error, 'Failed to load review summary') })
@@ -1006,7 +1069,10 @@ export async function handleReviewRoutes(
 
     try {
       setJson(res, 200, {
-        data: await buildReviewSnapshot(cwd, scope, workspaceView, baseBranch, commitSha),
+        data: await shareReviewRead(
+          JSON.stringify(['snapshot', normalizeInputCwd(cwd), scope, workspaceView, baseBranch, commitSha]),
+          () => buildReviewSnapshot(cwd, scope, workspaceView, baseBranch, commitSha),
+        ),
       })
     } catch (error) {
       setJson(res, 500, { error: getErrorMessage(error, 'Failed to load review snapshot') })
