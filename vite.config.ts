@@ -124,6 +124,20 @@ export default defineConfig({
       ],
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // Vue's runtime is shared by the eagerly loaded shell and every
+        // async panel. Keep it out of the shell chunk so the initial bundle
+        // stays below the size budget without duplicating framework code.
+        manualChunks(id) {
+          if (/\/node_modules\/(?:@vue|vue-router)\//u.test(id)) return "vue-runtime";
+          if (/\/src\/composables\/useDesktopState\.ts$/u.test(id)) return "desktop-state";
+          return undefined;
+        },
+      },
+    },
+  },
   plugins: [
     vue(),
     tailwindcss(),
