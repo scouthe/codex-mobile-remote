@@ -9,6 +9,21 @@ import { createAuthSession } from './authMiddleware.js'
 import express from 'express'
 import { PhoneControlManager } from './phoneControl/manager.js'
 
+const writeFailure = vi.hoisted(() => ({ request: false }))
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return {
+    ...actual,
+    writeFile: vi.fn(async (...args: any[]) => {
+      if (writeFailure.request && String(args[0]).endsWith('/request.json')) {
+        throw new Error('simulated request persistence failure')
+      }
+      return actual.writeFile(...args as Parameters<typeof actual.writeFile>)
+    }),
+  }
+})
+
 const directories: string[] = []
 const managers: PhoneAgentManager[] = []
 const servers: Server[] = []
@@ -45,6 +60,7 @@ setTimeout(()=>{send({type:'result',message:input.purpose,status:'succeeded'});p
 }
 
 afterEach(async () => {
+  writeFailure.request = false
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => {
     server.closeAllConnections(); server.close(() => resolve())
   })))
@@ -239,6 +255,17 @@ describe('local phone agent task lifecycle', () => {
     await expect(manager.start({ purpose: '' })).rejects.toMatchObject({ status: 400 })
     await expect(manager.start({ purpose: 'test', stepLimit: 51 })).rejects.toMatchObject({ status: 400 })
     expect((await manager.state()).runs).toHaveLength(0)
+  })
+
+  it('records a failed terminal state when request persistence fails after reservation', async () => {
+    const { manager } = await fixture()
+    writeFailure.request = true
+
+    await expect(manager.start({ purpose: 'persist failure' })).rejects.toThrow('simulated request persistence failure')
+
+    const state = await manager.state()
+    expect(state.runs).toHaveLength(1)
+    expect(state.runs[0]).toMatchObject({ status: 'failed', message: 'Agent 启动失败：simulated request persistence failure' })
   })
 
   it('preserves Chinese instructions split across HTTP byte chunks and rejects invalid JSON', async () => {

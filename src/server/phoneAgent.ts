@@ -200,6 +200,11 @@ export class PhoneAgentManager {
     } catch (error) {
       if (this.active === active) this.active = undefined
       if (run.status === 'stopping' && this.runs.has(run.id)) this.event(run, { type: 'result', status: 'stopped', message: '任务已停止，可手动操作手机。' })
+      else if (this.runs.has(run.id)) this.event(run, {
+        type: 'result',
+        status: 'failed',
+        message: `Agent 启动失败：${error instanceof Error ? error.message : '无法启动任务。'}`,
+      })
       active.finish()
       throw error
     }
