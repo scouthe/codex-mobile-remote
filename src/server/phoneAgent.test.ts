@@ -3,9 +3,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, request as httpRequest, type Server } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createPhoneAgentMiddleware, PhoneAgentManager } from './phoneAgent.js'
+import { PhoneAgentManager } from './phoneAgent.js'
+import { createPhoneAgentMiddleware } from './phoneAgentMiddleware.js'
 import { createAuthSession } from './authMiddleware.js'
 import express from 'express'
+import { PhoneControlManager } from './phoneControl/manager.js'
 
 const directories: string[] = []
 const managers: PhoneAgentManager[] = []
@@ -94,6 +96,116 @@ describe('local phone agent task lifecycle', () => {
     expect(await manager.start({ purpose: 'next' })).toHaveProperty('id')
   })
 
+  it('waits for the Agent to exit, reserves control across browsers, and releases explicitly', async () => {
+    const { manager } = await fixture()
+    const run = await manager.start({ purpose: 'slow' })
+    await vi.waitFor(async () => expect((await manager.detail(run.id)).run.step).toBe(1))
+    const lease = await manager.claimManual()
+    expect((await manager.detail(run.id)).run.status).toBe('stopped')
+    expect(lease.previousRun?.id).toBe(run.id)
+    await expect(manager.claimManual()).rejects.toMatchObject({ status: 409 })
+    await expect(manager.start({ purpose: 'competing task' })).rejects.toMatchObject({ status: 409 })
+    lease.release()
+    expect(await manager.start({ purpose: 'next' })).toHaveProperty('id')
+  })
+
+  it('can take over while Agent startup is still discovering the phone', async () => {
+    const { manager } = await fixture()
+    const starting = manager.start({ purpose: 'slow' })
+    const claiming = manager.claimManual()
+    const [started, claimed] = await Promise.allSettled([starting, claiming])
+    expect(started.status).toBe('rejected')
+    expect(claimed.status).toBe('fulfilled')
+    if (claimed.status === 'fulfilled') claimed.value.release()
+    expect(await manager.start({ purpose: 'next' })).toHaveProperty('id')
+  })
+
+  it('serializes manual input and waits for input and encoder cleanup before handback', async () => {
+    const { manager } = await fixture()
+    const first = await manager.start({ purpose: 'slow' })
+    await vi.waitFor(async () => expect((await manager.detail(first.id)).run.step).toBe(1))
+    let finishInput!: () => void, finishMirror!: () => void
+    const inputDone = new Promise<void>(resolve => { finishInput = resolve })
+    const mirrorDone = new Promise<void>(resolve => { finishMirror = resolve })
+    const stopMirror = vi.fn(() => mirrorDone)
+    const execute = vi.fn(() => inputDone)
+    const control = new PhoneControlManager(manager, {
+      available: () => true,
+      mirror: () => ({ start: async () => {}, stop: stopMirror, format: { width: 560, height: 1280, epoch: 1, codec: 'avc1.640020' } }),
+      input: () => ({ execute }),
+    })
+    const session = await control.acquire({ deviceId: 'phone-test' })
+    expect(session.previousRunId).toBe(first.id)
+    await expect(control.acquire({ deviceId: 'phone-test' })).rejects.toMatchObject({ status: 409 })
+    await control.stream(session.id, { format() {}, data() {}, error() {}, close() {} })
+    const action = control.input(session.id, { type: 'key', key: 'home' })
+    await expect(control.input(session.id, { type: 'key', key: 'back' })).rejects.toMatchObject({ status: 409 })
+    const resuming = control.resume({ sessionId: session.id, previousRunId: first.id, deviceId: 'phone-test', note: '弹窗已处理' })
+    await vi.waitFor(() => expect(stopMirror).toHaveBeenCalledOnce())
+    finishMirror()
+    await expect(manager.start({ purpose: 'too early' })).rejects.toMatchObject({ status: 409 })
+    finishInput(); await action
+    const resumed = await resuming
+    expect(execute).toHaveBeenCalledOnce()
+    expect(resumed.purpose).toContain('弹窗已处理')
+    expect(resumed.purpose).toContain('请先查看当前屏幕')
+    expect(control.state().busy).toBe(false)
+    control.dispose()
+  })
+
+  it('expires a disconnected manual lease without restarting the Agent', async () => {
+    const { manager } = await fixture()
+    const stop = vi.fn(async () => {})
+    const control = new PhoneControlManager(manager, { available: () => true, leaseMs: 60,
+      mirror: () => ({ start: async () => {}, stop, format: undefined }) })
+    const session = await control.acquire({ deviceId: 'phone-test' })
+    await control.stream(session.id, { format() {}, data() {}, error() {}, close() {} })
+    await vi.waitFor(() => expect(control.state().busy).toBe(false))
+    expect(stop).toHaveBeenCalledOnce()
+    expect((await manager.state()).runs).toHaveLength(0)
+    await expect(control.input(session.id, { type: 'key', key: 'home' })).rejects.toMatchObject({ status: 409 })
+    control.dispose()
+  })
+
+  it('allows only wake before the first video frame, so a sleeping phone can be reached', async () => {
+    const { manager } = await fixture()
+    const execute = vi.fn(async () => {})
+    const control = new PhoneControlManager(manager, { available: () => true,
+      input: () => ({ execute }), mirror: () => ({ start: async () => {}, stop: async () => {}, format: undefined }) })
+    const session = await control.acquire({ deviceId: 'phone-test' })
+    await control.stream(session.id, { format() {}, data() {}, error() {}, close() {} })
+    await control.input(session.id, { type: 'key', key: 'wake' })
+    expect(execute).toHaveBeenCalledExactlyOnceWith({ type: 'key', key: 'wake' }, undefined)
+    await expect(control.input(session.id, { type: 'key', key: 'home' })).rejects.toMatchObject({ status: 409 })
+    await control.release(session.id); control.dispose()
+  })
+
+  it('releases the encoder on HTTP stream disconnect and rejects a second stream', async () => {
+    const { manager } = await fixture()
+    const stop = vi.fn(async () => {})
+    const control = new PhoneControlManager(manager, { available: () => true, mirror: output => ({
+      start: async () => { output.format({ width: 560, height: 1280, epoch: 1, codec: 'avc1.640020' }) },
+      stop, format: undefined,
+    }) })
+    const middleware = createPhoneAgentMiddleware(manager, control)
+    const server = createServer((req, res) => middleware(req, res, () => res.end())); servers.push(server)
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const base = `http://127.0.0.1:${(server.address() as { port: number }).port}/phone-agent-api/control`
+    const acquired = await fetch(base + '/sessions', { method: 'POST', body: JSON.stringify({ deviceId: 'phone-test' }) })
+    const { session } = await acquired.json() as { session: { id: string } }
+    const abort = new AbortController()
+    const stream = await fetch(`${base}/sessions/${session.id}/stream`, { signal: abort.signal })
+    expect(stream.status).toBe(200)
+    expect(stream.headers.get('content-type')).toBe('application/octet-stream')
+    const duplicate = await fetch(`${base}/sessions/${session.id}/stream`)
+    expect(duplicate.status).toBe(409)
+    expect(control.state().busy).toBe(true)
+    abort.abort()
+    await vi.waitFor(() => expect(control.state().busy).toBe(false))
+    expect(stop).toHaveBeenCalledOnce()
+    middleware.dispose()
+  })
+
   it('uses the selected completed task as context for follow-up instructions', async () => {
     const { manager, options } = await fixture()
     const first = await manager.start({ purpose: 'first' })
@@ -140,12 +252,14 @@ describe('local phone agent task lifecycle', () => {
     const server = createServer(app); servers.push(server)
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
     const address = server.address() as { port: number }
+    for (const path of ['/phone-agent-api/state', '/phone-agent-api/control/sessions/test/stream']) {
     const response = await new Promise<string>((resolve, reject) => {
-      const req = httpRequest({ hostname: '127.0.0.1', port: address.port, path: '/phone-agent-api/state', headers: { Host: 'external.example.com' } }, res => {
+      const req = httpRequest({ hostname: '127.0.0.1', port: address.port, path, headers: { Host: 'external.example.com' } }, res => {
         let body = ''; res.on('data', chunk => { body += chunk }); res.on('end', () => resolve(body))
       }); req.on('error', reject); req.end()
     })
     expect(response.toLowerCase()).toContain('<!doctype html>')
     expect(response).not.toContain('phone-test')
+    }
   })
 })

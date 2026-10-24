@@ -1,5 +1,7 @@
 # Feature: Venus phone conversation window
 
+For live video, manual input and explicit Agent handback, see [On-demand mirroring and manual takeover](manual-takeover.md).
+
 ## Prerequisites
 
 - Existing UI-Venus installation at `~/common/UI-Venus`, with its `.venv`, `deployment/run_mobile.py`, mobile configuration and ADB Keyboard.

@@ -35,6 +35,7 @@
     "dist-cli/",
     "scripts/dev.cjs",
     "scripts/venus-web-agent.py",
+    "scripts/setup-phone-mirror.cjs",
     "scripts/dev-random-home.cjs",
     "scripts/fix-pty-native-build.cjs"
   ],
@@ -55,6 +56,7 @@
     "postinstall": "node scripts/fix-pty-native-build.cjs",
     "test:unit": "vitest run",
     "preview": "vite preview",
+    "setup:phone-mirror": "node scripts/setup-phone-mirror.cjs",
     "prepublishOnly": "pnpm run build",
     "profile:browser": "node scripts/profile-browser-runtime.cjs",
     "profile:thread": "PROFILE_ROUTE='#/thread/019da7c0-4e12-7a91-837c-f7c11cc8ab6c' node scripts/profile-browser-runtime.cjs"

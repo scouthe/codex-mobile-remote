@@ -29,23 +29,21 @@
         </div>
         <form class="phone-composer" @submit.prevent="send">
           <div class="phone-composer-meta"><span class="phone-connection" :class="{ 'is-connected': readyDevice }"><i />{{ readyDevice ? selectedDevice?.model : connectionLabel }}</span><button type="button" class="phone-detail-button" @click="refresh">刷新连接</button></div>
-          <ComposerDropdown v-if="devices.length > 1" v-model="deviceId" class="phone-device-picker" :options="deviceOptions" placeholder="选择手机" />
+          <ComposerDropdown v-if="devices.length > 1 && !controlBusy" v-model="deviceId" class="phone-device-picker" :options="deviceOptions" placeholder="选择手机" />
           <label for="phone-agent-message" class="phone-visually-hidden">给手机 Agent 的指令</label>
           <textarea id="phone-agent-message" v-model="draft" rows="3" maxlength="4000" placeholder="例如：打开设置，查看关于手机页面，不修改任何设置" @keydown="onKeydown" />
           <div class="phone-composer-footer">
             <label class="phone-limit">最多 <input v-model.number="stepLimit" aria-label="最大操作步数" type="number" min="1" max="50" :disabled="!!activeRun" /> 步</label>
             <span v-if="selectedId && !activeRun" class="phone-context-hint">将参考所选任务继续</span><span v-else class="phone-keyboard-hint">Shift + Enter 换行</span>
             <button v-if="activeRun" type="button" class="phone-send phone-stop" :disabled="busy || activeRun.status === 'stopping'" @click="stop">{{ activeRun.status === 'stopping' ? '正在停止…' : '停止任务' }}</button>
-            <button v-else type="submit" class="phone-send" :disabled="busy || !draft.trim() || !readyDevice || !available">{{ busy ? '正在提交…' : '发送任务' }} ↑</button>
+            <button v-else type="submit" class="phone-send" :disabled="busy || controlBusy || !draft.trim() || !readyDevice || !available">{{ busy ? '正在提交…' : controlBusy ? '人工接管中' : '发送任务' }} ↑</button>
           </div>
-          <p class="phone-composer-note">{{ activeRun ? '任务正在执行。可以先写下下一条指令，停止或完成后再发送。' : '每条指令启动一个任务；需要补充信息时，直接在这里回复。' }}</p>
+          <p class="phone-composer-note">{{ controlBusy ? '手机由人工控制。结束接管后可发送任务，或点击交回 Agent。' : activeRun ? '任务正在执行。可以先写下下一条指令，停止或完成后再发送。' : '每条指令启动一个任务；需要补充信息时，直接在这里回复。' }}</p>
         </form>
       </section>
-      <aside class="phone-screen" aria-label="手机屏幕预览">
-        <div class="phone-screen-heading"><div><strong>手机画面</strong><span>{{ selectedDevice?.model || '等待手机连接' }}</span></div><button type="button" class="phone-button" :disabled="!readyDevice || screenBusy" @click="capture">{{ screenBusy ? '获取中…' : '刷新画面' }}</button></div>
-        <div class="phone-screen-frame"><img v-if="screenUrl" :src="screenUrl" alt="已连接手机的当前截图" @error="screenError = '暂时无法显示截图，请刷新画面。'" @load="screenError = ''" /><div v-else class="phone-screen-empty"><span aria-hidden="true">▯</span><p>手机连接后<br>画面会显示在这里</p></div></div>
-        <p class="phone-screen-note" :role="screenError ? 'status' : undefined">{{ screenError || (activeRun ? '每个操作步骤会更新画面' : '点击刷新画面，查看手机的最新状态') }}</p>
-      </aside>
+      <PhoneScreenPanel :device-id="deviceId" :model="selectedDevice?.model" :connected="selectedDevice?.state === 'device'" :previous-run-id="selectedId || undefined"
+        :screenshot="screenUrl" :screenshot-busy="screenBusy" :screenshot-error="screenError" :control-state="controlState" :shown="showScreen"
+        @capture="capture" @ownership="onOwnership" @resumed="onResumed" />
     </div>
   </div>
 </template>
@@ -53,12 +51,16 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import ComposerDropdown from './ComposerDropdown.vue'
+import PhoneScreenPanel from './PhoneScreenPanel.vue'
+import type { PhoneControlState } from '../../types/phoneControl'
 import { isPhoneRunActive, type PhoneAgentState, type PhoneEvent, type PhoneRun, type PhoneRunStatus } from '../../types/phoneAgent'
 
 const runs = ref<PhoneRun[]>([]), devices = ref<PhoneAgentState['devices']>([]), events = ref<PhoneEvent[]>([])
 const selectedId = ref(''), deviceId = ref(''), draft = ref(''), stepLimit = ref(15)
 const available = ref(false), busy = ref(false), error = ref(''), screenError = ref(''), screenUrl = ref(''), screenBusy = ref(false), showScreen = ref(false)
 const conversation = ref<HTMLElement | null>(null)
+const controlState = ref<PhoneControlState>(), manualOwned = ref(false)
+const controlBusy = computed(() => manualOwned.value || !!controlState.value?.busy)
 let timer: ReturnType<typeof setTimeout> | undefined
 let disposed = false, refreshing = false, selectionInitialized = false, cursor = 0
 const controller = new AbortController()
@@ -106,8 +108,8 @@ async function refresh() {
   try {
     const state = await request<PhoneAgentState>('state')
     if (disposed) return
-    available.value = state.available; devices.value = state.devices; runs.value = state.runs; error.value = state.message
-    if (!devices.value.some(device => device.id === deviceId.value)) deviceId.value = devices.value.find(device => device.state === 'device')?.id || devices.value[0]?.id || ''
+    available.value = state.available; devices.value = state.devices; runs.value = state.runs; error.value = state.message; controlState.value = state.control
+    if (!manualOwned.value && !devices.value.some(device => device.id === deviceId.value)) deviceId.value = devices.value.find(device => device.state === 'device')?.id || devices.value[0]?.id || ''
     if (!selectionInitialized) {
       selectionInitialized = true
       const saved = localStorage.getItem('phone-agent-selected')
@@ -128,7 +130,7 @@ async function capture() {
   finally { screenBusy.value = false }
 }
 async function send() {
-  if (busy.value || activeRun.value || !draft.value.trim() || !readyDevice.value) return
+  if (busy.value || controlBusy.value || activeRun.value || !draft.value.trim() || !readyDevice.value) return
   busy.value = true; error.value = ''
   try {
     const data = await request<{ run: PhoneRun }>('runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ purpose: draft.value, deviceId: deviceId.value, stepLimit: stepLimit.value, previousRunId: selectedId.value || undefined }) })
@@ -145,14 +147,21 @@ async function stop() {
   finally { busy.value = false }
 }
 function newTask() { selectedId.value = ''; selectionInitialized = true; events.value = []; cursor = 0; localStorage.removeItem('phone-agent-selected'); document.getElementById('phone-agent-message')?.focus() }
+function onOwnership(value: boolean) {
+  if (manualOwned.value === value) return
+  manualOwned.value = value
+  if (value) showScreen.value = true
+  void refresh(); schedule(500)
+}
+async function onResumed(run: PhoneRun) { updateRun(run); await selectRun(run.id); await refresh(); showScreen.value = false; schedule(500) }
 function onKeydown(event: KeyboardEvent) { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void send() } }
 async function poll() {
   if (disposed) return
   if (!document.hidden) {
-    try { if (activeRun.value) { const id = activeRun.value.id; if (selectedId.value === id) await selectRun(id, true); else updateRun((await request<{ run: PhoneRun }>(`runs/${id}?after=999999`)).run) } else await refresh() }
+    try { if (controlBusy.value) await refresh(); else if (activeRun.value) { const id = activeRun.value.id; if (selectedId.value === id) await selectRun(id, true); else updateRun((await request<{ run: PhoneRun }>(`runs/${id}?after=999999`)).run) } else await refresh() }
     catch (cause) { if (!disposed) error.value = cause instanceof Error ? cause.message : '连接暂时中断。' }
   }
-  schedule(activeRun.value ? 2000 : 15000)
+  schedule(activeRun.value || controlBusy.value ? 2000 : 15000)
 }
 onMounted(async () => { await refresh(); if (readyDevice.value && !screenUrl.value) await capture(); schedule() })
 onUnmounted(() => { disposed = true; controller.abort(); clearTimeout(timer); if (screenUrl.value.startsWith('blob:')) URL.revokeObjectURL(screenUrl.value) })

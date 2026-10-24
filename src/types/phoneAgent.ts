@@ -29,6 +29,7 @@ export type PhoneAgentState = {
   message: string
   devices: Array<{ id: string; model: string; state: string; keyboardReady: boolean }>
   runs: PhoneRun[]
+  control?: import('./phoneControl').PhoneControlState
 }
 
 export const isPhoneRunActive = (status: PhoneRunStatus): boolean =>

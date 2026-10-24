@@ -1,23 +1,20 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { createReadStream, existsSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises'
-import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { isPhoneRunActive, type PhoneAgentState, type PhoneEvent, type PhoneRun } from '../types/phoneAgent.js'
+import { PhoneAgentError } from './phoneHttp.js'
+export { PhoneAgentError } from './phoneHttp.js'
 
 const exec = promisify(execFile)
 type StoredRun = PhoneRun & { events: PhoneEvent[] }
 type ManagerOptions = { root?: string; stateDir?: string; runner?: string; python?: string; adb?: string }
 const MAX_EVENTS = 400
-
-export class PhoneAgentError extends Error {
-  constructor(message: string, readonly status = 400) { super(message) }
-}
 
 export class PhoneAgentManager {
   readonly root: string
@@ -27,7 +24,8 @@ export class PhoneAgentManager {
   readonly adb: string
   private runs = new Map<string, StoredRun>()
   private initialized?: Promise<void>
-  private active?: { run: StoredRun; child?: ChildProcess; killTimer?: NodeJS.Timeout }
+  private active?: { run: StoredRun; child?: ChildProcess; killTimer?: NodeJS.Timeout; done: Promise<void>; finish: () => void }
+  private manualLease?: symbol
   private writes = Promise.resolve()
   private deviceCache?: { until: number; value: PhoneAgentState['devices'] }
   private deviceRequest?: Promise<PhoneAgentState['devices']>
@@ -130,6 +128,7 @@ export class PhoneAgentManager {
 
   async start(input: { purpose?: unknown; deviceId?: unknown; stepLimit?: unknown; previousRunId?: unknown }): Promise<PhoneRun> {
     await this.init()
+    if (this.manualLease) throw new PhoneAgentError('手机正在人工接管，请先结束接管或交回 Agent。', 409)
     if (this.active) throw new PhoneAgentError('手机正在执行任务，请先停止当前任务。', 409)
     const purpose = typeof input.purpose === 'string' ? input.purpose.trim() : ''
     if (!purpose || purpose.length > 4000) throw new PhoneAgentError('请输入 1–4000 字的任务。')
@@ -139,13 +138,16 @@ export class PhoneAgentManager {
     // Reserve the slot before any asynchronous device/file work.
     const now = new Date().toISOString()
     const run: StoredRun = { id: `${Date.now()}-${randomUUID()}`, purpose, deviceId: '', stepLimit, status: 'loading', createdAt: now, updatedAt: now, step: 0, message: '正在准备手机…', events: [] }
-    const active: NonNullable<PhoneAgentManager['active']> = { run }
+    let finish!: () => void
+    const done = new Promise<void>(resolve => { finish = resolve })
+    const active: NonNullable<PhoneAgentManager['active']> = { run, done, finish }
     this.active = active
     try {
       const devices = (await this.devices()).filter(device => device.state === 'device')
       const device = typeof input.deviceId === 'string' ? devices.find(item => item.id === input.deviceId) : devices.length === 1 ? devices[0] : undefined
       if (!device) throw new PhoneAgentError('请选择一台已授权的手机。')
       if (!device.keyboardReady) throw new PhoneAgentError('请先将手机输入法切换为 ADB Keyboard。')
+      if (['stopping'].includes(run.status)) throw new PhoneAgentError('任务已被人工接管。', 409)
       run.deviceId = device.id
       const runDir = join(this.stateDir, run.id)
       await mkdir(runDir, { recursive: true, mode: 0o700 })
@@ -160,6 +162,7 @@ export class PhoneAgentManager {
         if (oldest) this.runs.delete(oldest.id)
       }
       await writeFile(join(runDir, 'request.json'), JSON.stringify({ purpose: context + purpose, deviceId: device.id, stepLimit }), { mode: 0o600 })
+      if (['stopping'].includes(run.status)) throw new PhoneAgentError('任务已被人工接管。', 409)
       this.event(run, { type: 'status', message: '正在加载本地模型…', status: 'loading' })
       const child = spawn(this.python, [this.runner, '--root', this.root, '--run-dir', runDir], {
         cwd: this.root, detached: process.platform !== 'win32',
@@ -191,12 +194,31 @@ export class PhoneAgentManager {
         if (run.status === 'stopping') this.event(run, { type: 'result', status: 'stopped', message: '任务已停止。' })
         else if (terminalEvent) this.event(run, terminalEvent)
         else if (isPhoneRunActive(run.status)) this.event(run, { type: 'result', status: 'failed', message: stderr.trim().split('\n').at(-1) || 'Agent 意外退出，请检查手机和模型服务。' })
+        active.finish()
       })
       return this.summary(run)
     } catch (error) {
       if (this.active === active) this.active = undefined
+      if (run.status === 'stopping' && this.runs.has(run.id)) this.event(run, { type: 'result', status: 'stopped', message: '任务已停止，可手动操作手机。' })
+      active.finish()
       throw error
     }
+  }
+
+  /** Reserve manual ownership before stopping; release only after all manual I/O exits. */
+  async claimManual(): Promise<{ previousRun?: PhoneRun; release: () => void }> {
+    await this.init()
+    if (this.manualLease) throw new PhoneAgentError('手机已在另一个窗口接管。', 409)
+    const lease = Symbol('manual')
+    this.manualLease = lease
+    try {
+      const active = this.active
+      if (active) { await this.stop(active.run.id); await active.done }
+      return {
+        previousRun: active?.run.deviceId ? this.summary(active.run) : undefined,
+        release: () => { if (this.manualLease === lease) this.manualLease = undefined },
+      }
+    } catch (error) { if (this.manualLease === lease) this.manualLease = undefined; throw error }
   }
 
   async stop(id: string): Promise<PhoneRun> {
@@ -234,53 +256,4 @@ export class PhoneAgentManager {
   }
 
   dispose(): void { if (this.active) void this.stop(this.active.run.id) }
-}
-
-function json(res: ServerResponse, status: number, data: unknown): void {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
-  res.end(JSON.stringify(data))
-}
-
-async function body(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    size += buffer.length
-    if (size > 32768) throw new PhoneAgentError('请求内容过长。', 413)
-    chunks.push(buffer)
-  }
-  try {
-    const data = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
-    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('object required')
-    return data
-  } catch { throw new PhoneAgentError('请求格式不正确。') }
-}
-
-export function createPhoneAgentMiddleware(manager = new PhoneAgentManager()) {
-  const middleware = (req: IncomingMessage, res: ServerResponse, next: () => void) => {
-    const url = new URL(req.url || '/', 'http://localhost')
-    if (!url.pathname.startsWith('/phone-agent-api/')) return next()
-    void (async () => {
-      if (req.method === 'GET' && url.pathname === '/phone-agent-api/state') return json(res, 200, await manager.state())
-      if (req.method === 'POST' && url.pathname === '/phone-agent-api/runs') return json(res, 201, { run: await manager.start(await body(req)) })
-      const match = /^\/phone-agent-api\/runs\/([\da-f-]+)(\/stop|\/screenshot)?$/.exec(url.pathname)
-      if (match && req.method === 'POST' && match[2] === '/stop') return json(res, 200, { run: await manager.stop(match[1]!) })
-      if (match && req.method === 'GET' && !match[2]) return json(res, 200, await manager.detail(match[1]!, Math.max(0, Number(url.searchParams.get('after')) || 0)))
-      let path = ''
-      if (match && req.method === 'GET' && match[2] === '/screenshot') path = await manager.screenshot(match[1]!)
-      if (req.method === 'GET' && url.pathname === '/phone-agent-api/screen') path = await manager.capture(url.searchParams.get('deviceId') || '')
-      if (path) {
-        const stream = createReadStream(path)
-        stream.once('error', () => { if (!res.headersSent) json(res, 404, { error: '截图不存在。' }); else res.destroy() })
-        res.setHeader('Content-Type', path.endsWith('.jpg') ? 'image/jpeg' : 'image/png')
-        res.setHeader('Cache-Control', 'private, no-store')
-        stream.pipe(res)
-        return
-      }
-      json(res, 404, { error: '接口不存在。' })
-    })().catch(error => { if (!res.headersSent) json(res, error instanceof PhoneAgentError ? error.status : 500, { error: error instanceof Error ? error.message : '请求失败。' }) })
-  }
-  middleware.dispose = () => manager.dispose()
-  return middleware
 }
