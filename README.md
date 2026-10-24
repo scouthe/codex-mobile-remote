@@ -2,6 +2,14 @@
 
 通过网页或 Android App，远程使用 Linux 主机上的 Codex，并与连接同一官方 app-server 的 Codex Desktop 同步。
 
+## 本地手机 Agent 窗口
+
+左侧 **手机 Agent**（`#/phone-agent`）连接本机 UI-Venus-2 手机控制框架。输入自然语言任务后，可查看执行步骤、最新手机截图、最终结果，并随时停止。任务由服务器执行，刷新页面会恢复历史；选择已完成任务后发送消息，会将该任务的目标与结果作为后续指令的上下文，点击 **新任务** 则独立开始。任务执行期间需先停止或等待结束，再发送下一条指令。
+
+本机部署沿用 5900 网页和 8900 模型中台；默认读取 `~/common/UI-Venus`，手机需通过 ADB 授权并选中 ADB Keyboard 输入法。无需在浏览器填写模型密钥。可用 `VENUS_AGENT_ROOT`、`VENUS_AGENT_STATE_DIR`、`VENUS_ADB_PATH` 覆盖安装、记录与 ADB 路径。记录和截图默认保存在 `~/.codex/phone-agent`，网页列出最近 100 个任务。新接口沿用网页既有的登录验证。
+
+构建后重启现有网页服务即可生效：`pnpm run build`、`systemctl --user restart codexapp-5900.service`。手机控制仍受模型决策质量和步数上限影响；例如小米的系统信息入口通常叫“我的设备”，任务中写出屏幕上的名称更明确。[验证步骤](tests/phone-agent/venus-conversation-window.md)
+
 [![GitHub Release](https://img.shields.io/github/v/release/scouthe/codex-mobile-remote?style=for-the-badge)](https://github.com/scouthe/codex-mobile-remote/releases)
 [![node](https://img.shields.io/badge/Node-18%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![license](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](./LICENSE)

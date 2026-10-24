@@ -23,6 +23,11 @@ const router = createRouter({
       component: EmptyRouteView,
     },
     {
+      path: '/phone-agent',
+      name: 'phone-agent',
+      component: EmptyRouteView,
+    },
+    {
       path: '/automations',
       name: 'automations',
       component: EmptyRouteView,

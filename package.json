@@ -34,6 +34,7 @@
     "dist/",
     "dist-cli/",
     "scripts/dev.cjs",
+    "scripts/venus-web-agent.py",
     "scripts/dev-random-home.cjs",
     "scripts/fix-pty-native-build.cjs"
   ],

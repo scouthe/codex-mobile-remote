@@ -80,6 +80,11 @@
             </span>
           </button>
 
+          <button v-if="!isSidebarCollapsed" type="button" class="sidebar-skills-link" :class="{ 'is-active': isPhoneAgentRoute }" @click="router.push({ name: 'phone-agent' }); isMobile && setSidebarCollapsed(true)">
+            <span class="sidebar-skills-link-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 5h4M11 18h2"/></svg></span>
+            <span class="sidebar-skills-link-copy"><span class="sidebar-skills-link-title">手机 Agent</span><span class="sidebar-skills-link-subtitle">Venus · 手机任务与画面</span></span>
+          </button>
+
           <SidebarThreadTree ref="sidebarThreadTreeRef" :groups="projectGroups" :project-display-name-by-id="projectDisplayNameById"
             :project-git-repo-by-name="projectGitRepoByName"
             :project-cwd-by-name="projectCwdByName"
@@ -543,7 +548,7 @@
         <span v-if="isVirtualKeyboardOpen" class="content-keyboard-spacer" aria-hidden="true" />
         <ContentHeader
           :title="contentTitle"
-          :accent="isSkillsRoute || isAutomationsRoute"
+          :accent="isSkillsRoute || isAutomationsRoute || isPhoneAgentRoute"
           :status="isMobile && isSelectedThreadInProgress ? 'working' : undefined"
           :status-label="t('Working')"
         >
@@ -640,6 +645,9 @@
               @edit-automation="onEditAutomationFromPanel"
               @create-automation="onCreateAutomationFromPanel"
             />
+          </template>
+          <template v-else-if="isPhoneAgentRoute">
+            <PhoneAgentPanel />
           </template>
           <template v-else-if="isHomeRoute">
             <div class="content-grid content-grid-home">
@@ -1386,6 +1394,7 @@ const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/cont
 const ReviewPane = defineAsyncComponent(() => import('./components/content/ReviewPane.vue'))
 const DirectoryHub = defineAsyncComponent(() => import('./components/content/DirectoryHub.vue'))
 const AutomationsPanel = defineAsyncComponent(() => import('./components/content/AutomationsPanel.vue'))
+const PhoneAgentPanel = defineAsyncComponent(() => import('./components/content/PhoneAgentPanel.vue'))
 const { t, uiLanguage, uiLanguageOptions, setUiLanguage } = useUiLanguage()
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'codex-web-local.sidebar-collapsed.v1'
@@ -1933,11 +1942,13 @@ const routeThreadId = computed(() => {
 const isHomeRoute = computed(() => route.name === 'home')
 const isSkillsRoute = computed(() => route.name === 'skills')
 const isAutomationsRoute = computed(() => route.name === 'automations')
+const isPhoneAgentRoute = computed(() => route.name === 'phone-agent')
 const routeAutomationId = computed(() => {
   const raw = route.query.automationId
   return typeof raw === 'string' ? raw : ''
 })
 const contentTitle = computed(() => {
+  if (isPhoneAgentRoute.value) return '手机 Agent'
   if (isAutomationsRoute.value) return t('Automations')
   if (isSkillsRoute.value) return t('Skills')
   if (isHomeRoute.value) return t('Start new thread')
@@ -1948,6 +1959,7 @@ const browserHostName =
     ? (window.location.hostname || window.location.host || 'codexui')
     : 'codexui'
 const pageTitle = computed(() => {
+  if (isPhoneAgentRoute.value) return '手机 Agent · Venus'
   const threadTitle = selectedThread.value?.title?.trim() ?? ''
   return threadTitle || browserHostName
 })
@@ -2010,7 +2022,7 @@ const isSelectedThreadInProgress = computed(() => {
   }
   return selectedThread.value?.inProgress === true
 })
-const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && selectedThreadId.value.trim().length > 0)
+const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && !isPhoneAgentRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>
   isSendingMessage.value ||
   isInterruptingTurn.value ||

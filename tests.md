@@ -15,6 +15,7 @@ This file is the manual test index. Detailed regression and feature verification
 
 | Folder | Sections | Scope |
 | --- | ---: | --- |
+| [Local Phone Agent](tests/phone-agent/index.md) | 1 | Local Venus phone tasks, screenshots, cancellation, follow-up instructions, history and responsive conversation UI. |
 | [Projects, Sidebar, and New Chat](tests/projects-sidebar-new-chat/index.md) | 16 | Home route, project picker, sidebar organization, new-chat setup, projectless folders, and project/worktree shell behavior. |
 | [Automations](tests/automations/index.md) | 4 | Thread heartbeat automations, project cron automations, dialogs, action rows, and automation panel behavior. |
 | [Skills, Plugins, and Integrations](tests/skills-plugins-integrations/index.md) | 27 | Skills Hub, skill sync, plugin/app directory surfaces, prompts, Composio, Telegram, and installed skill behavior. |

@@ -6,6 +6,7 @@ import { writeFile, stat } from 'node:fs/promises'
 import express, { type Express } from 'express'
 import { createCodexBridgeMiddleware } from './codexAppServerBridge.js'
 import { createAuthSession } from './authMiddleware.js'
+import { createPhoneAgentMiddleware } from './phoneAgent.js'
 import { createDirectoryListingHtml, createTextEditorHtml, decodeBrowsePath, getLocalDirectoryListing, isTextEditableFile, normalizeLocalPath } from './localBrowseUi.js'
 import { WebSocketServer, type WebSocket } from 'ws'
 
@@ -89,6 +90,9 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
 
   // 1. Authentication, first-run setup, and explicit LAN-only access policy.
   app.use(authSession.middleware)
+
+  const phoneAgent = createPhoneAgentMiddleware()
+  app.use(phoneAgent)
 
   // 2. Bridge middleware for /codex-api/*
   app.use(bridge)
@@ -259,7 +263,7 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
 
   return {
     app,
-    dispose: () => bridge.dispose(),
+    dispose: () => { phoneAgent.dispose(); bridge.dispose() },
     attachWebSocket: (server: HttpServer) => {
       const wss = new WebSocketServer({ noServer: true })
 

@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import { createCodexBridgeMiddleware } from "./src/server/codexAppServerBridge";
+import { createPhoneAgentMiddleware } from "./src/server/phoneAgent";
 import { createDirectoryListingHtml, createTextEditorHtml, decodeBrowsePath, getLocalDirectoryListing, isTextEditableFile, normalizeLocalPath } from "./src/server/localBrowseUi";
 import tailwindcss from "@tailwindcss/vite";
 import { spawnSync } from "node:child_process";
@@ -129,6 +130,9 @@ export default defineConfig({
     {
       name: "codex-bridge",
       configureServer(server) {
+        const phoneAgent = createPhoneAgentMiddleware();
+        server.middlewares.use(phoneAgent);
+        server.httpServer?.once("close", () => phoneAgent.dispose());
         process.env.CODEXUI_SERVER_PORT = String(server.config.server.port ?? 5173);
         const bridge = createCodexBridgeMiddleware();
         const httpServer = server.httpServer;
