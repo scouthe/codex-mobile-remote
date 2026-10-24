@@ -180,6 +180,22 @@ describe('local phone agent task lifecycle', () => {
     await control.release(session.id); control.dispose()
   })
 
+  it('maps sleep to the Android power key while keeping the manual lease active', async () => {
+    const { manager } = await fixture()
+    const execute = vi.fn(async () => {})
+    const control = new PhoneControlManager(manager, {
+      available: () => true,
+      input: () => ({ execute }),
+      mirror: () => ({ start: async () => {}, stop: async () => {}, format: { width: 560, height: 1280, epoch: 1, codec: 'avc1.640020' } }),
+    })
+    const session = await control.acquire({ deviceId: 'phone-test' })
+    await control.stream(session.id, { format() {}, data() {}, error() {}, close() {} })
+    await control.input(session.id, { type: 'key', key: 'sleep' })
+    expect(execute).toHaveBeenCalledExactlyOnceWith({ type: 'key', key: 'sleep' }, { width: 560, height: 1280, epoch: 1, codec: 'avc1.640020' })
+    expect(control.state().busy).toBe(true)
+    await control.release(session.id); control.dispose()
+  })
+
   it('releases the encoder on HTTP stream disconnect and rejects a second stream', async () => {
     const { manager } = await fixture()
     const stop = vi.fn(async () => {})

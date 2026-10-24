@@ -60,7 +60,7 @@ const text = ref(''), note = ref(''), imageError = ref('')
 let gesture: { point: PhonePoint; time: number; epoch: number; pointerId: number } | undefined
 const stageLabel = computed(() => ({ idle: '', acquiring: '等待 Agent 停止…', connecting: '连接实时画面…', live: '实时 · 人工控制', closing: '正在结束接管…' }[stage.value]))
 const navigation: Array<{ key: Extract<PhoneInput, { type: 'key' }>['key']; label: string }> = [
-  { key: 'back', label: '返回' }, { key: 'home', label: '桌面' }, { key: 'recent', label: '最近' }, { key: 'wake', label: '亮屏' },
+  { key: 'back', label: '返回' }, { key: 'home', label: '桌面' }, { key: 'recent', label: '最近' }, { key: 'wake', label: '亮屏' }, { key: 'sleep', label: '息屏' },
   { key: 'enter', label: '回车' }, { key: 'delete', label: '退格' },
 ]
 watch(ownsControl, value => emit('ownership', value), { immediate: true })

@@ -4,7 +4,7 @@ import type { PhoneInput, PhonePoint, PhoneVideoFormat } from '../../types/phone
 import { PhoneAgentError } from '../phoneHttp.js'
 
 const exec = promisify(execFile)
-const keys = { back: 4, home: 3, recent: 187, enter: 66, delete: 67, wake: 224 } as const
+const keys = { back: 4, home: 3, recent: 187, enter: 66, delete: 67, wake: 224, sleep: 26 } as const
 
 function point(value: unknown): asserts value is PhonePoint {
   const p = value as PhonePoint | undefined

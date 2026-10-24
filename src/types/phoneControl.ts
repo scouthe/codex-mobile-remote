@@ -4,7 +4,7 @@ export type PhoneVideoFormat = { width: number; height: number; codec: string; e
 export type PhoneInput =
   | { type: 'tap'; point: PhonePoint; epoch: number }
   | { type: 'swipe'; from: PhonePoint; to: PhonePoint; duration: number; epoch: number }
-  | { type: 'key'; key: 'back' | 'home' | 'recent' | 'enter' | 'delete' | 'wake' }
+  | { type: 'key'; key: 'back' | 'home' | 'recent' | 'enter' | 'delete' | 'wake' | 'sleep' }
   | { type: 'text'; text: string }
 
 export type PhoneControlSession = {
