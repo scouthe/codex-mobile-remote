@@ -33,7 +33,7 @@ async function setup() {
   const store = new AgentSessionStore(directory)
   const manager = new AgentManager(store, { transport: value => { handlers = value; return transport }, available: async () => true, idleMs: 60_000 })
   cleanups.push(() => manager.dispose())
-  return { directory, manager, store, transport, handlers, calls, finish: () => finish?.({ stopReason: 'end_turn' }) }
+  return { directory, manager, store, transport, handlers, calls, finish: (stopReason = 'end_turn') => finish?.({ stopReason }) }
 }
 
 describe('DSH session lifecycle', () => {
@@ -68,6 +68,19 @@ describe('DSH session lifecycle', () => {
     await replacement.prompt(session.id, { requestId: 'request-fail-one', text: '继续' })
     await expect.poll(async () => (await replacement.detail(session.id)).session.state).toBe('failed')
     expect((await replacement.detail(session.id)).session.error).toBe('启动失败')
+  })
+
+  it('keeps a token-limited answer visible as the final response', async () => {
+    const test = await setup()
+    const { session } = await test.manager.create(test.directory)
+    await test.manager.prompt(session.id, { requestId: 'request-token-limit', text: '输出内容' })
+    await expect.poll(() => test.calls.includes('session/prompt')).toBe(true)
+    await test.handlers.update({ sessionId: 'native-one', update: { sessionUpdate: 'agent_message_chunk', messageId: 'limited', content: { type: 'text', text: '已生成的部分结果' } } } as SessionNotification)
+    test.finish('max_tokens')
+    await expect.poll(async () => (await test.manager.detail(session.id)).session.state).toBe('completed')
+    const detail = await test.manager.detail(session.id)
+    expect(detail.messages.at(-1)?.messagePhase).toBe('final_answer')
+    expect(detail.session.error).toContain('输出上限')
   })
 
   it('can retry an admission write failure without duplicate native prompts or user messages', async () => {

@@ -229,7 +229,7 @@ export class AgentManager {
       await this.updates
       if (session.runId !== runId) return
       const lastReply = Array.from(this.liveMessages.get(session.id)?.values() || []).reverse().find(message => message.id.endsWith('-agent_message_chunk'))
-      if (lastReply && result.stopReason === 'end_turn') await this.message(session, { ...lastReply, messagePhase: 'final_answer', turnStatus: 'completed' })
+      if (lastReply && result.stopReason !== 'cancelled') await this.message(session, { ...lastReply, messagePhase: 'final_answer', turnStatus: 'completed' })
       session.state = result.stopReason === 'cancelled' || (session.state as string) === 'stopping' ? 'interrupted' : 'completed'
       if (result.stopReason === 'max_tokens') session.error = '本轮达到输出上限，可以继续发送消息。'
       await this.change(session)
