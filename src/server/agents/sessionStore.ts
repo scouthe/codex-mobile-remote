@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, readdir, rename, unlink, writeFile, type FileHandle } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { AgentConfigOption, AgentSession } from '../../types/agent.js'
 import type { UiMessage } from '../../types/codex.js'
@@ -12,6 +12,7 @@ type MessageRecord = { seq: number; message: UiMessage }
 export class AgentSessionStore {
   private readonly sessions = new Map<string, SessionRecord>()
   private readonly writes = new Map<string, Promise<void>>()
+  private readonly verifiedTails = new Set<string>()
   private init?: Promise<void>
   private ownsLock = false
   private disposed = false
@@ -76,24 +77,48 @@ export class AgentSessionStore {
 
   async message(id: string, entry: MessageRecord): Promise<void> {
     await this.enqueue(id, async () => {
-      const file = await open(join(this.directory, `${id}.jsonl`), 'a', 0o600)
-      try { await file.writeFile(JSON.stringify(entry) + '\n'); await file.sync() }
+      const file = await open(join(this.directory, `${id}.jsonl`), 'a+', 0o600)
+      try {
+        if (!this.verifiedTails.has(id)) await this.repairTail(file)
+        await file.writeFile(JSON.stringify(entry) + '\n'); await file.sync()
+        this.verifiedTails.add(id)
+      } catch (error) { this.verifiedTails.delete(id); throw error }
       finally { await file.close() }
     })
   }
 
+  private async repairTail(file: FileHandle): Promise<void> {
+    const size = (await file.stat()).size
+    if (!size) return
+    const last = Buffer.alloc(1)
+    await file.read(last, 0, 1, size - 1)
+    if (last[0] === 10) return
+    let position = size
+    while (position > 0) {
+      const length = Math.min(position, 8192)
+      position -= length
+      const bytes = Buffer.alloc(length)
+      await file.read(bytes, 0, length, position)
+      const newline = bytes.lastIndexOf(10)
+      if (newline >= 0) { await file.truncate(position + newline + 1); return }
+      if (size - position > 16 * 1024 * 1024) throw new Error('DSH 未完成的历史记录超过恢复上限。')
+    }
+    await file.truncate(0)
+  }
+
   /** Read backwards only until a page is filled, without parsing the whole transcript. */
-  async page(id: string, before = Number.MAX_SAFE_INTEGER, limit = 50): Promise<{ messages: UiMessage[]; nextCursor: number | null }> {
+  async page(id: string, before?: number, limit = 50): Promise<{ messages: UiMessage[]; nextCursor: number | null }> {
     this.get(id)
     await this.writes.get(id)
     let file
     try { file = await open(join(this.directory, `${id}.jsonl`), 'r') }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { messages: [], nextCursor: null }; throw error }
     try {
-      let position = (await file.stat()).size
-      let tail = Buffer.alloc(0), oldest = before
+      let position = Math.min(before ?? Number.MAX_SAFE_INTEGER, (await file.stat()).size)
+      let tail = Buffer.alloc(0)
       const found = new Map<string, UiMessage>()
-      let hasMore = false
+      let nextCursor: number | null = null
+      let readingEnd = true
       while (position > 0) {
         const length = Math.min(position, 64 * 1024)
         position -= length
@@ -106,20 +131,37 @@ export class AgentSessionStore {
           tail = combined; continue
         }
         const start = position === 0 ? 0 : firstNewline + 1
-        const lines = combined.subarray(start).toString('utf8').split('\n')
-        tail = combined.subarray(0, start === 0 ? 0 : firstNewline)
+        let end = combined.length
+        if (readingEnd) {
+          // A killed writer may leave an unfinished final append. Only that
+          // tail is discardable; malformed complete records still fail loud.
+          if (combined[end - 1] !== 10) {
+            const newline = combined.lastIndexOf(10)
+            if (newline < 0) { if (position === 0) break; tail = combined; continue }
+            end = newline + 1
+          }
+          readingEnd = false
+        }
+        const lines: Array<{ text: string; end: number }> = []
+        for (let cursor = start; cursor < end;) {
+          const newline = combined.indexOf(10, cursor)
+          if (newline < 0 || newline >= end) break
+          lines.push({ text: combined.subarray(cursor, newline).toString('utf8'), end: position + newline + 1 })
+          cursor = newline + 1
+        }
+        tail = combined.subarray(0, start)
         for (let index = lines.length - 1; index >= 0; index--) {
-          const line = lines[index]!.trim()
+          const line = lines[index]!.text.trim()
           if (!line) continue
           const entry = JSON.parse(line) as MessageRecord
-          if (entry.seq >= before) continue
-          if (found.size >= limit && !found.has(entry.message.id)) { hasMore = true; break }
-          oldest = Math.min(oldest, entry.seq)
+          // The opaque cursor is a byte offset. Later pages start at that
+          // boundary instead of rescanning every newer message from the tail.
+          if (found.size >= limit && !found.has(entry.message.id)) { nextCursor = lines[index]!.end; break }
           if (!found.has(entry.message.id)) found.set(entry.message.id, entry.message)
         }
-        if (hasMore) break
+        if (nextCursor !== null) break
       }
-      return { messages: Array.from(found.values()).reverse(), nextCursor: hasMore ? oldest : null }
+      return { messages: Array.from(found.values()).reverse(), nextCursor }
     } finally { await file.close() }
   }
 

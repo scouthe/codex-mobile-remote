@@ -70,6 +70,18 @@ describe('DSH session lifecycle', () => {
     expect((await replacement.detail(session.id)).session.error).toBe('启动失败')
   })
 
+  it('can retry an admission write failure without duplicate native prompts or user messages', async () => {
+    const { manager, directory, store, calls } = await setup()
+    const { session } = await manager.create(directory)
+    const input = { requestId: 'request-disk-retry', text: '这是一条可重试消息' }
+    vi.spyOn(store, 'save').mockRejectedValueOnce(new Error('disk full'))
+    await expect(manager.prompt(session.id, input)).rejects.toThrow('disk full')
+    expect(calls.includes('session/prompt')).toBe(false)
+    await manager.prompt(session.id, input)
+    await expect.poll(() => calls.filter(call => call === 'session/prompt').length).toBe(1)
+    expect((await manager.detail(session.id)).messages.filter(message => message.role === 'user')).toHaveLength(1)
+  })
+
   it('approves exact ACP option IDs and cancels approvals if persistence fails', async () => {
     const { manager, directory, handlers, calls, store } = await setup()
     const { session } = await manager.create(directory)

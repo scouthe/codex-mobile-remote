@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -15,7 +15,7 @@ describe('agent durable display store', () => {
       const now = new Date().toISOString()
       const session: AgentSession = { id: randomUUID(), nativeId: 'native-id', agentId: 'dsh', cwd: directory, title: '测试', state: 'idle', error: '', runId: '', lastRequestId: '', createdAt: now, updatedAt: now, revision: 125, archived: false }
       await store.save({ session, configOptions: [] })
-      for (let seq = 1; seq <= 125; seq++) await store.message(session.id, { seq, message: { id: `message-${seq}`, role: 'assistant', text: `内容-${seq}` } })
+      for (let seq = 1; seq <= 125; seq++) await store.message(session.id, { seq, message: { id: `message-${seq}`, role: 'assistant', text: `内容-${seq}-${'多字节文本'.repeat(seq === 1 ? 30_000 : 300)}` } })
       const page1 = await store.page(session.id)
       expect(page1.messages).toHaveLength(50)
       expect(page1.messages[0]?.id).toBe('message-76')
@@ -24,11 +24,15 @@ describe('agent durable display store', () => {
       const page3 = await store.page(session.id, page2.nextCursor!)
       expect(page3.messages).toHaveLength(25)
       expect(page3.nextCursor).toBeNull()
+      await appendFile(join(directory, `${session.id}.jsonl`), '{"seq":126,"message":')
+      expect((await store.page(session.id)).messages).toEqual(page1.messages)
       await store.dispose()
       store = new AgentSessionStore(directory)
       await store.initialize()
       expect(store.list()[0]?.title).toBe('测试')
       expect((await store.page(session.id)).messages).toEqual(page1.messages)
+      await store.message(session.id, { seq: 126, message: { id: 'recovered', role: 'assistant', text: '恢复后可继续追加' } })
+      expect((await store.page(session.id)).messages.at(-1)?.id).toBe('recovered')
     } finally { await store.dispose(); await rm(directory, { recursive: true, force: true }) }
   })
 

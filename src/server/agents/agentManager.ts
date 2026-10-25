@@ -184,10 +184,18 @@ export class AgentManager {
       const runId = session.runId
       try {
         await this.change(session)
-        await this.message(session, { id: `user-${runId}`, role: 'user', text: input.text, turnId: runId,
+        await this.message(session, { id: `user-${input.requestId}`, role: 'user', text: input.text, turnId: runId,
           images: input.images?.map(item => `/codex-local-image?path=${encodeURIComponent(item.path)}`),
           fileAttachments: input.files?.map(item => ({ label: item.name, path: item.path })), messageType: 'userMessage' })
-      } catch (error) { session.state = 'failed'; session.error = '任务记录保存失败，消息尚未提交给 DSH。'; await this.change(session).catch(() => {}); throw error }
+      } catch (error) {
+        // This path never submitted a native prompt, so the same request may
+        // be retried. Its user message id stays stable if append succeeded.
+        session.requestIds = session.requestIds?.filter(id => id !== input.requestId)
+        session.lastRequestId = session.requestIds?.at(-1) || ''
+        session.turnCount = Math.max(0, (session.turnCount || 1) - 1)
+        session.state = 'failed'; session.error = '任务记录保存失败，消息尚未提交给 DSH。'
+        await this.change(session).catch(() => {}); throw error
+      }
       const run = this.run(session, runId, input)
       this.runs.set(runId, run)
       void run.finally(() => this.runs.delete(runId)).catch(() => {})
