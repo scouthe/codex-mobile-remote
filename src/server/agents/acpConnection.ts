@@ -26,8 +26,14 @@ export class AcpConnection implements AcpTransport {
 
   initialize(): Promise<InitializeResponse> {
     if (this.init) return this.init
-    this.init = this.start().catch(async error => { await this.dispose(); this.init = undefined; throw error })
-    return this.init
+    const generation = this.generation + 1
+    const initializing = this.start().catch(async error => {
+      if (generation === this.generation) await this.dispose()
+      if (this.init === initializing) this.init = undefined
+      throw error
+    })
+    this.init = initializing
+    return initializing
   }
 
   private async start(): Promise<InitializeResponse> {

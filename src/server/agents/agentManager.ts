@@ -3,7 +3,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { ContentBlock, InitializeResponse, RequestPermissionRequest, RequestPermissionResponse, SessionNotification } from '@agentclientprotocol/sdk'
-import type { AgentPermission, AgentPromptInput, AgentSession, AgentSessionDetail, AgentStatus, AgentUpdate } from '../../types/agent.js'
+import type { AgentPermission, AgentPromptInput, AgentSession, AgentSessionDetail, AgentSessionView, AgentStatus, AgentUpdate } from '../../types/agent.js'
 import { isAgentBusy } from '../../types/agent.js'
 import type { UiMessage } from '../../types/codex.js'
 import { AcpConnection, type AcpTransport } from './acpConnection.js'
@@ -103,7 +103,7 @@ export class AgentManager {
     return { session: { ...record.session }, ...page, configOptions: record.configOptions, permissions: this.permissions(id), imagesSupported: this.capabilities?.agentCapabilities?.promptCapabilities?.image === true }
   }
 
-  async activate(id: string): Promise<AgentSessionDetail> {
+  async activate(id: string): Promise<AgentSessionView> {
     await this.ready()
     return this.serialize(id, async () => {
       const { session } = this.requireSession(id)
@@ -111,7 +111,8 @@ export class AgentManager {
         await this.resume(session)
         this.scheduleRelease(session)
       }
-      return this.detail(id)
+      const record = this.requireSession(id)
+      return { session: { ...session }, configOptions: record.configOptions, permissions: this.permissions(id), imagesSupported: this.capabilities?.agentCapabilities?.promptCapabilities?.image === true }
     })
   }
 

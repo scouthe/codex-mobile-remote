@@ -45,6 +45,7 @@ export type AgentSessionDetail = {
   imagesSupported: boolean
   nextCursor: number | null
 }
+export type AgentSessionView = Omit<AgentSessionDetail, 'messages' | 'nextCursor'>
 
 export type AgentStatus = { available: boolean; connected: boolean; message: string; imagesSupported: boolean }
 export type AgentUpdate = {
