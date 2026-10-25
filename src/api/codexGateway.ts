@@ -972,19 +972,33 @@ async function getThreadDetailV2(threadId: string): Promise<{
   const turnErrorRecord = asRecord(lastTurn?.error)
   const turnError = readString(turnErrorRecord?.message) || readString(lastTurn?.error)
   const terminalState = (readString(rawThread?.terminalState) ?? '').toLowerCase()
-  const terminalError = readString(rawThread?.terminalError) || turnError
-  const taskState: TaskState = terminalState === 'failed' || turnStatus === 'failed'
-    ? 'failed'
-    : terminalState === 'canceled'
+  const inProgress = readThreadInProgressFromResponse(payload)
+  // An observer's ordinary thread/read projection can still end at an old
+  // failed turn while the shared session marker already describes another
+  // turn. In particular, Android cache hydration uses this path directly.
+  // Only borrow a projected error when it belongs to the terminal turn;
+  // failed turns often have a generic task_complete marker, so a matching
+  // turn's real provider error must remain visible.
+  const projectionIsHistorical = sessionActivityKnown && Boolean(terminalTurnId)
+    && readString(lastTurn?.id) !== terminalTurnId
+  const projectedError = projectionIsHistorical ? '' : turnError
+  const terminalError = readString(rawThread?.terminalError) || projectedError
+  const taskState: TaskState = sessionActivityKnown && inProgress
+    ? 'running'
+    : sessionActivityKnown && terminalState === 'canceled'
       ? 'canceled'
-      : readThreadInProgressFromResponse(payload)
-        ? 'running'
-        : 'completed'
+      : terminalState === 'failed' || (!projectionIsHistorical && turnStatus === 'failed')
+        ? 'failed'
+        : terminalState === 'canceled'
+          ? 'canceled'
+          : inProgress
+            ? 'running'
+            : 'completed'
   return {
     model: normalizeThreadModelFromPayload(payload),
     modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: turnIndexesKnown ? normalized : omitUnknownTurnIndexes(normalized),
-    inProgress: readThreadInProgressFromResponse(payload),
+    inProgress,
     activeTurnId: readActiveTurnIdFromResponse(payload),
     ...(terminalTurnId ? { terminalTurnId } : {}),
     hasMoreOlder,

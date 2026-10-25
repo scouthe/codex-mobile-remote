@@ -51,11 +51,13 @@ Clear an old `Task failed / interrupted` overlay when shared state proves that a
 4. Repeat with a new running turn, a canceled terminal turn, and a failed terminal turn carrying a different error.
 5. Return a plain idle read without authoritative session state, then an older successful snapshot with a lower stream cursor after a newer failure.
 6. Verify at 375×812 and 768×1024 in light and dark themes.
+7. Run `TASK_ERROR_TEST_ANDROID_CACHE=1 node scripts/test-task-error-recovery.cjs`. This enables the Android bridge and seeds real IndexedDB with an incomplete cache. Its mandatory history hydration returns an older failed turn while the shared marker identifies a newer completed turn.
 
 #### Expected Results
 - A successful terminal marker replaces an old failed/canceled state even when realtime lifecycle notifications were missed.
 - Fresh task snapshots reconcile the separate live-error map; a new failure displays its own reason instead of an older `interrupted` message.
 - Genuine failures remain visible after reload. Plain idle reads and stale cursors cannot clear a newer live failure.
+- Android cache hydration does not promote an older turn's `interrupted` error into the current task. The native bridge must not receive a failed state for the newer completed turn. Matching current-turn provider failures remain visible even when their JSONL terminal marker is generic `task_complete`.
 - Recovery reuses existing status/snapshot requests; it adds no polling, history scan, or model request.
 
 #### Rollback/Cleanup
@@ -63,11 +65,13 @@ Clear an old `Task failed / interrupted` overlay when shared state proves that a
 - Stop only the temporary Docker containers used for packaged auth verification. Keep the normal 5900 and 5173 services running.
 
 #### Verification Evidence
-- `pnpm run test:unit`: 477 passed; 2 opt-in DSH integration cases skipped. `pnpm run build` passed, with no frontend chunk above 500 kB.
+- `pnpm run test:unit`: 483 passed; 2 opt-in DSH integration cases skipped. `pnpm run build` passed, with no frontend chunk above 500 kB.
 - CJS entry smoke passed: `node -e "process.argv=['node','codexapp','--help']; require('./dist-cli/index.js')"`.
 - `node scripts/test-task-error-recovery.cjs` passed at `http://127.0.0.1:4173/#/thread/00000000-0000-4000-a000-000000000031`, in light/dark themes at 375×812 and 768×1024. Screenshots: `output/playwright/task-error-recovery-{375,768}-{light,dark}.png`. Refresh recovery passed; persisted failure duplicate live-overlay count was zero. These are browser viewport checks, not physical Android tests.
+- `TASK_ERROR_TEST_ANDROID_CACHE=1 node scripts/test-task-error-recovery.cjs` passed at the same URL/viewports/themes, using a simulated native bridge and real IndexedDB. The incomplete-cache hydration fixture has a legacy string `interrupted` error in an older projected turn; its newer shared terminal marker stays completed. Native task callbacks did not report a false failure. Screenshots: `output/playwright/task-error-recovery-android-cache-{375,768}-{light,dark}.png`. This closes a gap in the earlier browser-only recovery test; it is not physical Android evidence.
 - Packaged image built with `pnpm pack --pack-destination output/failed-state-package` and `docker build -t codexapp-error-recovery:local output/failed-state-package`. Ports 4192 (no auth), 4193 (invalid test API key and a container-local HTTP 401 upstream), and 4194 (malformed test auth) booted. The 401 persisted after refresh; duplicate live-overlay count was zero. Screenshots: `output/playwright/error-recovery-packaged-invalid-{light,dark}.png`.
 - The 4192 isolated settings API switched OpenCode Zen → OpenRouter with an empty test key; no model request was sent for the switch. No production credentials or provider configuration were changed.
 - Desktop Node benchmark, median of three runs of 50,000 reducer observations: before 20.91 ms, after 21.10 ms. The fix adds no network requests, filesystem reads, timers, or history scans; it only reconciles existing in-memory state. Android timing was not measured.
+- History normalization adds only constant-time state/turn-ID checks. The recovery sequence made 98 API requests at 375px and 107 at 768px, identical with and without Android cache mode across three page loads and the synthetic recovery scenarios; zero model requests were sent. The production desktop-state chunk changed from 195.26 kB to 195.36 kB (gzip 54.64 → 54.68 kB).
 
 ---

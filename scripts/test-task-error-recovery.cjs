@@ -4,6 +4,7 @@ const fs = require('node:fs/promises')
 const base = process.env.TASK_ERROR_TEST_BASE || 'http://127.0.0.1:4173'
 const id = '00000000-0000-4000-a000-000000000031'
 const cwd = '/tmp/task-error-recovery-fixture'
+const androidCache = process.env.TASK_ERROR_TEST_ANDROID_CACHE === '1'
 
 async function main() {
   await fs.mkdir('output/playwright', { recursive: true })
@@ -51,7 +52,15 @@ async function main() {
           }
         }
         page.on('pageerror', error => errors.push(error.message))
-        await page.addInitScript(() => {
+        await page.addInitScript(androidCache => {
+          if (androidCache) {
+            window.__nativeTaskStates = []
+            window.CodexAndroid = {
+              getClientInfo: () => JSON.stringify({ clientType: 'android', clientId: 'android-cache-fixture', mode: 'observer', version: 'test' }),
+              setTaskState: state => window.__nativeTaskStates.push(state),
+              clearTaskState() {},
+            }
+          }
           const NativeWebSocket = window.WebSocket
           window.WebSocket = class {
             static OPEN = 1
@@ -65,7 +74,7 @@ async function main() {
             close() { this.readyState = 3 }
             send() {}
           }
-        })
+        }, androidCache)
         await page.route('**/codex-api/**', async route => {
           const request = route.request(), url = new URL(request.url())
           const body = request.postDataJSON?.()
@@ -74,7 +83,12 @@ async function main() {
           if (url.pathname === '/codex-api/rpc') {
             const method = body?.method
             if (method === 'thread/list') result = { data: [snapshot().thread], nextCursor: null }
-            else if (method === 'thread/read') result = snapshot()
+            else if (method === 'thread/read') {
+              result = snapshot()
+              if (androidCache && phase === 'initial') {
+                result.thread.turns[0] = { ...result.thread.turns[0], id: 'older-interrupted-turn', status: 'failed', error: 'interrupted' }
+              }
+            }
             else if (method === 'model/list') result = { data: [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', displayName: 'GPT-6.1 Sol', isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: 'medium', description: 'Medium' }], defaultReasoningEffort: 'medium', inputModalities: ['text', 'image'] }], nextCursor: null }
             else if (method === 'config/read') result = { config: { model: 'gpt-6.1-sol', model_provider: 'openai' } }
             else if (method === 'thread/goal/get') result = { goal: null }
@@ -99,8 +113,36 @@ async function main() {
           revision++
           await emit({ method: 'ready', params: { streamEpoch: 'recovery-fixture', latestSeq: revision } })
         }
+        if (androidCache) {
+          // Seed a bounded cache before mounting the app. Its history must be
+          // hydrated through ordinary thread/read, whose projection lags the
+          // already-completed shared marker by one turn.
+          await page.goto(base + '/icons/codexui-icon.svg')
+          await page.evaluate(({ id, revision }) => new Promise((resolve, reject) => {
+            const request = indexedDB.open('codex-remote-android', 1)
+            request.onupgradeneeded = () => request.result.createObjectStore('conversation-snapshots', { keyPath: 'key' })
+            request.onerror = () => reject(request.error)
+            request.onsuccess = () => {
+              const database = request.result
+              const transaction = database.transaction('conversation-snapshots', 'readwrite')
+              transaction.objectStore('conversation-snapshots').put({
+                key: location.origin + '\u0000' + id, origin: location.origin, threadId: id,
+                renderFormatVersion: 3, requiresHydration: true, sessionRevision: 'revision-' + revision,
+                updatedAtIso: '', hasMoreOlder: true, savedAt: Date.now(),
+                messages: [{ id: 'cached-answer', role: 'assistant', text: '你好，在的。TASK_ERROR_RECOVERY', messageType: 'agentMessage', messagePhase: 'final_answer', turnId: 'initial-turn', turnStatus: 'completed' }],
+              })
+              transaction.oncomplete = () => { database.close(); resolve() }
+              transaction.onerror = () => { database.close(); reject(transaction.error) }
+            }
+          }), { id, revision })
+        }
         await page.goto(base + '/#/thread/' + id)
-        await expect(page.getByText('你好，在的。TASK_ERROR_RECOVERY', { exact: true }).last()).toBeVisible()
+        await expect(page.getByText('你好，在的。TASK_ERROR_RECOVERY', { exact: true }).last()).toBeVisible({ timeout: 20_000 })
+        await expect(page.locator('.live-overlay-inline')).toHaveCount(0)
+        if (androidCache) {
+          await expect.poll(() => calls.filter(call => call === 'thread/read').length).toBeGreaterThan(0)
+          expect(await page.evaluate(() => window.__nativeTaskStates)).not.toContain('failed')
+        }
         phase = 'interrupted'
         revision++
         await emit({ method: 'error', params: { threadId: id, turnId: 'old-turn', message: 'interrupted', willRetry: false } })
@@ -112,7 +154,7 @@ async function main() {
         await expect(page.getByText('你好，在的。TASK_ERROR_RECOVERY', { exact: true }).last()).toBeVisible()
         await expect(page.locator('.live-overlay-inline')).toHaveCount(0)
         await page.waitForTimeout(2200)
-        const screenshot = `output/playwright/task-error-recovery-${viewport.width}-${theme}.png`
+        const screenshot = `output/playwright/task-error-recovery-${androidCache ? 'android-cache-' : ''}${viewport.width}-${theme}.png`
         await page.screenshot({ path: screenshot, fullPage: true })
         phase = 'interrupted'
         revision++
@@ -127,11 +169,11 @@ async function main() {
         await expect(page.locator('.live-overlay-inline')).toHaveCount(0)
         expect(errors).toEqual([])
         expect(calls.filter(call => call === 'turn/start' || call === 'thread/resume')).toEqual([])
-        results.push({ viewport, theme, screenshot, recoveredAfterReload: true, realFailurePersisted: true, duplicateLiveOverlayCount: 0, requests: calls.length, modelRequests: 0 })
+        results.push({ viewport, theme, androidCache, screenshot, recoveredAfterReload: true, realFailurePersisted: true, duplicateLiveOverlayCount: 0, requests: calls.length, modelRequests: 0 })
         await context.close()
       }
     }
-    await fs.writeFile('output/playwright/task-error-recovery-results.json', JSON.stringify(results, null, 2))
+    await fs.writeFile(`output/playwright/task-error-recovery-${androidCache ? 'android-cache-' : ''}results.json`, JSON.stringify(results, null, 2))
     console.log(JSON.stringify(results, null, 2))
   } finally { await browser.close() }
 }

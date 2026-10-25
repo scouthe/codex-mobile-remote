@@ -419,6 +419,42 @@ describe('getThreadDetail', () => {
     vi.unstubAllGlobals()
   })
 
+  it.each(['completed', 'running', 'canceled'] as const)('uses the shared %s state instead of an older interrupted projection', async (state) => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ result: { thread: {
+      id: 'observer-thread', sessionActivityKnown: true, sessionRevision: 'new-revision',
+      inProgress: state === 'running', taskState: state,
+      terminalState: state === 'running' ? '' : state,
+      terminalTurnId: state === 'running' ? '' : 'new-turn', terminalError: '',
+      turns: [{ id: 'old-turn', status: 'failed', error: { message: 'interrupted' }, items: [] }],
+    } } })))
+
+    await expect(getThreadDetail('observer-thread')).resolves.toMatchObject({
+      taskState: state, error: null, inProgress: state === 'running',
+    })
+  })
+
+  it('preserves a real failed turn when its id matches the shared terminal marker', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ result: { thread: {
+      id: 'failed-thread', sessionActivityKnown: true, inProgress: false,
+      terminalState: 'completed', terminalTurnId: 'failed-turn', terminalError: '',
+      turns: [{ id: 'failed-turn', status: 'failed', error: { message: 'HTTP 401: authentication failed' }, items: [] }],
+    } } })))
+    await expect(getThreadDetail('failed-thread')).resolves.toMatchObject({
+      taskState: 'failed', error: 'HTTP 401: authentication failed',
+    })
+  })
+
+  it.each(['HTTP 502: new failure', ''])('does not borrow an old interrupted error for a new failed marker (%s)', async (terminalError) => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ result: { thread: {
+      id: 'failed-thread', sessionActivityKnown: true, inProgress: false,
+      terminalState: 'failed', terminalTurnId: 'new-turn', terminalError,
+      turns: [{ id: 'old-turn', status: 'failed', error: { message: 'interrupted' }, items: [] }],
+    } } })))
+    await expect(getThreadDetail('failed-thread')).resolves.toMatchObject({
+      taskState: 'failed', error: terminalError || 'Task failed',
+    })
+  })
+
   it('reads modelProvider from nested thread payloads returned by thread/read', async () => {
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = typeof init?.body === 'string'
