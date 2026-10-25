@@ -2167,6 +2167,23 @@
 .phone-release { width:100%; }
 .phone-takeover,.phone-handback-button { border-color:var(--phone-accent); color:var(--phone-accent); }
 .phone-handback { display:flex; flex-direction:column; gap:7px; padding-top:9px; border-top:1px solid var(--phone-line); }
+.dsh-panel { display:flex; flex-direction:column; position:relative; flex:1; min-width:0; min-height:0; height:100%; background:#fff; color:#242424; }
+.dsh-toolbar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; padding:10px 14px; border-bottom:1px solid #e5e7eb; }
+.dsh-toolbar p { margin:0; font-size:13px; font-weight:600; }
+.dsh-toolbar p span { margin-left:8px; color:#71717a; font-size:11px; font-weight:400; }
+.dsh-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.dsh-actions button,.dsh-actions a,.dsh-notice button { border:1px solid #d4d4d8; border-radius:7px; padding:5px 9px; font-size:12px; cursor:pointer; }
+.dsh-actions button:disabled { opacity:.5; cursor:default; }
+.dsh-frame { flex:1; min-height:0; width:100%; border:0; background:inherit; }
+.dsh-loading { position:absolute; inset:60px 0 auto; padding:25px; text-align:center; font-size:13px; color:#71717a; pointer-events:none; }
+.dsh-notice { padding:22px; font-size:13px; color:#a34736; }
+.dsh-panel:fullscreen { width:100%; height:100%; }
+:root.dark .dsh-panel { background:#18191d; color:#e5e7eb; }
+:root.dark .dsh-toolbar { border-color:#303139; }
+:root.dark .dsh-toolbar p span,:root.dark .dsh-loading { color:#a1a1aa; }
+:root.dark .dsh-actions button,:root.dark .dsh-actions a,:root.dark .dsh-notice button { border-color:#52525b; }
+:root.dark .dsh-notice { color:#eeac9c; }
+@media(max-width:650px) { .dsh-toolbar { padding:8px 10px; } .dsh-toolbar p span { display:none; } }
 .phone-handback p { font-size:10px; color:var(--phone-muted); margin:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .phone-control-error { font-size:11px; line-height:1.5; color:#a34736; margin:0; overflow-wrap:anywhere; }
 .phone-screen-empty { color:#9ca3af; display:grid; place-content:center; text-align:center; }

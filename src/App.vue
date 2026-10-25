@@ -80,6 +80,11 @@
             </span>
           </button>
 
+          <button v-if="!isSidebarCollapsed" type="button" class="sidebar-skills-link" :class="{ 'is-active': isDshRoute }" @click="router.push({ name: 'dsh' }); isMobile && setSidebarCollapsed(true)">
+            <span class="sidebar-skills-link-icon" aria-hidden="true"><IconTablerBolt /></span>
+            <span class="sidebar-skills-link-copy"><span class="sidebar-skills-link-title">DeepSeek / DSH</span><span class="sidebar-skills-link-subtitle">原生对话与插件</span></span>
+          </button>
+
           <button v-if="!isSidebarCollapsed" type="button" class="sidebar-skills-link" :class="{ 'is-active': isPhoneAgentRoute }" @click="router.push({ name: 'phone-agent' }); isMobile && setSidebarCollapsed(true)">
             <span class="sidebar-skills-link-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 5h4M11 18h2"/></svg></span>
             <span class="sidebar-skills-link-copy"><span class="sidebar-skills-link-title">手机 Agent</span><span class="sidebar-skills-link-subtitle">Venus · 手机任务与画面</span></span>
@@ -548,7 +553,7 @@
         <span v-if="isVirtualKeyboardOpen" class="content-keyboard-spacer" aria-hidden="true" />
         <ContentHeader
           :title="contentTitle"
-          :accent="isSkillsRoute || isAutomationsRoute || isPhoneAgentRoute"
+          :accent="isSkillsRoute || isAutomationsRoute || isPhoneAgentRoute || isDshRoute"
           :status="isMobile && isSelectedThreadInProgress ? 'working' : undefined"
           :status-label="t('Working')"
         >
@@ -648,6 +653,9 @@
           </template>
           <template v-else-if="isPhoneAgentRoute">
             <PhoneAgentPanel />
+          </template>
+          <template v-else-if="isDshRoute">
+            <DshPanel />
           </template>
           <template v-else-if="isHomeRoute">
             <div class="content-grid content-grid-home">
@@ -1395,6 +1403,7 @@ const ReviewPane = defineAsyncComponent(() => import('./components/content/Revie
 const DirectoryHub = defineAsyncComponent(() => import('./components/content/DirectoryHub.vue'))
 const AutomationsPanel = defineAsyncComponent(() => import('./components/content/AutomationsPanel.vue'))
 const PhoneAgentPanel = defineAsyncComponent(() => import('./components/content/PhoneAgentPanel.vue'))
+const DshPanel = defineAsyncComponent(() => import('./components/content/DshPanel.vue'))
 const { t, uiLanguage, uiLanguageOptions, setUiLanguage } = useUiLanguage()
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'codex-web-local.sidebar-collapsed.v1'
@@ -1943,11 +1952,13 @@ const isHomeRoute = computed(() => route.name === 'home')
 const isSkillsRoute = computed(() => route.name === 'skills')
 const isAutomationsRoute = computed(() => route.name === 'automations')
 const isPhoneAgentRoute = computed(() => route.name === 'phone-agent')
+const isDshRoute = computed(() => route.name === 'dsh')
 const routeAutomationId = computed(() => {
   const raw = route.query.automationId
   return typeof raw === 'string' ? raw : ''
 })
 const contentTitle = computed(() => {
+  if (isDshRoute.value) return 'DeepSeek / DSH'
   if (isPhoneAgentRoute.value) return '手机 Agent'
   if (isAutomationsRoute.value) return t('Automations')
   if (isSkillsRoute.value) return t('Skills')
@@ -1959,6 +1970,7 @@ const browserHostName =
     ? (window.location.hostname || window.location.host || 'codexui')
     : 'codexui'
 const pageTitle = computed(() => {
+  if (isDshRoute.value) return 'DeepSeek Harness'
   if (isPhoneAgentRoute.value) return '手机 Agent · Venus'
   const threadTitle = selectedThread.value?.title?.trim() ?? ''
   return threadTitle || browserHostName
@@ -2015,14 +2027,14 @@ const isTerminalKeyboardLayoutActive = computed(() => (
 ))
 const directoryCwd = computed(() => selectedThread.value?.cwd?.trim() ?? newThreadCwd.value.trim())
 const isSelectedThreadInProgress = computed(() => {
-  if (isHomeRoute.value) return false
+  if (isHomeRoute.value || isDshRoute.value) return false
   const taskState = selectedTaskSnapshot.value?.state
   if (taskState) {
     return ['starting', 'running', 'waiting_approval', 'waiting_user_input', 'steering'].includes(taskState)
   }
   return selectedThread.value?.inProgress === true
 })
-const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && !isPhoneAgentRoute.value && selectedThreadId.value.trim().length > 0)
+const showThreadContextBadge = computed(() => !isHomeRoute.value && !isSkillsRoute.value && !isAutomationsRoute.value && !isPhoneAgentRoute.value && !isDshRoute.value && selectedThreadId.value.trim().length > 0)
 const isAccountSwitchBlocked = computed(() =>
   isSendingMessage.value ||
   isInterruptingTurn.value ||
@@ -5021,7 +5033,7 @@ function onImplementPlan(payload: { turnId: string }): void {
 
 
 async function copySelectedThreadChat(): Promise<void> {
-  if (isHomeRoute.value || isSkillsRoute.value || isAutomationsRoute.value) return
+  if (isHomeRoute.value || isSkillsRoute.value || isAutomationsRoute.value || isDshRoute.value) return
   if (!selectedThread.value || filteredMessages.value.length === 0) return
   const markdown = buildThreadMarkdown()
   try {
@@ -5547,7 +5559,7 @@ watch(
   async (threadId) => {
     if (!hasInitialized.value) return
     if (isRouteSyncInProgress.value) return
-    if (isHomeRoute.value || isSkillsRoute.value || isAutomationsRoute.value) return
+    if (isHomeRoute.value || isSkillsRoute.value || isAutomationsRoute.value || isDshRoute.value) return
 
     if (!threadId) {
       if (route.name !== 'home') {

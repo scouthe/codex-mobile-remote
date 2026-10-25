@@ -1,7 +1,7 @@
-const CACHE_NAME = 'codexweb-shell-v2'
+const CACHE_NAME = 'codexweb-shell-v3'
 const APP_SHELL_PATHS = ['/', '/manifest.webmanifest']
 const STATIC_DESTINATIONS = new Set(['document', 'script', 'style', 'image', 'font'])
-const BYPASS_PREFIXES = ['/codex-api/', '/codex-local-image', '/codex-local-file', '/codex-local-browse/', '/codex-local-edit/']
+const BYPASS_PREFIXES = ['/codex-api/', '/codex-local-image', '/codex-local-file', '/codex-local-browse/', '/codex-local-edit/', '/dsh/', '/dsh-api/']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -29,6 +29,9 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
+  // The embedded DSH document belongs to its own application. In particular,
+  // its navigation response must never replace the cached Codex home at '/'.
+  if (url.pathname === '/dsh') return
   if (BYPASS_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))) return
 
   if (request.mode === 'navigate') {

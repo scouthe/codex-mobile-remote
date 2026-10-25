@@ -10,6 +10,33 @@
 
 构建后重启现有网页服务即可生效：`pnpm run build`、`systemctl --user restart codexapp-5900.service`。手机控制仍受模型决策质量和步数上限影响；例如小米的系统信息入口通常叫“我的设备”，任务中写出屏幕上的名称更明确。[验证步骤](tests/phone-agent/venus-conversation-window.md)
 
+## DSH 原生界面入口
+
+左侧 **DeepSeek / DSH**（`#/dsh`）在当前应用中打开本机已有的 DeepSeek Harness 原生网页。
+界面、模型、插件、工作区和历史仍由 dsh 自己管理；5900 仅提供入口及经过现有网页认证的 HTTP/WebSocket 转发。
+浏览器和 Android App 都访问同源 `/dsh/`，因此现有局域网、Tailscale 和星桥公网入口可以复用。
+DSH 页面按需加载，支持重新加载、全屏和独立打开。
+
+先自行安装并启动 dsh，然后在 **Codex 主机**的 `$CODEX_HOME/dsh-bridge.json`（默认 `~/.codex/dsh-bridge.json`）配置已有服务。
+如果 dsh 由本机 systemd 托管，且当前用户可读取它的启动日志：
+
+```json
+{
+  "upstreamUrl": "http://127.0.0.1:8080/",
+  "journalUnit": "dsh-web.service"
+}
+```
+
+`upstreamUrl` 应填写 dsh 实际监听的地址；例如本机 dsh 绑定局域网 IP 时就填写该 IP。
+桥接层只在内部授权时读取服务日志中的最新启动 URL，并通过官方 token 交换取得内部 Cookie；不会修改或重启 dsh。
+未使用 systemd 时，把 dsh 打印的完整启动 URL 填为 `launchUrl`，也可同时指定不带凭据的 `upstreamUrl`。
+配置包含凭据时请设置文件权限 `0600`，不要提交 Git；启动 token 更新后需同步该字段。
+也支持 `CODEXUI_DSH_CONFIG` 指定配置文件，或用 `CODEXUI_DSH_URL`、`CODEXUI_DSH_LAUNCH_URL`、`CODEXUI_DSH_JOURNAL_UNIT` 覆盖对应项。
+更改已连接的上游配置后重启 5900。未接入或 dsh 停止时页面会显示错误与重试入口，不影响 Codex 使用。
+
+dsh 的权限检查与插件行为保持原样；本入口不会放宽原有插件的访问限制，也不合并 Codex 与 dsh 会话。
+[接入与验收步骤](tests/skills-plugins-integrations/dsh-native-entry.md)
+
 [![GitHub Release](https://img.shields.io/github/v/release/scouthe/codex-mobile-remote?style=for-the-badge)](https://github.com/scouthe/codex-mobile-remote/releases)
 [![node](https://img.shields.io/badge/Node-18%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![license](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](./LICENSE)

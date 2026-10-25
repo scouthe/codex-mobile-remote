@@ -2,12 +2,17 @@ import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import { createCodexBridgeMiddleware } from "./src/server/codexAppServerBridge";
 import { createPhoneAgentMiddleware } from "./src/server/phoneAgentMiddleware";
+import { createDshBridge } from "./src/server/dshBridge";
+import { createAuthSession } from "./src/server/authMiddleware";
+import { resolveWebPassword } from "./src/server/passwordSetupStore";
 import { createDirectoryListingHtml, createTextEditorHtml, decodeBrowsePath, getLocalDirectoryListing, isTextEditableFile, normalizeLocalPath } from "./src/server/localBrowseUi";
 import tailwindcss from "@tailwindcss/vite";
 import { spawnSync } from "node:child_process";
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { stat, writeFile } from "node:fs/promises";
 import { basename, extname, isAbsolute } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import pkg from "./package.json";
@@ -144,6 +149,30 @@ export default defineConfig({
     {
       name: "codex-bridge",
       configureServer(server) {
+        const webPassword = resolveWebPassword(true, process.env.CODEX_HOME || join(homedir(), ".codex"));
+        const dshAuth = createAuthSession({
+          password: webPassword.password, setupRequired: webPassword.setupRequired,
+          lanOnly: webPassword.source === "skipped",
+        });
+        const dsh = createDshBridge();
+        server.middlewares.use((req, res, next) => {
+          if (!dsh.matches(req)) return next();
+          if (!dshAuth.isRequestAuthorized(req)) {
+            res.writeHead(401, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+            res.end("请先登录 Codex Remote。");
+            return;
+          }
+          dsh.middleware(req, res, next);
+        });
+        server.httpServer?.on("upgrade", (req, socket, head) => {
+          if (!new URL(req.url || "/", "http://localhost").pathname.startsWith("/dsh/")) return;
+          if (!dshAuth.isRequestAuthorized(req)) {
+            socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+            return;
+          }
+          void dsh.upgrade(req, socket, head);
+        });
+        server.httpServer?.once("close", () => dsh.dispose());
         const phoneAgent = createPhoneAgentMiddleware();
         server.middlewares.use(phoneAgent);
         server.httpServer?.once("close", () => phoneAgent.dispose());

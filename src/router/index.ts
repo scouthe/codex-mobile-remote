@@ -28,6 +28,11 @@ const router = createRouter({
       component: EmptyRouteView,
     },
     {
+      path: '/dsh',
+      name: 'dsh',
+      component: EmptyRouteView,
+    },
+    {
       path: '/automations',
       name: 'automations',
       component: EmptyRouteView,

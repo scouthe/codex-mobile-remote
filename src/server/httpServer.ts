@@ -7,6 +7,7 @@ import express, { type Express } from 'express'
 import { createCodexBridgeMiddleware } from './codexAppServerBridge.js'
 import { createAuthSession } from './authMiddleware.js'
 import { createPhoneAgentMiddleware } from './phoneAgentMiddleware.js'
+import { createDshBridge } from './dshBridge.js'
 import { createDirectoryListingHtml, createTextEditorHtml, decodeBrowsePath, getLocalDirectoryListing, isTextEditableFile, normalizeLocalPath } from './localBrowseUi.js'
 import { WebSocketServer, type WebSocket } from 'ws'
 
@@ -90,6 +91,9 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
 
   // 1. Authentication, first-run setup, and explicit LAN-only access policy.
   app.use(authSession.middleware)
+
+  const dsh = createDshBridge()
+  app.use(dsh.middleware)
 
   const phoneAgent = createPhoneAgentMiddleware()
   app.use(phoneAgent)
@@ -263,12 +267,20 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
 
   return {
     app,
-    dispose: () => { phoneAgent.dispose(); bridge.dispose() },
+    dispose: () => { dsh.dispose(); phoneAgent.dispose(); bridge.dispose() },
     attachWebSocket: (server: HttpServer) => {
       const wss = new WebSocketServer({ noServer: true })
 
       server.on('upgrade', (req: IncomingMessage, socket, head) => {
         const url = new URL(req.url ?? '', 'http://localhost')
+        if (url.pathname.startsWith('/dsh/')) {
+          if (!authSession.isRequestAuthorized(req)) {
+            socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
+            return
+          }
+          void dsh.upgrade(req, socket, head)
+          return
+        }
         if (url.pathname !== '/codex-api/ws') {
           return
         }
