@@ -1429,6 +1429,7 @@ const props = defineProps<{
   retryState?: TurnRetryState | null
   retryNow?: (threadId: string) => Promise<void> | void
   forkStatusByTurnId?: Record<string, ThreadForkStatus>
+  codexActions?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -2061,6 +2062,7 @@ function showCopyResponseButton(message: UiMessage): boolean {
 }
 
 function showForkResponseButton(message: UiMessage): boolean {
+  if (props.codexActions === false) return false
   return typeof forkableTurnIdByAnchorId.value[message.id] === 'string'
 }
 
@@ -2592,6 +2594,7 @@ function forkResponse(anchorMessageId: string): void {
 const editableTurnIdByMessageId = computed(() => buildEditableConversationTurns(props.messages))
 
 function showEditMessageButton(message: UiMessage): boolean {
+  if (props.codexActions === false) return false
   return typeof editableTurnIdByMessageId.value[message.id] === 'string'
 }
 
@@ -4641,6 +4644,16 @@ function dismissMobileConversationTurnPreview(event: PointerEvent): void {
 
 defineExpose({
   jumpToLatest,
+  readPosition: () => ({ top: conversationListRef.value?.scrollTop || 0, windowStart: renderWindowStart.value, follow: autoFollowOutput.value }),
+  restorePosition: async (position: { top: number; windowStart: number; follow: boolean }) => {
+    autoFollowOutput.value = position.follow
+    renderWindowStart.value = Math.max(0, Math.min(position.windowStart, props.messages.length - RENDER_WINDOW_SIZE))
+    await scheduleConversationScroll()
+    if (!position.follow && conversationListRef.value) {
+      conversationListRef.value.scrollTop = position.top
+      updateActiveTurnMarker(conversationListRef.value)
+    }
+  },
 })
 
 function bindPendingImageHandlers(): void {

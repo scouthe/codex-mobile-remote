@@ -7,6 +7,9 @@ const EmptyRouteView = {
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
+    { path: '/dsh', name: 'dsh-home', component: EmptyRouteView },
+    { path: '/dsh/session/:sessionId', name: 'dsh-session', component: EmptyRouteView },
+    { path: '/dsh/native', name: 'dsh-native', component: EmptyRouteView },
     {
       path: '/',
       name: 'home',
@@ -25,11 +28,6 @@ const router = createRouter({
     {
       path: '/phone-agent',
       name: 'phone-agent',
-      component: EmptyRouteView,
-    },
-    {
-      path: '/dsh',
-      name: 'dsh',
       component: EmptyRouteView,
     },
     {

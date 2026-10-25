@@ -10,7 +10,7 @@
 ## Exact Actions / Expected Results
 
 1. Open the normal Codex home. Expect no `/dsh/` or `/dsh-api/` request and no DSH JavaScript in the outer application's eager bundle.
-2. Select **DeepSeek / DSH**. Expect `#/dsh`, one status request, and an iframe at the same origin's `/dsh/`. The original DSH UI, workspace/session list, models and plugin menu must appear without another login prompt. Inspect the real iframe, not just the outer navigation.
+2. Select **DSH**, then **More → Open DSH native UI**. Expect `#/dsh/native`, one native status request, and an iframe at the same origin's `/dsh/`. `#/dsh` is the unified DSH chat workspace. The original DSH UI, workspace/session list, models and plugin menu must appear without another login prompt. Inspect the real iframe, not just the outer navigation.
 3. Verify plugin combo URLs such as `/dsh/plugins/??@deepseek-ai/dsh-client-modules/client.js,...&rev=...` return normally. Preserve their query bytes; converting them into ordinary URLSearchParams breaks the original loader.
 4. Open an existing DSH conversation, reload the page, and verify its history remains available. Do not send a model prompt as part of entry-only verification. Compare a plugin's direct and proxied response if it reports a permission error; existing DSH policy restrictions must remain intact.
 5. Verify the real DSH WebSocket `/dsh/api/remote.mux` and any plugin sockets connect. Leaving the route must tear down that iframe's sockets; it must not stop the independent DSH service or send an interrupt.

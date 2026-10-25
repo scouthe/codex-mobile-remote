@@ -2,6 +2,7 @@ import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import { createCodexBridgeMiddleware } from "./src/server/codexAppServerBridge";
 import { createPhoneAgentMiddleware } from "./src/server/phoneAgentMiddleware";
+import { createAgentBridge } from "./src/server/agents/agentRoutes";
 import { createDshBridge } from "./src/server/dshBridge";
 import { createAuthSession } from "./src/server/authMiddleware";
 import { resolveWebPassword } from "./src/server/passwordSetupStore";
@@ -154,6 +155,8 @@ export default defineConfig({
           password: webPassword.password, setupRequired: webPassword.setupRequired,
           lanOnly: webPassword.source === "skipped",
         });
+        const agents = createAgentBridge({ isAuthorized: dshAuth.isRequestAuthorized });
+        server.middlewares.use(agents.middleware);
         const dsh = createDshBridge();
         server.middlewares.use((req, res, next) => {
           if (!dsh.matches(req)) return next();
@@ -434,6 +437,8 @@ export default defineConfig({
         server.middlewares.use(bridge);
         server.httpServer?.once("close", () => {
           bridge.dispose();
+          void agents.dispose();
+          dsh.dispose();
         });
       },
     },

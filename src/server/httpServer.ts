@@ -7,6 +7,7 @@ import express, { type Express } from 'express'
 import { createCodexBridgeMiddleware } from './codexAppServerBridge.js'
 import { createAuthSession } from './authMiddleware.js'
 import { createPhoneAgentMiddleware } from './phoneAgentMiddleware.js'
+import { createAgentBridge } from './agents/agentRoutes.js'
 import { createDshBridge } from './dshBridge.js'
 import { createDirectoryListingHtml, createTextEditorHtml, decodeBrowsePath, getLocalDirectoryListing, isTextEditableFile, normalizeLocalPath } from './localBrowseUi.js'
 import { WebSocketServer, type WebSocket } from 'ws'
@@ -88,11 +89,12 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
     lanOnly: options.lanOnly,
   })
   const bridge = createCodexBridgeMiddleware({ passwordConfigured: () => authSession.hasPassword() })
+  const agents = createAgentBridge({ isAuthorized: authSession.isRequestAuthorized })
+  const dsh = createDshBridge()
 
   // 1. Authentication, first-run setup, and explicit LAN-only access policy.
   app.use(authSession.middleware)
-
-  const dsh = createDshBridge()
+  app.use(agents.middleware)
   app.use(dsh.middleware)
 
   const phoneAgent = createPhoneAgentMiddleware()
@@ -267,7 +269,7 @@ export function createServer(options: ServerOptions = {}): ServerInstance {
 
   return {
     app,
-    dispose: () => { dsh.dispose(); phoneAgent.dispose(); bridge.dispose() },
+    dispose: () => { dsh.dispose(); phoneAgent.dispose(); bridge.dispose(); void agents.dispose() },
     attachWebSocket: (server: HttpServer) => {
       const wss = new WebSocketServer({ noServer: true })
 
