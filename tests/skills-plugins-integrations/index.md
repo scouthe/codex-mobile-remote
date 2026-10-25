@@ -8,6 +8,7 @@ Return to the [manual test index](../../tests.md).
 
 | Section |
 | --- |
+| [DSH ACP workspace](dsh-acp-workspace.md) |
 | [Feature: Telegram bot token stored in dedicated global file](telegram-bot-token-stored-in-dedicated-global-file.md) |
 | [Feature: Telegram chatIds persisted for bot DM sending](telegram-chatids-persisted-for-bot-dm-sending.md) |
 | [Feature: Telegram bridge rejects unauthorized senders](telegram-bridge-rejects-unauthorized-senders.md) |

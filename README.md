@@ -1,6 +1,7 @@
 # Codex Remote · codex-mobile-remote
 
-通过网页或 Android App，远程使用 Linux 主机上的 Codex，并与连接同一官方 app-server 的 Codex Desktop 同步。
+通过网页或 Android App，远程使用 Linux 主机上的 Codex 和 DeepSeek Harness（DSH）。
+Codex 继续与连接同一官方 app-server 的 Codex Desktop 同步；DSH 使用独立会话和自己的模型配置。
 
 [![GitHub Release](https://img.shields.io/github/v/release/scouthe/codex-mobile-remote?style=for-the-badge)](https://github.com/scouthe/codex-mobile-remote/releases)
 [![node](https://img.shields.io/badge/Node-18%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
@@ -48,6 +49,8 @@ Codex Desktop 通过各自的连接方式使用同一台主机上的官方服务
 
 | 功能 | 使用方式与边界 |
 | --- | --- |
+| 工具切换 | 电脑侧栏顶部选择 Codex / DSH，手机在顶部下拉切换。两者分别保留项目、对话、草稿和阅读位置；切换工具不会停止正在运行的任务。 |
+| DSH 对话 | 选择主机项目目录后创建对话，模型和推理选项来自 DSH。支持文本、按能力开放的图片、文件引用、工具执行、权限审批、停止及重启后续聊。DSH 页面不显示 Codex 专属的 Fork、回滚、Goal 和 Fast。 |
 | 对话与任务状态 | 侧栏显示活动状态；任务中心区分 `queued`、`starting`、`running`、`waiting_approval`、`waiting_user_input`、`steering`、`completed`、`failed`、`canceled`。 |
 | 发送 / 引导 / 停止 | 普通发送在已有任务执行时默认排队；显式引导调用 `turn/steer`，停止调用 `turn/interrupt`。审批和输入请求通过对应卡片处理。 |
 | 从回复 Fork | 点击助手回复下方的双箭头；历史已完成、失败或中断轮次可以创建分支，正在执行的目标轮次不可用。原线程继续运行。 |
@@ -69,16 +72,62 @@ Codex Desktop 通过各自的连接方式使用同一台主机上的官方服务
     └── 星桥公网 HTTPS → 中转服务器 → 本机 FRPC
                                   ↓
                     Linux：codexapp :5900
-                                  ↓
-                    官方 codex app-server proxy
-                                  ↓
-                    官方 app-server 共享 socket
-                                  ↑
-                    Windows Codex Desktop 经 SSH 连接
+                       ├── Codex → 官方 app-server proxy
+                       │               ↓
+                       │      官方 app-server 共享 socket
+                       │               ↑
+                       │      Windows Desktop 经 SSH 连接
+                       └── DSH → 独立 ACP 进程 → DSH 原生会话
 ```
 
 关闭 Windows Desktop 不等于停止主机上的官方 app-server；各客户端的同步以连接到
 同一官方服务为前提。星桥管理员后台和公网 FRPS/Caddy 属于独立部署，当前仓库包含用户端接入能力。
+
+### 接入本机 DSH
+
+先在运行 5900 的 Linux 主机上安装并配置好 DSH，确认 `dsh` 命令能正常使用。
+本次接入已在 DSH `0.2.1-rc.2` 验证；需要它提供创建、恢复会话及配置选项接口。
+5900 不会自动安装 DSH，也不会修改它原有的 Web 服务或 Codex 的模型、登录配置。
+
+打开页面后选择 **DSH → 新建 DSH 对话**，选择主机上的项目目录，再创建对话。
+模型及推理强度会按 DSH 实际返回的选项显示；不支持图片时会隐藏图片按钮，并在添加图片时说明原因。
+工具执行的过程默认折叠，最终回复单独展示；需要审批的操作会出现确认卡片。
+
+首次使用会创建独立的 `~/.dsh/profiles/codex-remote-acp`，复用已安装的 DSH 包，
+只从现有 `web` profile 复制第一方模型适配器及默认模型，不加载其 Web 插件。
+配置文件权限为 `0600`。复制只在首次创建时发生，后续修改 ACP profile 不会被覆盖。
+如果你的模型只配置在其他 profile，或 systemd 找不到 `dsh`，可以创建
+`$CODEX_HOME/remote-agents/dsh.json`（默认 `~/.codex/remote-agents/dsh.json`）：
+
+```json
+{
+  "command": "/usr/bin/dsh",
+  "profile": "codex-remote-acp",
+  "sourceProfile": "web",
+  "dshHome": "/home/你的用户名/.dsh"
+}
+```
+
+`command` 应指向实际安装的 DSH；`profile` 必须独立于现有 Web/Desktop profile。
+原生上下文继续由 DSH 保存，5900 的显示记录、会话状态和配置快照保存在
+`$CODEX_HOME/remote-agents`。普通刷新不会重发任务；服务重启后会保留显示记录，
+此前未确认结束的任务会标记为中断，再次发送时恢复同一个 DSH 原生会话。
+
+当前列表展示由本工作台创建的 DSH 对话。已有原生 DSH 对话、插件管理等功能，
+可通过右上角“更多 → 打开 DSH 原生界面”使用：该入口需要已有 DSH Web 服务，
+以及独立的 `$CODEX_HOME/dsh-bridge.json` 配置。例如：
+
+```json
+{
+  "upstreamUrl": "http://127.0.0.1:8080",
+  "journalUnit": "dsh-web.service"
+}
+```
+
+服务端从你有权限读取的 systemd 日志中取得 DSH 启动授权，不把启动密钥发给浏览器。
+没有 Web 服务也可以使用 DSH 统一聊天页面。两种入口不同时写入同一条原生会话；
+DSH 的会话占用错误会直接显示，不会抢占另一个进程正在使用的会话。
+Android App 仍加载 5900 页面，本次功能无需重新安装 APK。
 
 ## Linux 一键安装脚本（需要发布包）
 
