@@ -2172,6 +2172,109 @@ describe('live error overlay', () => {
     })
   })
 
+  it.each(['completed', 'running', 'failed', 'canceled'] as const)('reconciles an old live error with a fresh %s snapshot after missed notifications', async (taskState) => {
+    installTestWindow()
+    let notify: (notification: { method: string; params: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notify = handler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    const state = useDesktopState()
+    state.primeSelectedThread('reconnect-error-thread')
+    state.startPolling()
+    notify({ method: 'error', params: { threadId: 'reconnect-error-thread', turnId: 'old-turn', message: 'interrupted', willRetry: false } })
+    expect(state.selectedLiveOverlay.value?.errorText).toBe('interrupted')
+
+    gatewayMocks.getThreadLiveState.mockResolvedValue({
+      messages: [{ id: 'answer', role: 'assistant', text: '你好，在的。', messageType: 'agentMessage', turnId: 'new-turn' }],
+      inProgress: taskState === 'running', activeTurnId: taskState === 'running' ? 'new-turn' : '',
+      terminalTurnId: taskState === 'running' ? '' : 'new-turn',
+      hasMoreOlder: false, turnIndexByTurnId: {}, sessionActivityKnown: true,
+      sessionRevision: 'new-revision', taskState,
+      currentActivity: taskState === 'failed'
+        ? { kind: 'error', label: 'Task failed', details: ['new authentication failure'] }
+        : { kind: taskState === 'running' ? 'thinking' : 'idle', label: taskState === 'running' ? 'Thinking' : 'Completed', details: [] },
+      error: taskState === 'failed' ? 'new authentication failure' : null,
+      liveStateError: null,
+    })
+    await state.loadMessages('reconnect-error-thread', { force: true, preferLiveState: true })
+
+    expect(state.selectedTaskSnapshot.value?.state).toBe(taskState)
+    if (taskState === 'failed') {
+      expect(state.selectedLiveOverlay.value?.errorText).toBe('new authentication failure')
+    } else {
+      expect(state.selectedLiveOverlay.value?.errorText || '').toBe('')
+      if (taskState === 'completed') expect(state.selectedLiveOverlay.value).toBeNull()
+    }
+  })
+
+  it('clears a failed task and its live error from an authoritative completed list marker', async () => {
+    installTestWindow()
+    let notify: (notification: { method: string; params: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notify = handler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    const state = useDesktopState()
+    state.primeSelectedThread('completed-marker-thread')
+    state.startPolling()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    notify({ method: 'error', params: { threadId: 'completed-marker-thread', turnId: 'old-turn', message: 'interrupted' } })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'Project', threads: [{
+        ...thread('completed-marker-thread', '/tmp/project'),
+        sessionActivityKnown: true, sessionRevision: 'completed-revision',
+        taskState: 'completed', terminalTurnId: 'completed-turn', taskError: '',
+      }] }], nextCursor: null,
+    })
+    await state.syncThreadStatus()
+
+    expect(state.selectedTaskSnapshot.value).toMatchObject({ state: 'completed', error: null })
+    expect(state.selectedLiveOverlay.value).toBeNull()
+  })
+
+  it('keeps a genuine live failure when a plain idle read provides no task authority', async () => {
+    installTestWindow()
+    let notify: (notification: { method: string; params: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notify = handler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    const state = useDesktopState()
+    state.primeSelectedThread('real-failure-thread')
+    state.startPolling()
+    notify({ method: 'error', params: { threadId: 'real-failure-thread', turnId: 'failed-turn', message: 'authentication failed' } })
+    gatewayMocks.getThreadDetail.mockResolvedValue({ messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {} })
+    await state.loadMessages('real-failure-thread', { force: true, fast: false })
+    expect(state.selectedLiveOverlay.value?.errorText).toBe('authentication failed')
+  })
+
+  it('does not clear a newer live failure with an older successful snapshot', async () => {
+    installTestWindow()
+    let notify: (notification: { method: string; params: unknown; seq: number; streamEpoch: string }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation((handler) => {
+      notify = handler
+      return vi.fn()
+    })
+    gatewayMocks.getPendingServerRequests.mockResolvedValue([])
+    const state = useDesktopState()
+    state.primeSelectedThread('newer-failure-thread')
+    state.startPolling()
+    notify({ method: 'error', seq: 30, streamEpoch: 'epoch-1', params: { threadId: 'newer-failure-thread', turnId: 'new-turn', message: 'current failure' } })
+    gatewayMocks.getThreadLiveState.mockResolvedValue({
+      messages: [], inProgress: false, activeTurnId: '', terminalTurnId: 'old-turn',
+      hasMoreOlder: false, turnIndexByTurnId: {}, taskState: 'completed', error: null,
+      sessionActivityKnown: true, sessionRevision: 'old-revision',
+      streamCursor: { streamEpoch: 'epoch-1', latestSeq: 20, oldestSeq: 1 }, liveStateError: null,
+    })
+    await state.loadMessages('newer-failure-thread', { force: true, preferLiveState: true })
+    expect(state.selectedTaskSnapshot.value).toMatchObject({ state: 'failed', error: 'current failure' })
+    expect(state.selectedLiveOverlay.value?.errorText).toBe('current failure')
+  })
+
   it('suppresses a live error only after that same error has persisted', async () => {
     installTestWindow()
     let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}

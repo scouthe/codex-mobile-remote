@@ -375,7 +375,11 @@ export function reduceTaskSnapshot(previous: TaskSnapshot | undefined, observati
       activeTurnId = ''
       error = null
       currentActivity = { kind: 'idle', label: 'Canceled', details: [] }
-    } else if (state === 'running' || state === 'starting' || state === 'steering' || state === 'waiting_approval' || state === 'waiting_user_input') {
+    } else if (observation.terminalState === 'completed'
+      || state === 'running' || state === 'starting' || state === 'steering' || state === 'waiting_approval' || state === 'waiting_user_input') {
+      // A reconnect can miss both start and completion notifications. The
+      // shared terminal marker must also replace a previous failed/canceled
+      // snapshot; an ordinary idle read alone must preserve genuine errors.
       state = 'completed'
       finishedAt = atIso
       error = null

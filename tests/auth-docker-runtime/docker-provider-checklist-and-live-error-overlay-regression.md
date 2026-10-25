@@ -33,3 +33,41 @@ Docker provider/auth checklist execution and live error overlay de-duplication.
 - Stop temporary containers with `docker rm -f codexui-what-noauth codexui-what-invalid-auth codexui-what-malformed-auth`.
 
 ---
+
+### Reconcile stale task errors after an observer reconnect
+
+#### Feature/Change Name
+Clear an old `Task failed / interrupted` overlay when shared state proves that a later turn is running or has completed.
+
+#### Prerequisites/Setup
+1. Build and run the current branch. Use an isolated test thread and browser context.
+2. Run `pnpm exec vitest run src/task/taskStateReducer.test.ts src/composables/useDesktopState.test.ts`.
+3. For browser verification, run `node scripts/test-task-error-recovery.cjs` against `127.0.0.1:4173`. Its intercepted fixtures do not write real threads or credentials.
+
+#### Steps
+1. Deliver a non-retryable `interrupted` notification to the observer and verify that its live error is visible.
+2. Simulate a reconnect that misses the next turn's start/completion notifications. Return a fresh successful shared snapshot with a different terminal turn ID.
+3. Verify that the successful assistant reply remains visible and that the old error and feedback overlay disappear. Reload and verify again.
+4. Repeat with a new running turn, a canceled terminal turn, and a failed terminal turn carrying a different error.
+5. Return a plain idle read without authoritative session state, then an older successful snapshot with a lower stream cursor after a newer failure.
+6. Verify at 375×812 and 768×1024 in light and dark themes.
+
+#### Expected Results
+- A successful terminal marker replaces an old failed/canceled state even when realtime lifecycle notifications were missed.
+- Fresh task snapshots reconcile the separate live-error map; a new failure displays its own reason instead of an older `interrupted` message.
+- Genuine failures remain visible after reload. Plain idle reads and stale cursors cannot clear a newer live failure.
+- Recovery reuses existing status/snapshot requests; it adds no polling, history scan, or model request.
+
+#### Rollback/Cleanup
+- Browser fixtures live only in the test context; close it to remove synthetic notifications.
+- Stop only the temporary Docker containers used for packaged auth verification. Keep the normal 5900 and 5173 services running.
+
+#### Verification Evidence
+- `pnpm run test:unit`: 477 passed; 2 opt-in DSH integration cases skipped. `pnpm run build` passed, with no frontend chunk above 500 kB.
+- CJS entry smoke passed: `node -e "process.argv=['node','codexapp','--help']; require('./dist-cli/index.js')"`.
+- `node scripts/test-task-error-recovery.cjs` passed at `http://127.0.0.1:4173/#/thread/00000000-0000-4000-a000-000000000031`, in light/dark themes at 375×812 and 768×1024. Screenshots: `output/playwright/task-error-recovery-{375,768}-{light,dark}.png`. Refresh recovery passed; persisted failure duplicate live-overlay count was zero. These are browser viewport checks, not physical Android tests.
+- Packaged image built with `pnpm pack --pack-destination output/failed-state-package` and `docker build -t codexapp-error-recovery:local output/failed-state-package`. Ports 4192 (no auth), 4193 (invalid test API key and a container-local HTTP 401 upstream), and 4194 (malformed test auth) booted. The 401 persisted after refresh; duplicate live-overlay count was zero. Screenshots: `output/playwright/error-recovery-packaged-invalid-{light,dark}.png`.
+- The 4192 isolated settings API switched OpenCode Zen → OpenRouter with an empty test key; no model request was sent for the switch. No production credentials or provider configuration were changed.
+- Desktop Node benchmark, median of three runs of 50,000 reducer observations: before 20.91 ms, after 21.10 ms. The fix adds no network requests, filesystem reads, timers, or history scans; it only reconciles existing in-memory state. Android timing was not measured.
+
+---

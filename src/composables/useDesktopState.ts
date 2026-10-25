@@ -2065,6 +2065,28 @@ export function useDesktopState() {
       ...taskSnapshotsByThreadId.value,
       [threadId]: next,
     }
+    // The overlay has a separate error map populated by live notifications.
+    // Reconcile it too when a shared snapshot recovers missed lifecycle
+    // events, or its old error will mask even a healthy/new failed snapshot.
+    const hasTerminalOutcome = !observation.notification
+      && observation.inProgress === false
+      && Boolean(observation.terminalState)
+    const hasNewActiveTurn = !observation.notification
+      && observation.inProgress === true
+      && Boolean(observation.activeTurnId)
+      && observation.activeTurnId !== previous?.activeTurnId
+      && observation.activeTurnId !== previous?.terminalTurnId
+    if (hasTerminalOutcome) {
+      if (next.state === 'failed' && next.error) {
+        setTurnErrorForThread(threadId, next.error)
+      } else if (!next.error && ['completed', 'canceled', 'queued'].includes(next.state)) {
+        setTurnErrorForThread(threadId, null)
+        clearTurnRetry(threadId)
+      }
+    } else if (hasNewActiveTurn && !next.error) {
+      setTurnErrorForThread(threadId, null)
+      clearTurnRetry(threadId)
+    }
     // Completion events and shared-session markers are authoritative before
     // message hydration catches up. Settle this turn's cached messages now so
     // the Fork action does not remain blocked by a stale inProgress row.
@@ -2151,6 +2173,9 @@ export function useDesktopState() {
       writerClient: detail.writerClient,
       streamCursor: detail.streamCursor ?? undefined,
       revision: detail.sessionRevision,
+      terminalState: detail.taskState === 'completed' || detail.taskState === 'failed' || detail.taskState === 'canceled'
+        ? detail.taskState : undefined,
+      terminalError: detail.error ?? undefined,
       ...(queueDepth === undefined
         ? {}
         : {
@@ -5862,6 +5887,9 @@ export function useDesktopState() {
         terminalTurnId: detailTerminalTurnId,
         streamCursor: detailStreamCursor,
         error: 'error' in detail && (typeof detail.error === 'string' || detail.error === null) ? detail.error : undefined,
+        terminalState: hasSharedTaskAuthority && (detail.taskState === 'completed' || detail.taskState === 'failed' || detail.taskState === 'canceled')
+          ? detail.taskState : undefined,
+        terminalError: hasSharedTaskAuthority ? detail.error ?? undefined : undefined,
         revision: detailSessionRevision,
         fullHydrationDeferred: detail.fullHydrationDeferred,
       })

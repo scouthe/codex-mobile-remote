@@ -289,6 +289,52 @@ describe('task state reducer', () => {
     expect(completed.currentActivity).toEqual({ kind: 'idle', label: 'Completed', details: [] })
   })
 
+  it('replaces a failed snapshot with an authoritative successful terminal marker', () => {
+    const failed = createTaskSnapshot('reconnected-thread', {
+      state: 'failed',
+      terminalTurnId: 'old-turn',
+      error: 'interrupted',
+      currentActivity: { kind: 'error', label: 'Task failed', details: ['interrupted'] },
+      streamCursor: { streamEpoch: 'epoch-1', latestSeq: 10, oldestSeq: 1 },
+    })
+    const completed = reduceTaskSnapshot(failed, {
+      threadId: 'reconnected-thread',
+      inProgress: false,
+      terminalTurnId: 'completed-turn',
+      terminalState: 'completed',
+      revision: 'completed-revision',
+      streamCursor: { streamEpoch: 'epoch-1', latestSeq: 20, oldestSeq: 1 },
+    })
+
+    expect(completed).toMatchObject({
+      state: 'completed',
+      terminalTurnId: 'completed-turn',
+      activeTurnId: '',
+      error: null,
+      currentActivity: { kind: 'idle', label: 'Completed', details: [] },
+    })
+  })
+
+  it('preserves a failure when an idle read has no terminal outcome', () => {
+    const failed = createTaskSnapshot('failed-thread', {
+      state: 'failed', error: 'authentication failed', terminalTurnId: 'failed-turn',
+    })
+    const idle = reduceTaskSnapshot(failed, { threadId: 'failed-thread', inProgress: false })
+    expect(idle).toMatchObject({ state: 'failed', error: 'authentication failed' })
+  })
+
+  it('ignores a successful terminal snapshot with an older stream cursor', () => {
+    const failed = createTaskSnapshot('failed-thread', {
+      state: 'failed', error: 'current failure', terminalTurnId: 'failed-turn',
+      streamCursor: { streamEpoch: 'epoch-1', latestSeq: 20, oldestSeq: 1 },
+    })
+    expect(reduceTaskSnapshot(failed, {
+      threadId: 'failed-thread', inProgress: false, terminalState: 'completed',
+      terminalTurnId: 'old-turn',
+      streamCursor: { streamEpoch: 'epoch-1', latestSeq: 10, oldestSeq: 1 },
+    })).toBe(failed)
+  })
+
   it('starts a fresh turn from a previous failed or canceled terminal state', () => {
     const failed = createTaskSnapshot('thread-retry-terminal', {
       state: 'failed',
