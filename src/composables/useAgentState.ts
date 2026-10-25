@@ -37,6 +37,7 @@ export function useAgentState(selectedId: Ref<string>) {
   const pendingReads = new Map<string, Promise<AgentSessionDetail>>()
   const knownSessions = new Map<string, AgentSession>()
   let stream: EventSource | undefined, disposed = false, listRequest: Promise<void> | undefined
+  let streamEpoch = 0, listEpoch = -1
 
   function upsertSession(session: AgentSession) {
     const current = knownSessions.get(session.id)
@@ -62,19 +63,21 @@ export function useAgentState(selectedId: Ref<string>) {
     details.value = { ...details.value, [update.session.id]: { ...previous, session: update.session, messages, configOptions: update.configOptions || previous.configOptions, permissions: update.permissions || previous.permissions } }
   }
   function refreshList(): Promise<void> {
-    if (!listRequest) {
+    if (!listRequest || listEpoch !== streamEpoch) {
+      listEpoch = streamEpoch
       const before = new Map(Array.from(knownSessions, ([id, session]) => [id, session.revision]))
-      listRequest = agentGateway.list().then(rows => {
+      const request = agentGateway.list().then(rows => {
         // A slower list must not hide a chat created while it was loading,
         // or resurrect a chat archived by a newer live update.
         sessions.value = reconcileAgentSessionList(rows, knownSessions, before)
-      }).finally(() => { listRequest = undefined })
+      }).finally(() => { if (listRequest === request) listRequest = undefined })
+      listRequest = request
     }
     return listRequest
   }
   async function refresh(id = selectedId.value, activate = false): Promise<AgentSessionDetail | undefined> {
     if (!id) return
-    const key = `${id}:${activate}`
+    const key = `${id}:${activate}:${streamEpoch}`
     if (pendingReads.has(key)) return pendingReads.get(key)
     const read = (activate
       ? agentGateway.activate(id).then(view => ({ ...view, messages: details.value[id]?.messages || [], nextCursor: details.value[id]?.nextCursor ?? null }))
@@ -95,13 +98,16 @@ export function useAgentState(selectedId: Ref<string>) {
     catch (cause) { error.value = cause instanceof Error ? cause.message : 'DSH 状态同步失败。' }
   }
   async function initialize() {
+    if (disposed || loading.value || stream && stream.readyState !== 2) return
+    stream?.close()
+    stream = undefined
     loading.value = true
     try {
       const status = await agentGateway.status()
       available.value = status.available; statusMessage.value = status.message
       if (disposed) return
       stream = new EventSource('/agent-api/events')
-      stream.addEventListener('ready', () => { connected.value = true; loading.value = false; void synchronize() })
+      stream.addEventListener('ready', () => { streamEpoch++; connected.value = true; loading.value = false; void synchronize() })
       stream.addEventListener('update', event => {
         try { apply(JSON.parse((event as MessageEvent).data)) } catch { void synchronize() }
       })

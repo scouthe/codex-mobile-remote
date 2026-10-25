@@ -17,6 +17,7 @@ async function main() {
   const detail = { session, messages, configOptions: [], permissions: [permission], imagesSupported: false, nextCursor: null }
   const other = { ...detail, session: { ...session, id: otherId, nativeId: 'other', title: '另一条 DSH 对话', state: 'idle' }, messages: [], permissions: [] }
   const submitted = []
+  let holdNextDetail = false, releaseStale
   await page.addInitScript(() => {
     window.EventSource = class {
       listeners = new Map()
@@ -28,6 +29,13 @@ async function main() {
   })
   await page.route('**/agent-api/**', async route => {
     const request = route.request(), url = new URL(request.url())
+    if (holdNextDetail && request.method() === 'GET' && url.pathname === '/agent-api/sessions/' + id) {
+      holdNextDetail = false
+      const stale = JSON.parse(JSON.stringify(detail))
+      await new Promise(resolve => { releaseStale = resolve })
+      await route.fulfill({ json: stale })
+      return
+    }
     let result
     if (url.pathname.endsWith('/status')) result = { available: true, connected: true, message: '', imagesSupported: false }
     else if (url.pathname.endsWith('/directories')) result = { path: '/tmp', parent: '/', directories: [] }
@@ -69,12 +77,20 @@ async function main() {
     await page.getByRole('textbox', { name: '向 DSH 发送消息' }).fill('另一条会话的草稿')
     await page.getByRole('button', { name: 'DSH 交互验收', exact: true }).click()
     await expect(page.getByRole('textbox', { name: '向 DSH 发送消息' })).toHaveValue('第一条会话的草稿')
+    // Hold a read from the previous connection. Reconnect must start a fresh
+    // read, then ignore the older response when it eventually arrives.
+    holdNextDetail = true
+    await page.getByRole('button', { name: '更多 DSH 操作', exact: true }).click()
+    await page.getByRole('button', { name: '刷新状态', exact: true }).click()
+    await expect.poll(() => typeof releaseStale).toBe('function')
     for (let index = 0; index < 35; index++) {
       detail.messages.push({ id: `long-user-${index}`, role: 'user', text: `Long question ${index}`, messageType: 'userMessage', turnId: `long-${index}`, turnIndex: index + 2 })
       detail.messages.push({ id: `long-answer-${index}`, role: 'assistant', text: `Long answer ${index}\n\n${'用于验证阅读位置的对话内容。'.repeat(12)}`, messageType: 'agentMessage', messagePhase: 'final_answer', turnId: `long-${index}`, turnIndex: index + 2 })
     }
     detail.session.revision++
     await page.evaluate(() => window.__acpStream.emit('ready', {}))
+    await expect(page.getByText(/Long answer 34/).first()).toBeVisible()
+    releaseStale()
     await expect(page.getByText(/Long answer 34/).first()).toBeVisible()
     await page.locator('.conversation-list').evaluate(element => { element.scrollTop = 400 })
     await page.waitForTimeout(600)

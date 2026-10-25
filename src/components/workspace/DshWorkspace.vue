@@ -33,7 +33,7 @@
             <div v-if="moreOpen" class="agent-more-menu"><button type="button" @click="router.push('/dsh/native'); moreOpen = false">打开 DSH 原生界面</button><button type="button" @click="refresh">刷新状态</button><button type="button" @click="toggleTheme">切换外观</button></div>
           </template>
         </ContentHeader>
-        <DshPanel v-if="native" />
+        <template v-if="native"><DshPanel v-if="workspaceActive" /></template>
         <template v-else>
           <div v-if="!state.connected.value" class="agent-connection-status" role="status">{{ state.loading.value ? '正在连接…' : '连接中断，正在重新连接；正在执行的任务会继续运行。' }} <button type="button" @click="refresh">刷新状态</button></div>
           <div v-if="state.error.value || pageError" class="agent-notice" role="alert">{{ pageError || state.error.value }} <button type="button" @click="refresh">重试</button></div>
@@ -65,7 +65,7 @@
             <form @submit.prevent="browse(pathInput)"><input v-model="pathInput" aria-label="项目绝对路径" :disabled="browsing" /><button type="submit" :disabled="browsing">前往</button></form>
             <p v-if="folderError" class="agent-inline-error" role="alert">{{ folderError }}</p>
             <div class="agent-directory-list"><button v-if="directory.parent !== directory.path" type="button" :disabled="browsing" @click="browse(directory.parent)">↰ 上一级</button><button v-for="folder in directory.directories" :key="folder.path" type="button" :disabled="browsing" @click="browse(folder.path)">▸ {{ folder.name }}</button></div>
-            <button class="agent-create" type="button" :disabled="browsing || !directory.path" @click="chooseFolder">使用此目录</button>
+            <button class="agent-create" type="button" :disabled="browsing || !directory.path || !!folderError" @click="chooseFolder">使用此目录</button>
           </section>
         </div>
       </Teleport>
@@ -92,6 +92,7 @@ import { CODEX_ANDROID_EVENTS, parseSharePayload } from '../../native/codexAndro
 const DshPanel = defineAsyncComponent(() => import('../content/DshPanel.vue'))
 const router = useRouter(), route = useRoute(), { isMobile } = useMobile()
 const sidebarClosed = ref(isMobile.value), selectedId = ref(''), native = ref(false), moreOpen = ref(false), pageError = ref('')
+const workspaceActive = ref(true)
 const creating = ref(false), approving = ref(false), cwd = ref(''), foldersOpen = ref(false), browsing = ref(false), folderError = ref(''), pathInput = ref('')
 const directory = ref({ path: '', parent: '', directories: [] as Array<{ path: string; name: string }> })
 const composer = ref<InstanceType<typeof DshComposer>>()
@@ -126,8 +127,11 @@ watch(() => route.fullPath, () => {
   }
 }, { immediate: true })
 watch(isMobile, value => { sidebarClosed.value = value })
-onDeactivated(() => { sidebarClosed.value = true; foldersOpen.value = false; moreOpen.value = false })
-onActivated(() => { if (!isMobile.value) sidebarClosed.value = false; void shared() })
+onDeactivated(() => { workspaceActive.value = false; sidebarClosed.value = true; foldersOpen.value = false; moreOpen.value = false })
+onActivated(() => { workspaceActive.value = true; if (!isMobile.value) sidebarClosed.value = false; void shared() })
+watch(() => [route.fullPath, detail.value?.session.title], () => {
+  if (String(route.name).startsWith('dsh')) document.title = native.value ? 'DSH 原生界面' : `${detail.value?.session.title || '新建对话'} · DSH`
+}, { immediate: true })
 
 async function create() {
   if (creating.value) return
@@ -144,6 +148,7 @@ async function archive(id: string) {
 }
 async function refresh() {
   moreOpen.value = false; pageError.value = ''
+  await state.initialize()
   await state.synchronize()
   if (selectedId.value) try { await state.refresh(selectedId.value, true) } catch (cause) { pageError.value = cause instanceof Error ? cause.message : '重新连接失败。' }
 }

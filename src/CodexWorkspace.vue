@@ -1302,7 +1302,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue'
 import WorkspaceToolPicker from './components/workspace/WorkspaceToolPicker.vue'
 import { useRoute, useRouter } from 'vue-router'
 import DesktopLayout from './components/layout/DesktopLayout.vue'
@@ -2689,6 +2689,7 @@ function onAndroidResume(): void {
 }
 
 onDeactivated(() => { if (isMobile.value) setSidebarCollapsed(true) })
+onActivated(() => { document.title = pageTitle.value })
 
 onMounted(() => {
   document.addEventListener('pointerdown', onDocumentPointerDown)
