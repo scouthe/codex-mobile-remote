@@ -1,7 +1,7 @@
-const CACHE_NAME = 'codexweb-shell-v2'
+const CACHE_NAME = 'codexweb-shell-v3'
 const APP_SHELL_PATHS = ['/', '/manifest.webmanifest']
 const STATIC_DESTINATIONS = new Set(['document', 'script', 'style', 'image', 'font'])
-const BYPASS_PREFIXES = ['/codex-api/', '/codex-local-image', '/codex-local-file', '/codex-local-browse/', '/codex-local-edit/']
+const BYPASS_PREFIXES = ['/codex-api/', '/agent-api/', '/auth/', '/codex-local-image', '/codex-local-file', '/codex-local-browse/', '/codex-local-edit/', '/dsh/', '/dsh-api/']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -29,6 +29,7 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
+  if (url.pathname === '/dsh') return
   if (BYPASS_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))) return
 
   if (request.mode === 'navigate') {
@@ -50,11 +51,15 @@ async function networkFirstNavigation(request) {
   const cache = await caches.open(CACHE_NAME)
   try {
     const response = await fetch(request)
-    cache.put('/', response.clone())
+    if (response.ok && urlIsAppShell(request.url)) cache.put('/', response.clone())
     return response
   } catch {
     return (await cache.match('/')) || Response.error()
   }
+}
+
+function urlIsAppShell(url) {
+  return new URL(url).pathname === '/'
 }
 
 async function staleWhileRevalidate(request) {

@@ -1,6 +1,12 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 import { createCodexBridgeMiddleware } from "./src/server/codexAppServerBridge";
+import { createAgentBridge } from "./src/server/agents/agentRoutes";
+import { createDshBridge } from "./src/server/dshBridge";
+import { createAuthSession } from "./src/server/authMiddleware";
+import { resolveWebPassword } from "./src/server/passwordSetupStore";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createDirectoryListingHtml, createTextEditorHtml, decodeBrowsePath, getLocalDirectoryListing, isTextEditableFile, normalizeLocalPath } from "./src/server/localBrowseUi";
 import tailwindcss from "@tailwindcss/vite";
 import { spawnSync } from "node:child_process";
@@ -131,6 +137,21 @@ export default defineConfig({
       configureServer(server) {
         process.env.CODEXUI_SERVER_PORT = String(server.config.server.port ?? 5173);
         const bridge = createCodexBridgeMiddleware();
+        const webPassword = resolveWebPassword(true, process.env.CODEX_HOME || join(homedir(), '.codex'));
+        const agentAuth = createAuthSession({ password: webPassword.password, lanOnly: webPassword.source === 'skipped', setupRequired: webPassword.setupRequired });
+        const agents = createAgentBridge({ isAuthorized: agentAuth.isRequestAuthorized });
+        const dsh = createDshBridge();
+        server.middlewares.use((req, res, next) => {
+          if (!dsh.matches(req)) return next();
+          if (!agentAuth.isRequestAuthorized(req)) { res.writeHead(401); res.end('请先登录 Codex Remote。'); return; }
+          dsh.middleware(req, res, next);
+        });
+        server.httpServer?.on('upgrade', (req, socket, head) => {
+          if (!new URL(req.url || '/', 'http://localhost').pathname.startsWith('/dsh/')) return;
+          if (!agentAuth.isRequestAuthorized(req)) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); return; }
+          void dsh.upgrade(req, socket, head);
+        });
+        server.middlewares.use(agents.middleware);
         const httpServer = server.httpServer;
         if (httpServer) {
           httpServer.once("listening", () => {
@@ -387,6 +408,8 @@ export default defineConfig({
         server.middlewares.use(bridge);
         server.httpServer?.once("close", () => {
           bridge.dispose();
+          void agents.dispose();
+          dsh.dispose();
         });
       },
     },
