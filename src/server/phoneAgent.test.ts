@@ -196,7 +196,7 @@ describe('local phone agent task lifecycle', () => {
     await control.release(session.id); control.dispose()
   })
 
-  it('maps sleep to the Android power key while keeping the manual lease active', async () => {
+  it('keeps the manual lease active after sleep', async () => {
     const { manager } = await fixture()
     const execute = vi.fn(async () => {})
     const control = new PhoneControlManager(manager, {

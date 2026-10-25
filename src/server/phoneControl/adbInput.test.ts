@@ -19,6 +19,16 @@ if(args.includes('settings')) console.log('com.android.adbkeyboard/.AdbIME');
 }
 
 describe('manual ADB input', () => {
+  it('uses the sleep-only key for repeated sleep requests so they cannot toggle the display on', async () => {
+    const { input, commands } = await setup()
+    await input.execute({ type: 'key', key: 'sleep' })
+    await input.execute({ type: 'key', key: 'sleep' })
+    expect(await commands()).toEqual([
+      ['-s', 'phone-test', 'shell', 'input', 'keyevent', '223'],
+      ['-s', 'phone-test', 'shell', 'input', 'keyevent', '223'],
+    ])
+  })
+
   it('maps normalized coordinates to current logical display pixels', async () => {
     const { input, commands } = await setup()
     await input.execute({ type: 'tap', point: { x: 0.5, y: 0.25 }, epoch: 2 }, { width: 560, height: 1280, epoch: 2, codec: 'avc1.640020' })
