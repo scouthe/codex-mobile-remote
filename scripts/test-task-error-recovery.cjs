@@ -82,7 +82,18 @@ async function main() {
           let result
           if (url.pathname === '/codex-api/rpc') {
             const method = body?.method
-            if (method === 'thread/list') result = { data: [snapshot().thread], nextCursor: null }
+            if (method === 'thread/list') {
+              const current = snapshot().thread
+              // Reproduce the real list: one ID, a current rollout followed by
+              // an older rollout carrying an unrelated interrupted terminal.
+              const stale = {
+                ...current, updatedAt: current.updatedAt - 86_400,
+                status: { type: 'idle' }, sessionRevision: 'stale-rollout',
+                taskState: 'failed', taskError: 'interrupted', terminalState: 'failed',
+                terminalError: 'interrupted', terminalTurnId: 'older-interrupted-turn',
+              }
+              result = { data: [current, stale], nextCursor: null }
+            }
             else if (method === 'thread/read') {
               result = snapshot()
               if (androidCache && phase === 'initial') {
@@ -169,7 +180,7 @@ async function main() {
         await expect(page.locator('.live-overlay-inline')).toHaveCount(0)
         expect(errors).toEqual([])
         expect(calls.filter(call => call === 'turn/start' || call === 'thread/resume')).toEqual([])
-        results.push({ viewport, theme, androidCache, screenshot, recoveredAfterReload: true, realFailurePersisted: true, duplicateLiveOverlayCount: 0, requests: calls.length, modelRequests: 0 })
+        results.push({ viewport, theme, androidCache, duplicateRolloutList: true, screenshot, recoveredAfterReload: true, realFailurePersisted: true, duplicateLiveOverlayCount: 0, requests: calls.length, modelRequests: 0 })
         await context.close()
       }
     }

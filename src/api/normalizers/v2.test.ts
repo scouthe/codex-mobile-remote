@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeThreadMessagesV2, readThreadInProgressFromResponse } from './v2'
+import { normalizeThreadGroupsV2, normalizeThreadMessagesV2, readThreadInProgressFromResponse } from './v2'
 import type { ThreadReadResponse } from '../appServerDtos'
 
 function threadReadResponseWithContent(content: ThreadReadResponse['thread']['turns'][number]['items'][number][]): ThreadReadResponse {
@@ -44,6 +44,20 @@ function threadReadResponseWithContent(content: ThreadReadResponse['thread']['tu
     },
   }
 }
+
+describe('normalizeThreadGroupsV2', () => {
+  it.each([false, true])('keeps the newest record before grouping duplicate thread IDs (reverse=%s)', (reverse) => {
+    const current = { ...threadReadResponseWithContent([]).thread, updatedAt: 200, cwd: '/new-project',
+      sessionActivityKnown: true, sessionRevision: 'new', taskState: 'completed', taskError: '' }
+    const stale = { ...current, updatedAt: 100, cwd: '/old-project', sessionRevision: 'old', taskState: 'failed', taskError: 'interrupted' }
+    const rows = reverse ? [stale, current] : [current, stale]
+    const groups = normalizeThreadGroupsV2({ data: rows, nextCursor: 'next', backwardsCursor: null })
+    expect(groups).toHaveLength(1)
+    expect(groups[0]?.threads).toHaveLength(1)
+    expect(groups[0]?.threads[0]).toMatchObject({ id: current.id, cwd: '/new-project', sessionRevision: 'new', taskState: 'completed' })
+    expect(groups[0]?.threads[0]?.taskError).toBeUndefined()
+  })
+})
 
 describe('normalizeThreadMessagesV2', () => {
   it('preserves commentary, final-answer phase and turn duration for conversation grouping', () => {

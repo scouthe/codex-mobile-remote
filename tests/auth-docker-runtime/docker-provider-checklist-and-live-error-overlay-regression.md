@@ -34,6 +34,48 @@ Docker provider/auth checklist execution and live error overlay de-duplication.
 
 ---
 
+### Duplicate rollout records must not overwrite current task state
+
+#### Feature/Change Name
+Deduplicate thread IDs before reading session activity, caching summaries, and normalizing the sidebar. Keep the newest record without copying task errors from an older rollout.
+
+#### Prerequisites/Setup
+1. Run `pnpm run test:unit` and `pnpm run build`.
+2. Keep the current branch's verification server running on `127.0.0.1:4173`.
+3. Use synthetic sessions or a thread already containing multiple rollout files with the same ID. Do not delete or rewrite real history to create this condition.
+
+#### Steps
+1. Return a thread list containing a current rollout and an older rollout with the same ID. Make the old file terminate with `interrupted`; test both list orders.
+2. Test the current file while running, after successful completion, and after a real provider failure. Request both the first page and a cursor page.
+3. Check that database supplementation updates the canonical record once, preserves the cursor, and does not overwrite a newer official record with an older cached row. Include duplicate supplemental records and an empty supplement.
+4. Fetch an older cursor page after caching the current summary. Verify the cached fallback still points at the current rollout.
+5. Run `node scripts/test-task-error-recovery.cjs` and `TASK_ERROR_TEST_ANDROID_CACHE=1 node scripts/test-task-error-recovery.cjs`. Both fixtures now return the real duplicate-ID pattern on every list refresh.
+6. At 375×812 and 768×1024 in light/dark themes, verify initial load, reconnect, and reload. Confirm successful snapshots clear the old error and genuine new errors remain visible.
+7. After deploying, query the affected instance's `thread/list` repeatedly with limits 40 and 1000. Check unique IDs, the affected thread's current path, and its task state/error. Open and reload the same thread over LAN and the public relay.
+
+#### Expected Results
+- Exactly one row per thread ID reaches activity reconciliation, even when rollout paths or project directories differ. A newer record replaces the old record as a whole; equal timestamps keep the first record deterministically.
+- Old `interrupted` records cannot overwrite a newer running/completed task or replace the reason for a genuine new failure.
+- Activity reads use only the selected rollout, once per path per response. Pagination cursors are preserved; list updates do not roll the fallback summary cache backward.
+- New unsent forks remain visible through the existing supplement. No sessions, databases, or official Codex configuration are modified by deduplication.
+- A production check during a running turn proves only its current API/browser state. Physical Android and post-completion production behavior must not be claimed from viewport simulation alone.
+
+#### Rollback/Cleanup
+- Close synthetic browser contexts and remove only the named isolated auth-test containers.
+- If a rollback is necessary, revert the deduplication commit, rebuild, and restart only `codexapp-5900.service`. Do not alter rollout files or restart the independent official app-server.
+
+#### Verification Evidence
+- Before the fix, the affected 5900 list returned 211 rows with seven duplicate-ID groups. The affected ID had both a current running rollout and an older failed rollout carrying `interrupted`.
+- All 14 added regression cases passed; full suite: 497 passed, two opt-in DSH integration cases skipped. Build and public CJS-entry smoke passed.
+- Browser fixtures passed at both viewports in light/dark themes, including simulated Android bridge callbacks and real IndexedDB hydration. Screenshots: `output/playwright/task-error-recovery-{375,768}-{light,dark}.png` and `output/playwright/task-error-recovery-android-cache-{375,768}-{light,dark}.png`. Genuine failures persisted after reload, with zero duplicate live error overlays.
+- After restarting only the 5900 user service, three real list requests (limits 40, 1000, 40) returned 200 unique rows, no duplicate IDs, and one current affected-thread record with `taskState: running` and an empty task error.
+- LAN and public-relay browser checks at 375×812 passed before and after reload in light/dark themes, with a simulated Android observer bridge: no live error, false failed native callback, or page error. Screenshots: `output/playwright/task-error-production-{lan,public}-375-{light,dark}.png`. This checked the current running production turn; completion was covered by synthetic HTTP/browser fixtures, not a physical Android device.
+- Final packed-image checks used ports 4192 (no auth), 4193 (invalid fixture key with container-local 401 upstream), and 4194 (malformed auth). All booted; 4193's genuine auth failure persisted after reload with zero duplicate live overlays. Switching 4192 from OpenCode Zen to OpenRouter with an empty test key succeeded without a model request. Commands: `pnpm pack --pack-destination /tmp`, `docker build -t codexapp-error-recovery:local output/failed-state-package`, `node output/failed-state-package/verify.cjs`. Screenshots: `output/playwright/error-recovery-packaged-invalid-{light,dark}.png`.
+- The pure O(n) selection took a median 0.017 ms for 211 synthetic rows and 0.403 ms for 10,000 rows on desktop Node (101 measured iterations after warmup). It adds no RPCs, database queries, filesystem reads, timers, or unbounded concurrency. HTTP regressions assert that the older duplicate file is never read. Physical Android timings were not measured.
+- The browser recovery scenarios still used 98 API requests at 375px and 107 at 768px, with zero model calls. The desktop-state chunk increased from 195.36 kB to 195.78 kB (gzip 54.68 → 54.80 kB); the largest frontend chunk remained 342.64 kB.
+
+---
+
 ### Reconcile stale task errors after an observer reconnect
 
 #### Feature/Change Name

@@ -18,6 +18,7 @@ import type {
   UiThread,
 } from '../../types/codex'
 import { normalizePathForComparison, normalizePathForUi, toProjectName } from '../../pathUtils.js'
+import { deduplicateThreadRecords } from '../../threadList.js'
 
 function toIso(seconds: number): string {
   return new Date(seconds * 1000).toISOString()
@@ -686,7 +687,7 @@ function groupThreadsByProject(threads: UiThread[]): UiProjectGroup[] {
 }
 
 export function normalizeThreadGroupsV2(payload: ThreadListResponse): UiProjectGroup[] {
-  const uiThreads = payload.data.map(toUiThread)
+  const uiThreads = deduplicateThreadRecords(payload.data).map(toUiThread)
   return groupThreadsByProject(uiThreads)
 }
 

@@ -53,6 +53,7 @@ import { ThreadSessionBroker } from './threadSessionBroker.js'
 import { ThreadSessionActivityReader, type ThreadSessionActivity } from './threadSessionActivity.js'
 import { countTurnsFromTarget, invalidateThreadHistoryPages, readOfficialThreadPage } from './threadHistoryPager.js'
 import { ThreadListSupplementCache } from './threadListSupplementCache.js'
+import { deduplicateThreadRecords, threadUpdatedAt } from '../threadList.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
@@ -2125,19 +2126,24 @@ export function mergeImportedThreadsIntoThreadListResult(
   const record = asRecord(result)
   const data = Array.isArray(record?.data) ? record.data : null
   if (!record || !data) return result
+  const uniqueData = deduplicateThreadRecords(data)
   const importedById = new Map<string, Record<string, unknown>>()
-  for (const thread of supplementalThreads ?? listImportedThreadsFromStateDb()) {
+  for (const thread of deduplicateThreadRecords(supplementalThreads ?? listImportedThreadsFromStateDb())) {
     const id = readNonEmptyString(thread.id)
     if (id) importedById.set(id, thread)
   }
-  if (importedById.size === 0) return result
+  if (importedById.size === 0) return uniqueData.length === data.length ? result : { ...record, data: uniqueData }
   const mergedData: unknown[] = []
-  for (const item of data) {
+  for (const item of uniqueData) {
     const id = readNonEmptyString(asRecord(item)?.id)
     const imported = id ? importedById.get(id) : undefined
     if (imported) {
       const { pendingFork, ...visibleImported } = imported
-      mergedData.push(pendingFork ? item : { ...asRecord(item), ...visibleImported })
+      // The database may know the canonical rollout before the official list,
+      // but its cached supplement must never roll a newer official row back.
+      mergedData.push(pendingFork || threadUpdatedAt(item) > threadUpdatedAt(imported)
+        ? item
+        : { ...asRecord(item), ...visibleImported })
       importedById.delete(id)
     } else {
       mergedData.push(item)
@@ -7452,7 +7458,7 @@ export async function canonicalizeThreadListResponseForRead(
   }
   return {
     ...record,
-    data: await Promise.all(record.data.map((item) => canonicalizeThreadCwdRecord(item, canonicalizeCwd))),
+    data: await Promise.all(deduplicateThreadRecords(record.data).map((item) => canonicalizeThreadCwdRecord(item, canonicalizeCwd))),
   }
 }
 
@@ -8903,11 +8909,13 @@ export class AppServerProcess {
       : record?.thread
         ? [record.thread]
         : []
-    for (const row of rows) {
+    for (const row of deduplicateThreadRecords(rows)) {
       const summary = asRecord(row)
       const threadId = readNonEmptyString(summary?.id)
       const sessionPath = readNonEmptyString(summary?.path)
       if (!threadId || !sessionPath || !isAbsolute(sessionPath)) continue
+      const cached = this.threadSummaryById.get(threadId)
+      if (Array.isArray(record?.data) && cached && threadUpdatedAt(cached) > threadUpdatedAt(summary)) continue
       this.threadSummaryById.set(threadId, { ...summary, turns: [] })
     }
   }

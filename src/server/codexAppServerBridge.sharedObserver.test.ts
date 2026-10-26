@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer as createHttpServer, type Server } from 'node:http'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -232,6 +232,62 @@ describe('shared thread observer HTTP path', () => {
       expect(payload.data?.['queue-thread']?.map((row) => row.id)).toEqual(['q-c', 'q-a'])
       const persisted = JSON.parse(await readFile(join(directory, '.codex-global-state.json'), 'utf8')) as Record<string, unknown>
       expect(persisted['thread-queue-state']).toBeDefined()
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+      instance.dispose()
+      fake.restore()
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = previousCodexHome
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['running', false], ['running', true],
+    ['completed', false], ['completed', true],
+    ['failed', false], ['failed', true],
+  ] as const)('uses only the current rollout for duplicate thread IDs (%s, reverse=%s)', async (state, reverse) => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-duplicate-list-'))
+    const previousCodexHome = process.env.CODEX_HOME
+    process.env.CODEX_HOME = directory
+    const currentPath = join(directory, 'rollout-current.jsonl')
+    const oldPath = join(directory, 'rollout-old.jsonl')
+    const event = (payload: Record<string, unknown>) => JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(), payload }) + '\n'
+    await writeFile(oldPath, event({ type: 'task_started', turn_id: 'old-turn' })
+      + event({ type: 'turn_aborted', turn_id: 'old-turn', error: 'interrupted' }))
+    await writeFile(currentPath, event({ type: 'task_started', turn_id: 'new-turn' })
+      + (state === 'running' ? '' : state === 'failed'
+        ? event({ type: 'task_failed', turn_id: 'new-turn', error: { message: 'HTTP 401: authentication failed' } })
+        : event({ type: 'task_complete', turn_id: 'new-turn' })))
+    const current = { id: 'shared-thread', path: currentPath, updatedAt: 200, status: { type: 'idle' }, turns: [] }
+    const stale = { ...current, path: oldPath, updatedAt: 100 }
+    const fake = installFakeSharedBridge({ threadListResult: {
+      data: reverse ? [stale, current] : [current, stale], nextCursor: 'next-page',
+    } })
+    const readActivity = vi.spyOn(fake.sessionActivityReader, 'read')
+    const instance = createServer()
+    const server = await new Promise<Server>((resolve) => {
+      const httpServer = createHttpServer(instance.app)
+      httpServer.listen(0, '127.0.0.1', () => resolve(httpServer))
+    })
+    try {
+      const address = server.address()
+      if (!address || typeof address === 'string') throw new Error('Missing test port')
+      for (const cursor of [null, 'page-two']) {
+        const response = await fetch(`http://127.0.0.1:${address.port}/codex-api/rpc`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ method: 'thread/list', params: { cursor } }),
+        })
+        expect(response.status).toBe(200)
+        const payload = await response.json() as { result: { data: Array<Record<string, unknown>>; nextCursor: string } }
+        expect(payload.result.nextCursor).toBe('next-page')
+        expect(payload.result.data).toHaveLength(1)
+        expect(payload.result.data[0]).toMatchObject({
+          id: 'shared-thread', path: currentPath, taskState: state,
+          taskError: state === 'failed' ? 'HTTP 401: authentication failed' : '',
+        })
+      }
+      expect(readActivity.mock.calls.map(([path]) => path)).toEqual([currentPath, currentPath])
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
       instance.dispose()

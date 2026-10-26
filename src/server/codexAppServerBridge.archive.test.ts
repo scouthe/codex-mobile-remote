@@ -30,6 +30,34 @@ afterEach(() => {
 })
 
 describe('forked thread list recovery', () => {
+  it('merges canonical database metadata once when the official list contains duplicate rollout records', () => {
+    const stale = { id: 'shared-thread', path: '/sessions/old.jsonl', updatedAt: 100, preview: 'old', status: { type: 'idle' } }
+    const current = { ...stale, path: '/sessions/current.jsonl', updatedAt: 200 }
+    const canonical = { ...current, updatedAt: 300, preview: 'current title' }
+    const result = mergeImportedThreadsIntoThreadListResult({
+      data: [stale, current], nextCursor: 'next-page',
+    }, [canonical])
+
+    expect(result).toEqual({ data: [canonical], nextCursor: 'next-page' })
+    expect(stale.path).toBe('/sessions/old.jsonl')
+  })
+
+  it('does not replace a newer official rollout with a stale cached supplement', () => {
+    const current = { id: 'shared-thread', path: '/sessions/current.jsonl', updatedAt: 300, preview: 'new title' }
+    const stale = { ...current, path: '/sessions/old.jsonl', updatedAt: 100, preview: 'old title' }
+    expect(mergeImportedThreadsIntoThreadListResult({ data: [current], nextCursor: null }, [stale]))
+      .toEqual({ data: [current], nextCursor: null })
+  })
+
+  it('deduplicates official and supplemental records even when there is no matching database row', () => {
+    const stale = { id: 'shared-thread', path: '/sessions/old.jsonl', updatedAt: 100 }
+    const current = { ...stale, path: '/sessions/current.jsonl', updatedAt: 200 }
+    expect(mergeImportedThreadsIntoThreadListResult({ data: [stale, current] }, []))
+      .toEqual({ data: [current] })
+    expect(mergeImportedThreadsIntoThreadListResult({ data: [] }, [current, stale]))
+      .toEqual({ data: [current] })
+  })
+
   it('lists an unsent fork but not an ordinary empty thread, and avoids duplicates after first send', async () => {
     const codexHome = await mkdtemp(join(tmpdir(), 'codex-fork-list-'))
     const sessions = join(codexHome, 'sessions')
@@ -300,6 +328,15 @@ describe('writeWorkspaceRootsState', () => {
 })
 
 describe('canonicalizeThreadListResponseForRead', () => {
+  it('deduplicates cursor pages before resolving cwd and preserves the pagination cursor', async () => {
+    const current = { id: 'shared-thread', cwd: '/new-project', path: '/sessions/current.jsonl', updatedAt: 200 }
+    const stale = { ...current, cwd: '/old-project', path: '/sessions/old.jsonl', updatedAt: 100 }
+    const realpath = vi.fn(async (path: string) => path)
+    expect(await canonicalizeThreadListResponseForRead({ data: [stale, current], nextCursor: 'next' }, realpath))
+      .toEqual({ data: [current], nextCursor: 'next' })
+    expect(realpath.mock.calls).toEqual([['/new-project']])
+  })
+
   it('realpaths thread cwd values to match canonicalized workspace roots', async () => {
     const payload = await canonicalizeThreadListResponseForRead({
       data: [
