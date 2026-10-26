@@ -151,9 +151,28 @@ Codex Desktop 通过各自的连接方式使用同一台主机上的官方服务
 `$CODEX_HOME/remote-agents`。普通刷新不会重发任务；服务重启后会保留显示记录，
 此前未确认结束的任务会标记为中断，再次发送时恢复同一个 DSH 原生会话。
 
-当前列表展示由本工作台创建的 DSH 对话。已有原生 DSH 对话、插件管理等功能，
-可通过右上角“更多 → 打开 DSH 原生界面”使用：该入口需要已有 DSH Web 服务，
-以及独立的 `$CODEX_HOME/dsh-bridge.json` 配置。例如：
+会话列表通过标准 `session/list` 读取原生 DSH 会话，按项目展示并支持分页。
+已有工作台对话仍保留原来的 ID 和显示记录；原生条目使用稳定 ID，刷新或重启不会重复创建。
+列表读取合并并发请求，缓存 10 秒，“更多 → 刷新状态”可立即重新读取。
+DSH 只返回当前可恢复的会话；原生端正占用的会话可能需要先释放，再刷新列表。
+
+| ACP 能力 | 当前接入行为 |
+| --- | --- |
+| `session/new`、`session/prompt`、`session/cancel` | 创建、发送及停止任务 |
+| `session/list` | 按原生分页读取，合并本工作台已有记录 |
+| `session/resume` | 点击“恢复原生会话”后沿用原生上下文，查看列表不会占用会话 |
+| `session/close` | “更多 → 释放会话连接”；执行中可停止并释放，保留原生会话与显示记录 |
+| `session/set_config_option`、`config_option_update` | 使用 DSH 返回的模型、推理选项及实时配置更新 |
+| 图片、工具、权限请求 | 按实际能力开放图片输入，展示工具状态和审批 |
+| `usage_update` | 收到真实上下文用量及容量后显示，无额外轮询 |
+| stdio / HTTP MCP | 将主机配置中的标准 MCP 声明交给新建和恢复会话 |
+| `session/load`、音频、Fork | 本机 DSH 未声明支持，不调用或显示对应操作 |
+
+**本机 DSH 的 `session/list` 不返回原标题，且不支持旧消息回放。**
+原生条目显示“原生对话 · ID”，页面明确说明历史限制；恢复后可以使用原有模型上下文继续，
+此后在工作台产生的显示记录会保留。侧栏归档只隐藏工作台条目，不删除 DSH 原生会话。
+插件市场、原生专属界面和旧消息浏览仍可通过“更多 → 打开 DSH 原生界面”使用，
+该入口需要已有 DSH Web 服务和独立的 `$CODEX_HOME/dsh-bridge.json`。例如：
 
 ```json
 {
@@ -166,6 +185,21 @@ Codex Desktop 通过各自的连接方式使用同一台主机上的官方服务
 没有 Web 服务也可以使用 DSH 统一聊天页面。两种入口不同时写入同一条原生会话；
 DSH 的会话占用错误会直接显示，不会抢占另一个进程正在使用的会话。
 Android App 仍加载 5900 页面，本次功能无需重新安装 APK。
+
+如需给 ACP 会话配置额外 MCP 工具，在 `remote-agents/dsh.json` 中增加标准 `mcpServers` 数组：
+
+```json
+{
+  "mcpServers": [
+    { "name": "local-tools", "command": "/usr/bin/node", "args": ["/absolute/path/mcp.cjs"], "env": [] },
+    { "name": "remote-tools", "type": "http", "url": "https://mcp.example.com/mcp", "headers": [] }
+  ]
+}
+```
+
+只添加需要的工具，命令使用绝对路径。MCP 配置在新建或恢复连接时读取，
+修改后释放再恢复会话即可；密钥仅保存在主机文件中，不返回页面。当前 DSH 不声明 SSE MCP 支持。
+原生 profile 的插件变更不会自动复制到 ACP profile。
 
 ## Linux 一键安装脚本（需要发布包）
 

@@ -5,17 +5,18 @@
         <WorkspaceToolPicker current-tool="dsh" />
         <button type="button" class="agent-new" @click="newChat">＋ 新建 DSH 对话</button>
         <div class="agent-thread-list">
-          <p v-if="state.loading.value" role="status">正在读取 DSH 对话…</p>
+          <p v-if="state.loading.value || state.listing.value" role="status">正在读取 DSH 对话…</p>
           <p v-else-if="!state.sessions.value.length" class="agent-muted">尚无 DSH 对话</p>
           <section v-for="group in groups" :key="group.cwd" class="agent-project-group">
             <h2 :title="group.cwd">{{ leaf(group.cwd) }}</h2>
             <div v-for="session in group.sessions" :key="session.id" class="agent-thread-row" :class="{ 'is-selected': session.id === selectedId && !native }">
-              <button type="button" :aria-current="session.id === selectedId && !native ? 'page' : undefined" @click="selectSession(session.id)">
-                <span>{{ session.title }}</span><span v-if="isAgentBusy(session.state)" class="agent-working-dot" aria-label="正在执行" />
+              <button type="button" :aria-current="session.id === selectedId && !native ? 'page' : undefined" :title="session.source === 'native' ? session.nativeId : session.title" @click="selectSession(session.id)">
+                <span>{{ session.title }}</span><span v-if="session.source === 'native'" class="agent-native-tag">原生</span><span v-if="isAgentBusy(session.state)" class="agent-working-dot" aria-label="正在执行" />
               </button>
               <button type="button" class="agent-archive" :aria-label="`归档 ${session.title}`" :disabled="isAgentBusy(session.state)" @click="archive(session.id)">×</button>
             </div>
           </section>
+          <button v-if="state.nativeCursor.value" class="agent-load-more" type="button" :disabled="state.loadingMore.value" @click="state.loadMore">{{ state.loadingMore.value ? '正在加载…' : '加载更多原生对话' }}</button>
         </div>
         <div class="agent-sidebar-footer"><button type="button" @click="router.push('/dsh/native'); sidebarClosed = isMobile">打开 DSH 原生界面 ↗</button><button type="button" @click="toggleTheme">切换外观</button></div>
       </section>
@@ -37,13 +38,14 @@
           </template>
           <template #actions>
             <button class="agent-header-button" type="button" aria-label="更多 DSH 操作" :aria-expanded="moreOpen" @click="moreOpen = !moreOpen"><IconTablerDots class="icon-svg" /></button>
-            <div v-if="moreOpen" class="agent-more-menu"><button type="button" @click="router.push('/dsh/native'); moreOpen = false">打开 DSH 原生界面</button><button type="button" @click="refresh">刷新状态</button><button type="button" @click="toggleTheme">切换外观</button></div>
+            <div v-if="moreOpen" class="agent-more-menu"><button type="button" @click="router.push('/dsh/native'); moreOpen = false">打开 DSH 原生界面</button><button type="button" @click="refresh">刷新状态</button><button v-if="selectedId && detail?.attached && state.capabilities.value?.closeSession" type="button" :disabled="closing" @click="closeSelected">{{ busy ? '停止并释放会话连接' : '释放会话连接' }}</button><button type="button" @click="toggleTheme">切换外观</button></div>
           </template>
         </ContentHeader>
         <template v-if="native"><DshPanel v-if="workspaceActive" /></template>
         <template v-else>
           <div v-if="!state.connected.value" class="agent-connection-status" role="status">{{ state.loading.value ? '正在连接…' : '连接中断，正在重新连接；正在执行的任务会继续运行。' }} <button type="button" @click="refresh">刷新状态</button></div>
           <div v-if="state.error.value || pageError" class="agent-notice" role="alert">{{ pageError || state.error.value }} <button type="button" @click="refresh">重试</button></div>
+          <div v-if="state.listWarning.value" class="agent-notice" role="status">{{ state.listWarning.value }} <button type="button" @click="refresh">重试读取列表</button></div>
           <div v-if="!state.available.value" class="agent-notice" role="status">{{ state.statusMessage.value }}</div>
           <div v-if="!selectedId" class="agent-start">
             <h2>用 DSH 开始开发</h2><p>选择这台主机上的项目，使用 DSH 已配置的模型和工具。</p>
@@ -53,14 +55,21 @@
           </div>
           <template v-else-if="detail">
             <div class="agent-project-path" :title="detail.session.cwd">{{ detail.session.cwd }}</div>
-            <ThreadConversation ref="conversation" :messages="detail.messages" :pending-requests="[]" :live-overlay="null" :is-loading="false" :active-thread-id="`dsh:${selectedId}`" :cwd="detail.session.cwd" :codex-actions="false" :has-more-persisted-above="detail.nextCursor !== null" :is-loading-persisted-above="state.loadingEarlier.value" :load-earlier-messages="loadEarlier" />
+            <div v-if="detail.session.historyUnavailable" class="agent-native-history" role="status">
+              <span>此原生对话的旧消息暂不支持回放，恢复连接后可沿用原有上下文继续。</span>
+              <button v-if="!detail.attached && state.capabilities.value?.resumeSession" type="button" :disabled="activating" @click="activateNative">{{ activating ? '正在恢复…' : '恢复原生会话' }}</button>
+              <button type="button" @click="router.push('/dsh/native')">查看原生历史</button>
+            </div>
+            <div v-if="detail.session.historyUnavailable && !detail.messages.length" class="agent-native-placeholder" />
+            <ThreadConversation v-else ref="conversation" :messages="detail.messages" :pending-requests="[]" :live-overlay="null" :is-loading="false" :active-thread-id="`dsh:${selectedId}`" :cwd="detail.session.cwd" :codex-actions="false" :has-more-persisted-above="detail.nextCursor !== null" :is-loading-persisted-above="state.loadingEarlier.value" :load-earlier-messages="loadEarlier" />
             <p v-if="detail.session.error" class="agent-task-error" role="alert">{{ detail.session.error }}</p>
             <div v-for="permission in detail.permissions" :key="permission.id" class="agent-permission" role="region" :aria-label="permission.title">
               <strong>{{ permission.title }}</strong><pre v-if="permission.details">{{ permission.details }}</pre>
               <div><button v-for="option in permission.options" :key="option.optionId" type="button" :disabled="approving" @click="respond(permission.id, option.optionId)">{{ option.name }}</button></div>
             </div>
             <p v-if="busy" class="agent-run-status" role="status">{{ runLabel }}</p>
-            <div class="agent-composer-area"><DshComposer :key="selectedId" ref="composer" :session-id="selectedId" :config-options="detail.configOptions" :images-supported="detail.imagesSupported" :busy="busy" :submit="submit" :configure="configure" :stop-task="stop" /></div>
+            <p v-if="detail.session.usage" class="agent-context-usage" role="status">上下文 {{ detail.session.usage.used.toLocaleString() }} / {{ detail.session.usage.size.toLocaleString() }} tokens</p>
+            <div v-if="detail.session.source !== 'native' || detail.attached" class="agent-composer-area"><DshComposer :key="selectedId" ref="composer" :session-id="selectedId" :config-options="detail.configOptions" :images-supported="detail.imagesSupported" :busy="busy" :submit="submit" :configure="configure" :stop-task="stop" /></div>
           </template>
           <div v-else class="workspace-loading" role="status">正在读取对话…</div>
         </template>
@@ -103,6 +112,7 @@ const router = useRouter(), route = useRoute(), { isMobile } = useMobile()
 const sidebarClosed = ref(isMobile.value), selectedId = ref(''), native = ref(false), moreOpen = ref(false), pageError = ref('')
 const workspaceActive = ref(true)
 const creating = ref(false), approving = ref(false), cwd = ref(''), foldersOpen = ref(false), browsing = ref(false), folderError = ref(''), pathInput = ref('')
+const activating = ref(false), closing = ref(false)
 const directory = ref({ path: '', parent: '', directories: [] as Array<{ path: string; name: string }> })
 const composer = ref<InstanceType<typeof DshComposer>>()
 type ReadingPosition = { top: number; windowStart: number; follow: boolean }
@@ -127,11 +137,11 @@ watch(() => route.fullPath, () => {
   pageError.value = ''
   if (selectedId.value) {
     const id = selectedId.value
-    void state.refresh(id).then(async () => {
+    void state.refresh(id).then(async result => {
       await nextTick()
       const position = readingPositions.get(id)
       if (id === selectedId.value && position) await conversation.value?.restorePosition(position)
-      return state.refresh(id, true)
+      if (id === selectedId.value && result?.session.source !== 'native') return state.refresh(id, true)
     }).catch(cause => { if (id === selectedId.value) pageError.value = cause instanceof Error ? cause.message : 'DSH 对话加载失败。' })
   }
 }, { immediate: true })
@@ -158,8 +168,23 @@ async function archive(id: string) {
 async function refresh() {
   moreOpen.value = false; pageError.value = ''
   await state.initialize()
-  await state.synchronize()
-  if (selectedId.value) try { await state.refresh(selectedId.value, true) } catch (cause) { pageError.value = cause instanceof Error ? cause.message : '重新连接失败。' }
+  await state.synchronize(true)
+  if (selectedId.value && detail.value?.session.source !== 'native') try { await state.refresh(selectedId.value, true) } catch (cause) { pageError.value = cause instanceof Error ? cause.message : '重新连接失败。' }
+}
+async function activateNative() {
+  if (activating.value) return
+  activating.value = true; pageError.value = ''
+  try { await state.refresh(selectedId.value, true) }
+  catch (cause) { pageError.value = cause instanceof Error ? cause.message : '恢复原生会话失败。' }
+  finally { activating.value = false }
+}
+async function closeSelected() {
+  if (closing.value || !selectedId.value) return
+  const id = selectedId.value
+  closing.value = true; moreOpen.value = false; pageError.value = ''
+  try { state.apply(await agentGateway.close(id)) }
+  catch (cause) { if (id === selectedId.value) pageError.value = cause instanceof Error ? cause.message : '释放会话连接失败。' }
+  finally { closing.value = false }
 }
 async function submit(input: AgentPromptInput) { state.apply({ session: await agentGateway.prompt(selectedId.value, input) }) }
 async function configure(id: string, value: string) { state.accept(await agentGateway.configure(selectedId.value, id, value)) }

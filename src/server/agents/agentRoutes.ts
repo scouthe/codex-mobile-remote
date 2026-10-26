@@ -65,7 +65,12 @@ export function createAgentBridge(options: {
       const entries = await readdir(path, { withFileTypes: true })
       return json(res, { path: resolve(path), parent: dirname(path), directories: entries.filter(entry => entry.isDirectory() && !entry.name.startsWith('.')).map(entry => ({ name: entry.name, path: resolve(path, entry.name) })).sort((a, b) => a.name.localeCompare(b.name)) })
     }
-    if (path === 'sessions' && req.method === 'GET') return json(res, await manager.list())
+    if (path === 'sessions' && req.method === 'GET') {
+      const cursor = url.searchParams.get('cursor') || undefined
+      const cwd = url.searchParams.get('cwd') || undefined
+      if (cursor && cursor.length > 4096 || cwd && (!isAbsolute(cwd) || cwd.length > 4096)) throw new AgentError('会话列表分页或目录参数无效。')
+      return json(res, await manager.list({ cursor, cwd, refresh: url.searchParams.get('refresh') === '1' }))
+    }
     if (path === 'sessions' && req.method === 'POST') {
       const input = z.object({ cwd: z.string().min(1).max(4096) }).parse(await body(req))
       return json(res, await manager.create(input.cwd), 201)
@@ -86,7 +91,7 @@ export function createAgentBridge(options: {
       res.once('close', () => { clearInterval(timer); unsubscribe(); streams.delete(res) })
       return
     }
-    const match = /^sessions\/([a-f0-9-]{36})(?:\/(activate|config|prompt|stop|permission|archive))?$/.exec(path)
+    const match = /^sessions\/([a-f0-9-]{36})(?:\/(activate|close|config|prompt|stop|permission|archive))?$/.exec(path)
     if (!match) throw new AgentError('接口不存在。', 404)
     const id = match[1]!, action = match[2]
     if (!action && req.method === 'GET') {
@@ -97,6 +102,7 @@ export function createAgentBridge(options: {
     }
     if (req.method !== 'POST') throw new AgentError('请求方法不支持。', 405)
     if (action === 'activate') return json(res, await manager.activate(id))
+    if (action === 'close') return json(res, await manager.close(id))
     if (action === 'stop') return json(res, await manager.stop(id))
     if (action === 'archive') { await manager.archive(id); return json(res, { ok: true }) }
     const input = await body(req)

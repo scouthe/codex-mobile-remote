@@ -2,14 +2,16 @@ import { randomUUID } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import type { ContentBlock, InitializeResponse, RequestPermissionRequest, RequestPermissionResponse, SessionNotification } from '@agentclientprotocol/sdk'
-import type { AgentPermission, AgentPromptInput, AgentSession, AgentSessionDetail, AgentSessionView, AgentStatus, AgentUpdate } from '../../types/agent.js'
+import type { ContentBlock, InitializeResponse, McpServer, RequestPermissionRequest, RequestPermissionResponse, SessionNotification } from '@agentclientprotocol/sdk'
+import type { AgentPermission, AgentPromptInput, AgentSession, AgentSessionDetail, AgentSessionPage, AgentSessionView, AgentStatus, AgentUpdate } from '../../types/agent.js'
 import { isAgentBusy } from '../../types/agent.js'
 import type { UiMessage } from '../../types/codex.js'
 import { AcpConnection, type AcpTransport } from './acpConnection.js'
 import { normalizeAgentConfigOptions } from './configOptions.js'
 import { dshAvailable } from './dshProfile.js'
 import { AgentSessionStore } from './sessionStore.js'
+import { nativeDisplayId, normalizeNativeSessionPage, protocolCapabilities, type NativeSessionPage } from './nativeSessions.js'
+import { readDshMcpServers } from './mcpConfig.js'
 
 export class AgentError extends Error { constructor(message: string, readonly status = 400) { super(message) } }
 const text = (value: unknown, limit = 32_000): string => typeof value === 'string' ? value.slice(0, limit) : value === undefined ? '' : JSON.stringify(value).slice(0, limit)
@@ -30,14 +32,19 @@ export class AgentManager {
   private updates: Promise<void> = Promise.resolve()
   private readonly runs = new Map<string, Promise<void>>()
   private exiting?: Promise<void>
+  private catalogGeneration = 0
+  private readonly listRequests = new Map<string, Promise<AgentSessionPage>>()
+  private readonly nativePages = new Map<string, { at: number; page: NativeSessionPage }>()
 
   constructor(readonly store = new AgentSessionStore(), options: {
     transport?: (handlers: ConstructorParameters<typeof AcpConnection>[0]) => AcpTransport
     available?: () => Promise<boolean>
     idleMs?: number
+    mcpServers?: () => Promise<McpServer[]>
   } = {}) {
     this.available = options.available || dshAvailable
     this.idleMs = options.idleMs ?? 10 * 60_000
+    this.readMcpServers = options.mcpServers || readDshMcpServers
     const handlers = {
       update: (notification: SessionNotification) => {
         this.updates = this.updates.then(() => this.handleUpdate(notification)).catch(error => this.onExit(error instanceof Error ? error : new Error('DSH 更新保存失败。')))
@@ -50,6 +57,16 @@ export class AgentManager {
   }
   private readonly available: () => Promise<boolean>
   private readonly idleMs: number
+  private readonly readMcpServers: () => Promise<McpServer[]>
+
+  private async mcpServers(): Promise<McpServer[]> {
+    const servers = await this.readMcpServers()
+    const capabilities = protocolCapabilities(this.capabilities)
+    if (servers.some(server => 'type' in server && (server.type === 'http' ? !capabilities?.mcpHttp : !capabilities?.mcpSse))) {
+      throw new AgentError('当前 DSH 未声明所配置的 MCP 传输能力，请检查主机配置。')
+    }
+    return servers
+  }
 
   private ready(): Promise<void> {
     if (!this.initialization) this.initialization = (async () => {
@@ -74,23 +91,84 @@ export class AgentManager {
 
   async status(): Promise<AgentStatus> {
     const available = await this.available()
-    return { available, connected: !!this.capabilities, message: available ? '' : '未找到 DSH，请先在这台主机安装并配置 DeepSeek Harness。', imagesSupported: this.capabilities?.agentCapabilities?.promptCapabilities?.image === true }
+    return { available, connected: !!this.capabilities, message: available ? '' : '未找到 DSH，请先在这台主机安装并配置 DeepSeek Harness。', imagesSupported: this.capabilities?.agentCapabilities?.promptCapabilities?.image === true, capabilities: protocolCapabilities(this.capabilities) }
   }
 
-  async list(): Promise<AgentSession[]> { await this.ready(); return this.store.list().filter(session => !session.archived) }
+  async list(input: { cursor?: string; cwd?: string; refresh?: boolean } = {}): Promise<AgentSessionPage> {
+    await this.ready()
+    const key = JSON.stringify([input.cursor || '', input.cwd || ''])
+    const pending = this.listRequests.get(key)
+    if (pending) return pending
+    const request = this.readSessionList(input, key).finally(() => {
+      if (this.listRequests.get(key) === request) this.listRequests.delete(key)
+    })
+    this.listRequests.set(key, request)
+    return request
+  }
+
+  private async readSessionList(input: { cursor?: string; cwd?: string; refresh?: boolean }, key: string): Promise<AgentSessionPage> {
+    let nextCursor: string | null = null, warning = ''
+    const pageIds = new Set<string>()
+    try {
+      if (await this.available()) {
+        await this.connect()
+        if (protocolCapabilities(this.capabilities)?.listSessions) {
+          const generation = this.catalogGeneration
+          const cached = this.nativePages.get(key)
+          const useCached = !input.refresh && cached && Date.now() - cached.at < 10_000
+          const page = useCached ? cached.page
+            : normalizeNativeSessionPage(await this.transport.request('session/list', {
+              ...(input.cursor ? { cursor: input.cursor } : {}), ...(input.cwd ? { cwd: input.cwd } : {}),
+            }))
+          if (generation !== this.catalogGeneration || this.disposed) throw new Error('DSH 会话状态已变化，请刷新列表。')
+          for (const summary of page.sessions) {
+            await this.serialize(`native:${summary.nativeId}`, async () => {
+              if (generation !== this.catalogGeneration || this.disposed) throw new Error('DSH 会话状态已变化，请刷新列表。')
+              let id = this.nativeIds.get(summary.nativeId)
+              if (!id) {
+                id = nativeDisplayId(summary.nativeId)
+                await this.store.save({ session: {
+                  id, nativeId: summary.nativeId, agentId: 'dsh', cwd: summary.cwd,
+                  title: summary.title || `原生对话 · ${summary.nativeId.replace(/^session-/, '').slice(0, 8)}`,
+                  createdAt: '', updatedAt: summary.updatedAt, state: 'idle', error: '', runId: '', lastRequestId: '', revision: 0, archived: false,
+                  source: 'native', historyUnavailable: true,
+                }, configOptions: [] })
+                this.nativeIds.set(summary.nativeId, id)
+              }
+              pageIds.add(id)
+            })
+          }
+          nextCursor = page.nextCursor
+          if (generation !== this.catalogGeneration || this.disposed) throw new Error('DSH 会话状态已变化，请刷新列表。')
+          this.nativePages.set(key, { at: useCached ? cached.at : Date.now(), page })
+          if (this.nativePages.size > 16) this.nativePages.delete(this.nativePages.keys().next().value!)
+        } else warning = '当前 DSH 未声明会话列表能力，暂时仅显示本工作台已保存的对话。'
+      }
+    } catch (error) {
+      warning = `原生会话列表读取失败：${error instanceof Error ? error.message : '请重试'}`
+      if (input.cursor) nextCursor = input.cursor
+    }
+    return {
+      sessions: this.store.list().filter(session => !session.archived && (input.cursor ? pageIds.has(session.id) : !input.cwd || session.cwd === input.cwd || pageIds.has(session.id))),
+      nextCursor, capabilities: protocolCapabilities(this.capabilities), warning,
+    }
+  }
+
+  private invalidateNativeList(): void { this.catalogGeneration++; this.nativePages.clear(); this.listRequests.clear() }
 
   async create(cwd: string): Promise<AgentSessionDetail> {
     await this.ready()
     if (!isAbsolute(cwd) || !(await stat(cwd)).isDirectory()) throw new AgentError('请选择主机上已有的项目目录。')
     await this.connect()
-    const result = await this.transport.request<{ sessionId: string; configOptions?: unknown }>('session/new', { cwd, mcpServers: [] })
+    const result = await this.transport.request<{ sessionId: string; configOptions?: unknown }>('session/new', { cwd, mcpServers: await this.mcpServers() })
     if (!result.sessionId) throw new AgentError('DSH 没有返回会话 ID。', 502)
     const now = new Date().toISOString()
     const session: AgentSession = { id: randomUUID(), nativeId: result.sessionId, agentId: 'dsh', title: '新建 DSH 对话', cwd, createdAt: now, updatedAt: now, state: 'idle', error: '', runId: '', lastRequestId: '', revision: 0, archived: false }
     this.owned.add(session.nativeId)
     try { await this.store.save({ session, configOptions: normalizeAgentConfigOptions(result.configOptions) }) }
-    catch (error) { this.owned.delete(session.nativeId); await this.transport.request('session/close', { sessionId: session.nativeId }).catch(() => {}); throw error }
+    catch (error) { this.owned.delete(session.nativeId); if (protocolCapabilities(this.capabilities)?.closeSession) await this.transport.request('session/close', { sessionId: session.nativeId }).catch(() => {}); throw error }
     this.nativeIds.set(session.nativeId, session.id)
+    this.invalidateNativeList()
     this.emit({ session })
     this.scheduleRelease(session)
     return this.detail(session.id)
@@ -100,7 +178,7 @@ export class AgentManager {
     await this.ready()
     const record = this.requireSession(id)
     const page = await this.store.page(id, before)
-    return { session: { ...record.session }, ...page, configOptions: record.configOptions, permissions: this.permissions(id), imagesSupported: this.capabilities?.agentCapabilities?.promptCapabilities?.image === true }
+    return { session: { ...record.session }, ...page, configOptions: record.configOptions, permissions: this.permissions(id), imagesSupported: this.capabilities?.agentCapabilities?.promptCapabilities?.image === true, attached: this.owned.has(record.session.nativeId) }
   }
 
   async activate(id: string): Promise<AgentSessionView> {
@@ -112,8 +190,30 @@ export class AgentManager {
         this.scheduleRelease(session)
       }
       const record = this.requireSession(id)
-      return { session: { ...session }, configOptions: record.configOptions, permissions: this.permissions(id), imagesSupported: this.capabilities?.agentCapabilities?.promptCapabilities?.image === true }
+      return { session: { ...session }, configOptions: record.configOptions, permissions: this.permissions(id), imagesSupported: this.capabilities?.agentCapabilities?.promptCapabilities?.image === true, attached: this.owned.has(session.nativeId) }
     })
+  }
+
+  async close(id: string): Promise<AgentSessionView> {
+    await this.ready()
+    await this.serialize(id, async () => {
+      if (!protocolCapabilities(this.capabilities)?.closeSession) throw new AgentError('当前 DSH 不支持关闭会话连接。')
+      const { session } = this.requireSession(id)
+      if (!this.owned.has(session.nativeId)) return
+      clearTimeout(this.timers.get(id)); this.timers.delete(id)
+      this.cancelPermissions(id)
+      const wasBusy = isAgentBusy(session.state)
+      if (wasBusy) { session.state = 'stopping'; await this.change(session) }
+      await this.transport.request('session/close', { sessionId: session.nativeId }, 30_000)
+      this.owned.delete(session.nativeId)
+      this.invalidateNativeList()
+      if (wasBusy) { session.state = 'interrupted'; await this.change(session) }
+      session.revision++
+      await this.store.save(this.requireSession(id))
+      this.emit({ session: { ...session }, attached: false })
+    })
+    const { messages: _messages, nextCursor: _cursor, ...view } = await this.detail(id)
+    return view
   }
 
   async archive(id: string): Promise<void> {
@@ -124,6 +224,7 @@ export class AgentManager {
       await this.release(session)
       session.archived = true
       await this.change(session)
+      this.invalidateNativeList()
     })
   }
 
@@ -144,12 +245,13 @@ export class AgentManager {
     if (this.owned.has(session.nativeId)) return
     const supported = this.capabilities?.agentCapabilities?.sessionCapabilities?.resume
     if (!supported) throw new AgentError('当前 DSH 版本不支持恢复会话，请升级 DSH；已有显示记录已保留。')
-    const response = await this.transport.request<{ configOptions?: unknown }>('session/resume', { sessionId: session.nativeId, cwd: session.cwd, mcpServers: [] })
+    const response = await this.transport.request<{ configOptions?: unknown }>('session/resume', { sessionId: session.nativeId, cwd: session.cwd, mcpServers: await this.mcpServers() })
     this.owned.add(session.nativeId)
     const record = this.requireSession(session.id)
     record.configOptions = normalizeAgentConfigOptions(response.configOptions)
+    session.revision++
     await this.store.save(record)
-    this.emit({ session: record.session, configOptions: record.configOptions })
+    this.emit({ session: { ...record.session }, configOptions: record.configOptions, attached: true })
   }
 
   async configure(id: string, configId: string, value: string): Promise<AgentSessionDetail> {
@@ -227,7 +329,7 @@ export class AgentManager {
       session.state = 'running'; await this.change(session)
       const result = await this.transport.request<{ stopReason: string }>('session/prompt', { sessionId: session.nativeId, prompt }, 0)
       await this.updates
-      if (session.runId !== runId) return
+      if (session.runId !== runId || (session.state as string) === 'interrupted') return
       const lastReply = Array.from(this.liveMessages.get(session.id)?.values() || []).reverse().find(message => message.id.endsWith('-agent_message_chunk'))
       if (lastReply && result.stopReason !== 'cancelled') await this.message(session, { ...lastReply, messagePhase: 'final_answer', turnStatus: 'completed' })
       session.state = result.stopReason === 'cancelled' || (session.state as string) === 'stopping' ? 'interrupted' : 'completed'
@@ -299,6 +401,14 @@ export class AgentManager {
     const { session } = this.requireSession(id)
     const update = params.update as unknown as Record<string, unknown>
     const kind = update.sessionUpdate
+    if (kind === 'usage_update') {
+      const { used, size } = update
+      if (typeof used === 'number' && Number.isFinite(used) && used >= 0 && typeof size === 'number' && Number.isFinite(size) && size > 0) {
+        session.usage = { used, size }
+        await this.change(session)
+      }
+      return
+    }
     if (kind === 'config_option_update') {
       const record = this.requireSession(session.id)
       record.configOptions = normalizeAgentConfigOptions(update.configOptions)
@@ -345,15 +455,19 @@ export class AgentManager {
 
   private scheduleRelease(session: AgentSession): void {
     clearTimeout(this.timers.get(session.id))
-    if (this.disposed || isAgentBusy(session.state)) return
+    if (this.disposed || isAgentBusy(session.state) || !this.owned.has(session.nativeId)) return
     const timer = setTimeout(() => { void this.serialize(session.id, () => this.release(session)).catch(() => {}) }, this.idleMs)
     timer.unref(); this.timers.set(session.id, timer)
   }
 
   private async release(session: AgentSession): Promise<void> {
-    if (isAgentBusy(session.state) || !this.owned.has(session.nativeId)) return
+    if (isAgentBusy(session.state) || !this.owned.has(session.nativeId) || !protocolCapabilities(this.capabilities)?.closeSession) return
     await this.transport.request('session/close', { sessionId: session.nativeId }, 30_000)
     this.owned.delete(session.nativeId)
+    this.invalidateNativeList()
+    session.revision++
+    await this.store.save(this.requireSession(session.id))
+    this.emit({ session: { ...session }, attached: false })
   }
 
   private onExit(error: Error): Promise<void> {
@@ -365,10 +479,18 @@ export class AgentManager {
 
   private async recoverExit(error: Error): Promise<void> {
     this.capabilities = undefined; this.connectionReady = undefined; this.owned.clear()
+    for (const timer of this.timers.values()) clearTimeout(timer)
+    this.timers.clear()
+    this.invalidateNativeList()
     for (const summary of this.store.list()) {
       this.cancelPermissions(summary.id)
       const { session } = this.requireSession(summary.id)
-      if (isAgentBusy(session.state)) { session.state = 'interrupted'; session.error = error.message; await this.change(session).catch(() => {}) }
+      if (isAgentBusy(session.state)) { session.state = 'interrupted'; session.error = error.message; await this.change(session, { attached: false }).catch(() => {}) }
+      else {
+        session.revision++
+        await this.store.save(this.requireSession(summary.id)).catch(() => {})
+        this.emit({ session: { ...session }, attached: false })
+      }
     }
     await this.transport.dispose()
   }
@@ -376,6 +498,7 @@ export class AgentManager {
   async dispose(): Promise<void> {
     this.disposed = true
     await this.initialization?.catch(() => {})
+    await Promise.allSettled(this.listRequests.values())
     await Promise.allSettled(this.mutations.values())
     for (const timer of this.timers.values()) clearTimeout(timer)
     for (const session of this.store.list()) this.cancelPermissions(session.id)

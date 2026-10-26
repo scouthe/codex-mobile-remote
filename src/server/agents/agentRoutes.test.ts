@@ -23,7 +23,9 @@ it('authenticates ACP routes, rejects cross-origin writes, validates and bounds 
     authorized = true
     const status = await fetch(`${base}/agent-api/status`)
     expect(status.status).toBe(200)
-    expect((await status.json()).available).toBe(false)
+    expect((await status.json() as { available: boolean }).available).toBe(false)
+    expect((await fetch(`${base}/agent-api/sessions?cwd=relative`)).status).toBe(400)
+    expect((await fetch(`${base}/agent-api/sessions?cursor=${'a'.repeat(4097)}`)).status).toBe(400)
     expect((await fetch(`${base}/agent-api/sessions`, { method: 'POST', headers: { Origin: 'https://untrusted.example' }, body: '{}' })).status).toBe(403)
     expect((await fetch(`${base}/agent-api/sessions`, { method: 'POST', body: '{' })).status).toBe(400)
     expect((await fetch(`${base}/agent-api/sessions`, { method: 'POST', body: JSON.stringify({ cwd: 42 }) })).status).toBe(400)

@@ -35,6 +35,25 @@ export type AgentSession = {
   revision: number
   turnCount?: number
   archived: boolean
+  source?: 'native' | 'remote'
+  historyUnavailable?: boolean
+  usage?: { used: number; size: number }
+}
+
+export type AgentProtocolCapabilities = {
+  listSessions: boolean
+  resumeSession: boolean
+  closeSession: boolean
+  loadSession: boolean
+  image: boolean
+  mcpHttp: boolean
+  mcpSse: boolean
+}
+export type AgentSessionPage = {
+  sessions: AgentSession[]
+  nextCursor: string | null
+  capabilities: AgentProtocolCapabilities | null
+  warning: string
 }
 
 export type AgentSessionDetail = {
@@ -44,15 +63,17 @@ export type AgentSessionDetail = {
   permissions: AgentPermission[]
   imagesSupported: boolean
   nextCursor: number | null
+  attached?: boolean
 }
 export type AgentSessionView = Omit<AgentSessionDetail, 'messages' | 'nextCursor'>
 
-export type AgentStatus = { available: boolean; connected: boolean; message: string; imagesSupported: boolean }
+export type AgentStatus = { available: boolean; connected: boolean; message: string; imagesSupported: boolean; capabilities?: AgentProtocolCapabilities | null }
 export type AgentUpdate = {
   session: AgentSession
   message?: UiMessage
   configOptions?: AgentConfigOption[]
   permissions?: AgentPermission[]
+  attached?: boolean
 }
 
 export type AgentPromptInput = {

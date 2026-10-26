@@ -39,6 +39,13 @@
 .agent-thread-row>button:first-child { display:flex; align-items:center; gap:8px; flex:1; min-width:0; text-align:left; padding:10px 8px; border:0; background:transparent; }
 .agent-thread-row>button:first-child>span:first-child { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .agent-archive { min-width:32px; padding:7px; color:#71717a; background:transparent; border:0; }
+.agent-native-tag { flex-shrink:0; font-size:10px; color:#71717a; }
+.agent-load-more { display:block; width:100%; margin-top:8px; min-height:40px; border:1px solid #e4e4e7; border-radius:8px; background:transparent; font-size:12px; }
+.agent-native-history { flex-shrink:0; display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px 18px; font-size:12px; background:#f4f4f5; color:#52525b; }
+.agent-native-history span { flex-basis:100%; }
+.agent-native-history button { min-height:36px; padding:4px 9px; border:1px solid #d4d4d8; border-radius:7px; background:transparent; }
+.agent-native-placeholder { flex:1; min-height:0; }
+.agent-context-usage { flex-shrink:0; margin:4px 18px; text-align:right; color:#71717a; font-size:11px; }
 .agent-working-dot { width:7px; height:7px; background:#16a34a; border-radius:50%; flex-shrink:0; }
 .agent-sidebar-footer { display:grid; gap:8px; padding:8px; border-top:1px solid #e4e4e7; font-size:12px; }
 .agent-sidebar-footer button { background:transparent; border:0; text-align:left; padding:6px; color:#71717a; }
@@ -118,6 +125,8 @@
 :root.dark .agent-sidebar-footer,:root.dark .agent-composer,:root.dark .agent-permission,:root.dark .agent-permission button,:root.dark .agent-attachment,:root.dark .agent-more-menu,:root.dark .agent-folder-dialog,:root.dark .agent-folder-dialog input,:root.dark .agent-start-folder>button { border-color:#3f3f46; }
 :root.dark .agent-create,:root.dark .agent-composer-controls .agent-send { background:#e4e4e7; color:#18181b; }
 :root.dark .agent-connection-status { background:#27272a; color:#a1a1aa; }
+:root.dark .agent-native-history { background:#27272a; color:#d4d4d8; }
+:root.dark .agent-native-history button,:root.dark .agent-load-more { border-color:#3f3f46; }
 :root.dark .agent-notice { background:#431407; color:#fed7aa; }
 :root.dark .agent-inline-error,:root.dark .agent-task-error { color:#fca5a5; }
 @media (max-width:767px) {

@@ -1,6 +1,6 @@
 import { computed, onUnmounted, ref, shallowRef, type Ref } from 'vue'
 import { agentGateway } from '../api/agentGateway'
-import type { AgentSession, AgentSessionDetail, AgentUpdate } from '../types/agent'
+import type { AgentProtocolCapabilities, AgentSession, AgentSessionDetail, AgentUpdate } from '../types/agent'
 
 export function mergeAgentDetail(previous: AgentSessionDetail | undefined, detail: AgentSessionDetail, older = false): AgentSessionDetail {
   if (!previous) return detail
@@ -33,11 +33,13 @@ export function reconcileAgentSessionList(rows: AgentSession[], known: Map<strin
 export function useAgentState(selectedId: Ref<string>) {
   const sessions = shallowRef<AgentSession[]>([]), details = shallowRef<Record<string, AgentSessionDetail>>({})
   const connected = ref(false), available = ref(true), statusMessage = ref(''), error = ref(''), loading = ref(false), loadingEarlier = ref(false)
+  const capabilities = shallowRef<AgentProtocolCapabilities | null>(null)
+  const nativeCursor = ref<string | null>(null), loadingMore = ref(false), listing = ref(false), listWarning = ref('')
   const current = computed(() => details.value[selectedId.value])
   const pendingReads = new Map<string, Promise<AgentSessionDetail>>()
   const knownSessions = new Map<string, AgentSession>()
   let stream: EventSource | undefined, disposed = false, listRequest: Promise<void> | undefined
-  let streamEpoch = 0, listEpoch = -1
+  let streamEpoch = 0, listEpoch = -1, listVersion = 0
 
   function upsertSession(session: AgentSession) {
     const current = knownSessions.get(session.id)
@@ -60,20 +62,36 @@ export function useAgentState(selectedId: Ref<string>) {
       if (index < 0) messages.push(update.message)
       else messages[index] = update.message
     }
-    details.value = { ...details.value, [update.session.id]: { ...previous, session: update.session, messages, configOptions: update.configOptions || previous.configOptions, permissions: update.permissions || previous.permissions } }
+    details.value = { ...details.value, [update.session.id]: { ...previous, session: update.session, messages, configOptions: update.configOptions || previous.configOptions, permissions: update.permissions || previous.permissions, attached: update.attached ?? previous.attached } }
   }
-  function refreshList(): Promise<void> {
-    if (!listRequest || listEpoch !== streamEpoch) {
+  function refreshList(force = false): Promise<void> {
+    if (!listRequest || listEpoch !== streamEpoch || force) {
       listEpoch = streamEpoch
+      const epoch = streamEpoch, version = ++listVersion
       const before = new Map(Array.from(knownSessions, ([id, session]) => [id, session.revision]))
-      const request = agentGateway.list().then(rows => {
+      listing.value = true
+      const request = agentGateway.list(undefined, force).then(page => {
+        if (disposed || epoch !== streamEpoch || version !== listVersion) return
         // A slower list must not hide a chat created while it was loading,
         // or resurrect a chat archived by a newer live update.
-        sessions.value = reconcileAgentSessionList(rows, knownSessions, before)
-      }).finally(() => { if (listRequest === request) listRequest = undefined })
+        sessions.value = reconcileAgentSessionList(page.sessions, knownSessions, before)
+        nativeCursor.value = page.nextCursor; capabilities.value = page.capabilities; listWarning.value = page.warning
+      }).finally(() => { if (listRequest === request) { listRequest = undefined; listing.value = false } })
       listRequest = request
     }
     return listRequest
+  }
+  async function loadMore() {
+    if (!nativeCursor.value || loadingMore.value) return
+    const epoch = streamEpoch, version = listVersion, before = new Map(Array.from(knownSessions, ([id, row]) => [id, row.revision]))
+    loadingMore.value = true
+    try {
+      const page = await agentGateway.list(nativeCursor.value)
+      if (disposed || epoch !== streamEpoch || version !== listVersion) return
+      sessions.value = reconcileAgentSessionList([...sessions.value, ...page.sessions], knownSessions, before)
+      nativeCursor.value = page.nextCursor; capabilities.value = page.capabilities; listWarning.value = page.warning
+    } catch (cause) { if (!disposed && epoch === streamEpoch && version === listVersion) listWarning.value = cause instanceof Error ? cause.message : '原生会话列表加载失败。' }
+    finally { loadingMore.value = false }
   }
   async function refresh(id = selectedId.value, activate = false): Promise<AgentSessionDetail | undefined> {
     if (!id) return
@@ -93,8 +111,8 @@ export function useAgentState(selectedId: Ref<string>) {
     catch (cause) { error.value = cause instanceof Error ? cause.message : '历史记录加载失败。' }
     finally { loadingEarlier.value = false }
   }
-  async function synchronize() {
-    try { await Promise.all([refreshList(), refresh()]); error.value = '' }
+  async function synchronize(force = false) {
+    try { await Promise.all([refreshList(force), refresh()]); error.value = '' }
     catch (cause) { error.value = cause instanceof Error ? cause.message : 'DSH 状态同步失败。' }
   }
   async function initialize() {
@@ -104,7 +122,7 @@ export function useAgentState(selectedId: Ref<string>) {
     loading.value = true
     try {
       const status = await agentGateway.status()
-      available.value = status.available; statusMessage.value = status.message
+      available.value = status.available; statusMessage.value = status.message; capabilities.value = status.capabilities ?? null
       if (disposed) return
       stream = new EventSource('/agent-api/events')
       stream.addEventListener('ready', () => { streamEpoch++; connected.value = true; loading.value = false; void synchronize() })
@@ -115,5 +133,5 @@ export function useAgentState(selectedId: Ref<string>) {
     } catch (cause) { error.value = cause instanceof Error ? cause.message : 'DSH 连接失败。'; loading.value = false }
   }
   onUnmounted(() => { disposed = true; stream?.close() })
-  return { sessions, current, connected, available, statusMessage, error, loading, loadingEarlier, accept, apply, refresh, refreshList, loadEarlier, synchronize, initialize }
+  return { sessions, current, connected, available, statusMessage, error, loading, loadingEarlier, capabilities, nativeCursor, loadingMore, listing, listWarning, accept, apply, refresh, refreshList, loadMore, loadEarlier, synchronize, initialize }
 }

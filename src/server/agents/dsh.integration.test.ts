@@ -4,6 +4,30 @@ import { join } from 'node:path'
 import { expect, it } from 'vitest'
 import { AgentManager } from './agentManager.js'
 import { AgentSessionStore } from './sessionStore.js'
+import { AcpConnection } from './acpConnection.js'
+
+it.skipIf(!process.env.CODEXUI_DSH_DISCOVERY_TEST)('discovers installed native sessions read-only, without claiming or creating any session', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'codex-dsh-readonly-'))
+  const calls: string[] = []
+  const manager = new AgentManager(new AgentSessionStore(directory), { transport: handlers => {
+    const connection = new AcpConnection(handlers)
+    return {
+      initialize: () => connection.initialize(),
+      async request<T>(method: string, params: unknown, timeout?: number): Promise<T> { calls.push(method); return connection.request<T>(method, params, timeout) },
+      notify: (method, params) => connection.notify(method, params),
+      dispose: () => connection.dispose(),
+    }
+  } })
+  try {
+    const page = await manager.list()
+    expect(page.warning).toBe('')
+    expect(page.capabilities).toMatchObject({ listSessions: true, resumeSession: true, closeSession: true, loadSession: false })
+    expect(new Set(page.sessions.map(row => row.nativeId)).size).toBe(page.sessions.length)
+    for (const row of page.sessions) expect(await manager.detail(row.id)).toMatchObject({ attached: false, messages: [], session: { source: 'native', historyUnavailable: true } })
+    expect(calls).toEqual(['session/list'])
+    console.log('Read-only DSH ACP discovery verified:', { sessions: page.sessions.length, more: !!page.nextCursor, capabilities: page.capabilities })
+  } finally { await manager.dispose(); await rm(directory, { recursive: true, force: true }) }
+}, 60_000)
 
 it.skipIf(!process.env.CODEXUI_TEST_DSH)('connects to installed DSH, creates, closes and resumes its native session', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'codex-real-dsh-'))
@@ -12,7 +36,7 @@ it.skipIf(!process.env.CODEXUI_TEST_DSH)('connects to installed DSH, creates, cl
     const detail = await manager.create(directory)
     expect(detail.session.nativeId).toBeTruthy()
     expect(detail.configOptions.some(option => option.category === 'model')).toBe(true)
-    expect((await manager.list())[0]?.id).toBe(detail.session.id)
+    expect((await manager.list()).sessions.some(row => row.id === detail.session.id)).toBe(true)
     await manager.dispose()
     manager = new AgentManager(new AgentSessionStore(join(directory, 'display')))
     const resumed = await manager.activate(detail.session.id)

@@ -65,7 +65,6 @@ export class AgentSessionStore {
   }
 
   async save(record: SessionRecord): Promise<void> {
-    this.sessions.set(record.session.id, record)
     const serialized = JSON.stringify(record)
     await this.enqueue(record.session.id, async () => {
       const target = join(this.directory, `${record.session.id}.json`)
@@ -73,6 +72,7 @@ export class AgentSessionStore {
       await writeFile(temp, serialized + '\n', { mode: 0o600 })
       await rename(temp, target)
     })
+    this.sessions.set(record.session.id, record)
   }
 
   async message(id: string, entry: MessageRecord): Promise<void> {

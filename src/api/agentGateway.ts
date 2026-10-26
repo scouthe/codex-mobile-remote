@@ -1,4 +1,4 @@
-import type { AgentPromptInput, AgentSession, AgentSessionDetail, AgentSessionView, AgentStatus } from '../types/agent'
+import type { AgentPromptInput, AgentSession, AgentSessionDetail, AgentSessionPage, AgentSessionView, AgentStatus } from '../types/agent'
 
 export async function agentRequest<T>(path: string, data?: unknown): Promise<T> {
   const controller = new AbortController()
@@ -21,10 +21,19 @@ export async function agentRequest<T>(path: string, data?: unknown): Promise<T> 
 
 export const agentGateway = {
   status: () => agentRequest<AgentStatus>('status'),
-  list: () => agentRequest<AgentSession[]>('sessions'),
+  list: async (cursor?: string, refresh = false): Promise<AgentSessionPage> => {
+    const query = new URLSearchParams()
+    if (cursor) query.set('cursor', cursor)
+    if (refresh) query.set('refresh', '1')
+    const page = await agentRequest<AgentSession[] | AgentSessionPage>(`sessions${query.size ? `?${query}` : ''}`)
+    // Existing servers/fixtures used an array; keep saved clients compatible
+    // while the paged response carries negotiated protocol capabilities.
+    return Array.isArray(page) ? { sessions: page, nextCursor: null, capabilities: null, warning: '' } : page
+  },
   create: (cwd: string) => agentRequest<AgentSessionDetail>('sessions', { cwd }),
   detail: (id: string, before?: number) => agentRequest<AgentSessionDetail>(`sessions/${id}${before ? `?before=${before}` : ''}`),
   activate: (id: string) => agentRequest<AgentSessionView>(`sessions/${id}/activate`, {}),
+  close: (id: string) => agentRequest<AgentSessionView>(`sessions/${id}/close`, {}),
   configure: (id: string, configId: string, value: string) => agentRequest<AgentSessionDetail>(`sessions/${id}/config`, { configId, value }),
   prompt: (id: string, input: AgentPromptInput) => agentRequest<AgentSession>(`sessions/${id}/prompt`, input),
   stop: (id: string) => agentRequest<AgentSession>(`sessions/${id}/stop`, {}),
