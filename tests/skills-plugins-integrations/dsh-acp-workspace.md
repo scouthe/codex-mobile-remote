@@ -1,5 +1,11 @@
 # DSH ACP workspace
 
+> Archived UI specification: the normal DSH route now embeds the original DSH Web app directly.
+> Current browser acceptance is documented in [dsh-native-entry.md](dsh-native-entry.md).
+> ACP backend/store tests remain useful for the retained experimental implementation;
+> historical UI scenarios below do not describe the current `#/dsh` page. The old ACP interaction
+> and native-session browser scripts were removed when their UI was replaced.
+
 ## Prerequisites / setup
 
 - Install and configure DSH on the 5900 host. The current acceptance target is `0.2.1-rc.2`.
@@ -93,7 +99,7 @@ active user session for testing; use browser fixtures or a disposable native ses
 Automated evidence:
 
 ```bash
-node scripts/test-dsh-native-sessions.cjs
+node scripts/test-dsh-workspace.cjs # current native-page acceptance
 CODEXUI_DSH_DISCOVERY_TEST=1 pnpm exec vitest run src/server/agents/dsh.integration.test.ts
 pnpm exec tsc -p tsconfig.server.json --noEmit
 ```
@@ -141,8 +147,7 @@ exited 0 with CLI help. Server and frontend typechecks passed.
 pnpm exec vitest run src/server/agents src/composables/useAgentState.test.ts src/server/dshBridge.test.ts src/cache/serviceWorker.test.ts
 CODEXUI_TEST_DSH=1 pnpm exec vitest run src/server/agents/dsh.integration.test.ts
 CODEXUI_DSH_LIVE_TEST=1 pnpm exec vitest run src/server/agents/dsh.integration.test.ts
-DSH_UI_LIVE_PROMPT=1 node scripts/test-dsh-workspace.cjs
-node scripts/test-dsh-interactions.cjs
+node scripts/test-dsh-workspace.cjs # current native-page acceptance, no model prompts
 node scripts/test-workspace-header.cjs
 pnpm run build
 node -e "process.argv=['node','codexapp','--help']; require('./dist-cli/index.js')"

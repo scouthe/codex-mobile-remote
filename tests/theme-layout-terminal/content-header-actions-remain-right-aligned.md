@@ -27,6 +27,9 @@ Thread and new-chat header action buttons stay pinned to the right edge while lo
 
 ### Shared Codex / DSH header and centered mobile tool switching
 
+> ACP-specific sidebar, composer and draft scenarios below describe the earlier workspace.
+> The current DSH page embeds the native app; see the native-only acceptance below.
+
 #### Feature/Change Name
 Both workspaces reuse the same sidebar/new-chat controls. Mobile tool switching uses centered Codex/DSH buttons, with the conversation title on the next row. The former Android-observer/desktop-writer header badge is removed.
 
@@ -65,3 +68,26 @@ Both workspaces reuse the same sidebar/new-chat controls. Mobile tool switching 
 - To roll back, revert this header commit, rebuild, and restart only the 5900 service. Preserve official Codex, DSH and the existing 5173 server.
 
 ---
+
+### Native-only DSH with the shared tool picker
+
+Prerequisites: 4173 belongs to this checkout; the real native DSH bridge is configured for the
+workspace check, or native HTTP fixtures are used by the header check. No APK change is required.
+
+1. Run `node scripts/test-workspace-header.cjs` at 320x812, 375x812, 768x1024 and 1280x900,
+   light/dark. Codex retains its leading/sidebar/new-chat, Git and terminal controls.
+2. Click DSH. The top tool picker remains centered on mobile, with More at the right. The native
+   iframe fills the available width and vertical space. There is no outer ACP sidebar/composer,
+   duplicate native toolbar or mobile title row; the embedded app owns its own controls.
+3. Open More and verify reload/fullscreen/independent-open/theme controls. Switch Codex → DSH
+   and verify correct pressed state and restored Codex route, with no model prompts or ACP calls.
+4. Run `node scripts/test-dsh-workspace.cjs` to inspect the actual native iframe, not just fixtures.
+   Confirm native socket cleanup on leaving, legacy URL redirects and unavailable/retry behavior.
+
+Expected: no overlap/overflow or page errors; only one native status request per entry/reload.
+Native DSH's own theme/plugins/history are managed by DSH. Screenshots:
+`output/playwright/workspace-header-{320,375,768,1280}-{light,dark}-{codex,dsh}.png` and
+`output/playwright/dsh-embedded-{375,768,1280}-{light,dark}.png`.
+
+Cleanup: close browser contexts. No test session/project is created. Rollback by reverting the
+native-only entry commit and rebuilding/restarting 5900; preserve DSH and Codex data/config.

@@ -1,6 +1,6 @@
 <template>
-  <section ref="panel" class="dsh-panel" aria-label="DeepSeek Harness">
-    <div class="dsh-toolbar">
+  <section ref="panel" class="dsh-panel" :class="{ 'is-embedded': !showToolbar }" aria-label="DeepSeek Harness">
+    <div v-if="showToolbar" class="dsh-toolbar">
       <p>DeepSeek Harness <span>原生界面</span></p>
       <div class="dsh-actions">
         <button type="button" :disabled="checking" @click="reload">重新加载</button>
@@ -20,6 +20,8 @@
 
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
+
+withDefaults(defineProps<{ showToolbar?: boolean }>(), { showToolbar: true })
 
 const panel = ref<HTMLElement | null>(null)
 const available = ref(false), checking = ref(false), loaded = ref(false), error = ref(''), generation = ref(0)
@@ -51,4 +53,5 @@ async function fullscreen() {
 }
 onMounted(reload)
 onUnmounted(() => { controller.abort(); clearTimeout(loadTimer) })
+defineExpose({ reload, fullscreen, available, checking })
 </script>

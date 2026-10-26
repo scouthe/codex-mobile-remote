@@ -8,8 +8,8 @@ const router = createRouter({
   history: createWebHashHistory(),
   routes: [
     { path: '/dsh', name: 'dsh-home', component: EmptyRouteView },
-    { path: '/dsh/session/:sessionId', name: 'dsh-session', component: EmptyRouteView },
-    { path: '/dsh/native', name: 'dsh-native', component: EmptyRouteView },
+    { path: '/dsh/session/:sessionId', redirect: '/dsh' },
+    { path: '/dsh/native', redirect: '/dsh' },
     {
       path: '/',
       name: 'home',

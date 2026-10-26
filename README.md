@@ -1,7 +1,7 @@
 # Codex Remote · codex-mobile-remote
 
 通过网页或 Android App，远程使用 Linux 主机上的 Codex 和 DeepSeek Harness（DSH）。
-Codex 继续与连接同一官方 app-server 的 Codex Desktop 同步；DSH 使用独立会话和自己的模型配置。
+Codex 继续与连接同一官方 app-server 的 Codex Desktop 同步；DSH 直接使用本机已有的原生网页及其模型、插件和历史。
 
 ## 本地手机 Agent 窗口
 
@@ -13,11 +13,11 @@ Codex 继续与连接同一官方 app-server 的 Codex Desktop 同步；DSH 使�
 
 ## DSH 原生界面入口
 
-顶部工具切换选择 **DSH** 后，点击“更多 → 打开 DSH 原生界面”（`#/dsh/native`），
-即可在当前应用中打开本机已有的 DeepSeek Harness 原生网页。`#/dsh` 为统一 DSH 聊天工作台。
+顶部工具切换选择 **DSH**（`#/dsh`），即可在当前应用中直接打开本机已有的
+DeepSeek Harness 原生网页。页面使用 DSH 自带的会话列表和输入框。
 界面、模型、插件、工作区和历史仍由 dsh 自己管理；5900 仅提供入口及经过现有网页认证的 HTTP/WebSocket 转发。
 浏览器和 Android App 都访问同源 `/dsh/`，因此现有局域网、Tailscale 和星桥公网入口可以复用。
-DSH 页面按需加载，支持重新加载、全屏和独立打开。
+DSH 页面按需加载，“更多”菜单支持重新加载、全屏和独立打开。
 
 先自行安装并启动 dsh，然后在 **Codex 主机**的 `$CODEX_HOME/dsh-bridge.json`（默认 `~/.codex/dsh-bridge.json`）配置已有服务。
 如果 dsh 由本机 systemd 托管，且当前用户可读取它的启动日志：
@@ -87,8 +87,8 @@ Codex Desktop 通过各自的连接方式使用同一台主机上的官方服务
 
 | 功能 | 使用方式与边界 |
 | --- | --- |
-| 工具切换 | 电脑侧栏顶部选择 Codex / DSH，手机在顶部下拉切换。两者分别保留项目、对话、草稿和阅读位置；切换工具不会停止正在运行的任务。 |
-| DSH 对话 | 选择主机项目目录后创建对话，模型和推理选项来自 DSH。支持文本、按能力开放的图片、文件引用、工具执行、权限审批、停止及重启后续聊。DSH 页面不显示 Codex 专属的 Fork、回滚、Goal 和 Fast。 |
+| 工具切换 | 顶部选择 Codex / DSH，手机按钮位于顶部中央。Codex 使用原有工作台，DSH 直接嵌入原生页面。 |
+| DSH | 复用本机已运行的 DSH 原生网页、工作区、历史、模型和插件配置。自动化及任务看板由 DSH 原生功能和权限提供。 |
 | 对话与任务状态 | 侧栏显示活动状态；任务中心区分 `queued`、`starting`、`running`、`waiting_approval`、`waiting_user_input`、`steering`、`completed`、`failed`、`canceled`。 |
 | 发送 / 引导 / 停止 | 普通发送在已有任务执行时默认排队；显式引导调用 `turn/steer`，停止调用 `turn/interrupt`。审批和输入请求通过对应卡片处理。 |
 | 从回复 Fork | 点击助手回复下方的双箭头；历史已完成、失败或中断轮次可以创建分支，正在执行的目标轮次不可用。原线程继续运行。 |
@@ -115,7 +115,7 @@ Codex Desktop 通过各自的连接方式使用同一台主机上的官方服务
                        │      官方 app-server 共享 socket
                        │               ↑
                        │      Windows Desktop 经 SSH 连接
-                       └── DSH → 独立 ACP 进程 → DSH 原生会话
+                       └── DSH → 同源 HTTP/WebSocket 转发 → 已运行的 DSH 原生 Web 服务
 ```
 
 关闭 Windows Desktop 不等于停止主机上的官方 app-server；各客户端的同步以连接到
@@ -123,83 +123,21 @@ Codex Desktop 通过各自的连接方式使用同一台主机上的官方服务
 
 ### 接入本机 DSH
 
-先在运行 5900 的 Linux 主机上安装并配置好 DSH，确认 `dsh` 命令能正常使用。
-本次接入已在 DSH `0.2.1-rc.2` 验证；需要它提供创建、恢复会话及配置选项接口。
-5900 不会自动安装 DSH，也不会修改它原有的 Web 服务或 Codex 的模型、登录配置。
+先在运行 5900 的 Linux 主机上安装并启动 DSH 原生 Web 服务，按上方
+[DSH 原生界面入口](#dsh-原生界面入口)配置 `dsh-bridge.json`。
 
-打开页面后选择 **DSH → 新建 DSH 对话**，选择主机上的项目目录，再创建对话。
-模型及推理强度会按 DSH 实际返回的选项显示；不支持图片时会隐藏图片按钮，并在添加图片时说明原因。
-工具执行的过程默认折叠，最终回复单独展示；需要审批的操作会出现确认卡片。
+点击顶部 **DSH** 即可直接使用原生页面（`#/dsh`）。工作区、历史、模型、插件、
+自动化任务和任务看板由原来的 DSH 页面及其配置提供，权限规则也沿用 DSH。
+外层只保留 Codex / DSH 切换和“更多”菜单，手机工具切换位于顶部中央。
+重新加载、全屏和独立打开均在“更多”中；DSH 的外观设置由原生页面管理。
 
-首次使用会创建独立的 `~/.dsh/profiles/codex-remote-acp`，复用已安装的 DSH 包，
-只从现有 `web` profile 复制第一方模型适配器及默认模型，不加载其 Web 插件。
-配置文件权限为 `0600`。复制只在首次创建时发生，后续修改 ACP profile 不会被覆盖。
-如果你的模型只配置在其他 profile，或 systemd 找不到 `dsh`，可以创建
-`$CODEX_HOME/remote-agents/dsh.json`（默认 `~/.codex/remote-agents/dsh.json`）：
+当前页面不再使用独立 ACP 聊天界面，也不会为浏览 DSH 发起 `/agent-api/` 请求或启动 ACP 进程。
+早期的 `#/dsh/native` 和 `#/dsh/session/...` 链接统一转到 `#/dsh`。
+切换回 Codex 时释放嵌入页面的浏览器连接，原生 DSH 服务继续运行。
+DSH 服务不可用时显示错误和重试入口。
 
-```json
-{
-  "command": "/usr/bin/dsh",
-  "profile": "codex-remote-acp",
-  "sourceProfile": "web",
-  "dshHome": "/home/你的用户名/.dsh"
-}
-```
-
-`command` 应指向实际安装的 DSH；`profile` 必须独立于现有 Web/Desktop profile。
-原生上下文继续由 DSH 保存，5900 的显示记录、会话状态和配置快照保存在
-`$CODEX_HOME/remote-agents`。普通刷新不会重发任务；服务重启后会保留显示记录，
-此前未确认结束的任务会标记为中断，再次发送时恢复同一个 DSH 原生会话。
-
-会话列表通过标准 `session/list` 读取原生 DSH 会话，按项目展示并支持分页。
-已有工作台对话仍保留原来的 ID 和显示记录；原生条目使用稳定 ID，刷新或重启不会重复创建。
-列表读取合并并发请求，缓存 10 秒，“更多 → 刷新状态”可立即重新读取。
-DSH 只返回当前可恢复的会话；原生端正占用的会话可能需要先释放，再刷新列表。
-
-| ACP 能力 | 当前接入行为 |
-| --- | --- |
-| `session/new`、`session/prompt`、`session/cancel` | 创建、发送及停止任务 |
-| `session/list` | 按原生分页读取，合并本工作台已有记录 |
-| `session/resume` | 点击“恢复原生会话”后沿用原生上下文，查看列表不会占用会话 |
-| `session/close` | “更多 → 释放会话连接”；执行中可停止并释放，保留原生会话与显示记录 |
-| `session/set_config_option`、`config_option_update` | 使用 DSH 返回的模型、推理选项及实时配置更新 |
-| 图片、工具、权限请求 | 按实际能力开放图片输入，展示工具状态和审批 |
-| `usage_update` | 收到真实上下文用量及容量后显示，无额外轮询 |
-| stdio / HTTP MCP | 将主机配置中的标准 MCP 声明交给新建和恢复会话 |
-| `session/load`、音频、Fork | 本机 DSH 未声明支持，不调用或显示对应操作 |
-
-**本机 DSH 的 `session/list` 不返回原标题，且不支持旧消息回放。**
-原生条目显示“原生对话 · ID”，页面明确说明历史限制；恢复后可以使用原有模型上下文继续，
-此后在工作台产生的显示记录会保留。侧栏归档只隐藏工作台条目，不删除 DSH 原生会话。
-插件市场、原生专属界面和旧消息浏览仍可通过“更多 → 打开 DSH 原生界面”使用，
-该入口需要已有 DSH Web 服务和独立的 `$CODEX_HOME/dsh-bridge.json`。例如：
-
-```json
-{
-  "upstreamUrl": "http://127.0.0.1:8080",
-  "journalUnit": "dsh-web.service"
-}
-```
-
-服务端从你有权限读取的 systemd 日志中取得 DSH 启动授权，不把启动密钥发给浏览器。
-没有 Web 服务也可以使用 DSH 统一聊天页面。两种入口不同时写入同一条原生会话；
-DSH 的会话占用错误会直接显示，不会抢占另一个进程正在使用的会话。
-Android App 仍加载 5900 页面，本次功能无需重新安装 APK。
-
-如需给 ACP 会话配置额外 MCP 工具，在 `remote-agents/dsh.json` 中增加标准 `mcpServers` 数组：
-
-```json
-{
-  "mcpServers": [
-    { "name": "local-tools", "command": "/usr/bin/node", "args": ["/absolute/path/mcp.cjs"], "env": [] },
-    { "name": "remote-tools", "type": "http", "url": "https://mcp.example.com/mcp", "headers": [] }
-  ]
-}
-```
-
-只添加需要的工具，命令使用绝对路径。MCP 配置在新建或恢复连接时读取，
-修改后释放再恢复会话即可；密钥仅保存在主机文件中，不返回页面。当前 DSH 不声明 SSE MCP 支持。
-原生 profile 的插件变更不会自动复制到 ACP profile。
+Android App 加载同一份 5900 页面，更新并刷新页面即可，无需重新安装 APK。
+[原生接入验收步骤](tests/skills-plugins-integrations/dsh-native-entry.md)
 
 ## Linux 一键安装脚本（需要发布包）
 

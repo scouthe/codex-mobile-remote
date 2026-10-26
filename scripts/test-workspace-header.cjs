@@ -15,8 +15,6 @@ async function main() {
         const page = await context.newPage()
         const errors = [], calls = []
         let tool = 'codex'
-        const session = { id, nativeId: 'header-native-fixture', agentId: 'dsh', title: 'DSH 顶部布局验收：长标题不应遮挡工具切换或右侧操作', cwd, createdAt: '2026-10-26T03:00:00.000Z', updatedAt: '2026-10-26T03:00:00.000Z', state: 'completed', error: '', runId: '', lastRequestId: '', revision: 1, archived: false }
-        const detail = { session, messages: [{ id: 'dsh-answer', role: 'assistant', text: 'DSH_HEADER_READY', messageType: 'agentMessage', messagePhase: 'final_answer', turnId: 'dsh-turn', turnIndex: 0 }], configOptions: [], permissions: [], imagesSupported: false, nextCursor: null }
         const thread = { id, name: 'Codex 顶部布局验收：长标题不应遮挡工具切换或右侧操作', preview: 'Codex 顶部布局验收', cwd, createdAt: 1792983600, updatedAt: 1792983600, modelProvider: 'openai', status: { type: 'idle' }, sessionActivityKnown: true, sessionRevision: 'header-revision', taskState: 'completed', taskError: '', terminalTurnId: 'codex-turn', turns: [{ id: 'codex-turn', status: 'completed', items: [{ id: 'codex-answer', type: 'agentMessage', phase: 'final_answer', text: 'CODEX_HEADER_READY' }] }] }
         page.on('pageerror', error => errors.push(error.message))
         await page.addInitScript(({ theme, id }) => {
@@ -42,11 +40,13 @@ async function main() {
         await page.route('**/agent-api/**', async route => {
           const request = route.request(), path = new URL(request.url()).pathname
           calls.push({ tool, method: request.method(), path })
-          const result = path.endsWith('/status') ? { available: true, connected: true, message: '', imagesSupported: false }
-            : path.endsWith('/directories') ? { path: cwd, parent: '/tmp', directories: [] }
-              : path === '/agent-api/sessions' ? [session] : detail
-          await route.fulfill({ json: result })
+          await route.fulfill({ status: 500, json: { error: 'Native DSH must not call ACP routes' } })
         })
+        await page.route('**/dsh-api/status', async route => {
+          calls.push({ tool, method: 'GET', path: '/dsh-api/status' })
+          await route.fulfill({ json: { available: true, message: '' } })
+        })
+        await page.route('**/dsh/', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><h1>DSH_NATIVE_HEADER_READY</h1><textarea aria-label="原生 DSH 输入框"></textarea>' }))
         await page.route('**/codex-api/**', async route => {
           const request = route.request(), path = new URL(request.url()).pathname
           const body = request.postDataJSON?.()
@@ -74,7 +74,7 @@ async function main() {
           const header = page.locator('.content-header')
           await expect(header.locator('.workspace-tool-compact')).toBeVisible()
           await expect(header.getByRole('button', { name: currentTool, exact: true })).toHaveAttribute('aria-pressed', 'true')
-          await expect(header.locator('.sidebar-thread-controls-button')).toHaveCount(2)
+          await expect(header.locator('.sidebar-thread-controls-button')).toHaveCount(currentTool === 'Codex' ? 2 : 0)
           await expect(page.locator('.android-observer-badge')).toHaveCount(0)
           const boxes = await header.evaluate(element => {
             const rect = value => { const r = value.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height } }
@@ -85,8 +85,8 @@ async function main() {
           expect(boxes.overflow).toBe(false)
           if (mobile) {
             expect(Math.abs(boxes.picker.x + boxes.picker.width / 2 - (boxes.header.x + boxes.header.width / 2))).toBeLessThan(1)
-            expect(boxes.leading.at(-1).x + boxes.leading.at(-1).width).toBeLessThanOrEqual(boxes.picker.x + 1)
-            expect(boxes.title.y).toBeGreaterThanOrEqual(boxes.picker.y + boxes.picker.height)
+            if (boxes.leading.length) expect(boxes.leading.at(-1).x + boxes.leading.at(-1).width).toBeLessThanOrEqual(boxes.picker.x + 1)
+            if (currentTool === 'Codex') expect(boxes.title.y).toBeGreaterThanOrEqual(boxes.picker.y + boxes.picker.height)
             for (const action of boxes.actions) expect(action.x).toBeGreaterThanOrEqual(boxes.picker.x + boxes.picker.width - 1)
           }
           if (theme === 'dark') {
@@ -97,7 +97,7 @@ async function main() {
         }
         await page.goto(base + '/#/thread/' + id)
         await expect(page.getByText('CODEX_HEADER_READY', { exact: true })).toBeVisible()
-        const codexLeading = await checkHeader('Codex')
+        await checkHeader('Codex')
         await expect(page.locator('.content-header-terminal-command')).toBeVisible()
         await page.locator('.header-git-trigger').click()
         await expect(page.locator('.header-git-menu')).toBeVisible()
@@ -107,32 +107,24 @@ async function main() {
         await page.screenshot({ path: `output/playwright/workspace-header-${viewport.width}-${theme}-codex.png`, fullPage: true })
         tool = 'dsh'
         await page.locator('.content-header').getByRole('button', { name: 'DSH', exact: true }).click()
-        await expect(page.getByText('DSH_HEADER_READY', { exact: true })).toBeVisible()
-        const dshLeading = await checkHeader('DSH')
-        expect(dshLeading).toEqual(codexLeading)
-        await page.getByRole('textbox', { name: '向 DSH 发送消息' }).fill('保留 DSH 草稿')
-        await page.locator('.content-header .sidebar-thread-controls-button').first().click()
-        if (mobile) {
-          await expect(page.locator('.mobile-drawer .agent-sidebar')).toBeVisible()
-          await page.locator('.mobile-drawer-backdrop').click({ position: { x: viewport.width - 3, y: 200 } })
-        } else {
-          await expect(page.locator('.desktop-sidebar')).toHaveCount(0)
-          await page.locator('.content-header .sidebar-thread-controls-button').first().click()
-        }
+        await expect(page.frameLocator('.dsh-frame').getByRole('heading', { name: 'DSH_NATIVE_HEADER_READY', exact: true })).toBeVisible()
+        await expect(page).toHaveURL(/#\/dsh$/)
+        await checkHeader('DSH')
+        await expect(page.locator('.desktop-sidebar,.agent-sidebar,.agent-composer')).toHaveCount(0)
+        expect(calls.filter(call => call.path.startsWith('/agent-api/'))).toHaveLength(0)
         await page.getByRole('button', { name: '更多 DSH 操作', exact: true }).click()
-        await expect(page.getByRole('button', { name: '打开 DSH 原生界面', exact: true })).toBeVisible()
+        await expect(page.getByRole('link', { name: '独立打开 ↗', exact: true })).toHaveAttribute('href', '/dsh/')
+        await expect(page.getByRole('button', { name: '重新加载', exact: true })).toBeVisible()
         await page.getByRole('button', { name: '更多 DSH 操作', exact: true }).click()
         await page.waitForTimeout(2200)
         await page.screenshot({ path: `output/playwright/workspace-header-${viewport.width}-${theme}-dsh.png`, fullPage: true })
         await page.locator('.content-header').getByRole('button', { name: 'Codex', exact: true }).click()
         await expect(page.getByText('CODEX_HEADER_READY', { exact: true })).toBeVisible()
         await page.locator('.content-header').getByRole('button', { name: 'DSH', exact: true }).click()
-        await expect(page.getByRole('textbox', { name: '向 DSH 发送消息' })).toHaveValue('保留 DSH 草稿')
-        await page.locator('.content-header .sidebar-thread-controls-button').last().click()
-        await expect(page).toHaveURL(/#\/dsh$/)
+        await expect(page.frameLocator('.dsh-frame').getByRole('heading', { name: 'DSH_NATIVE_HEADER_READY', exact: true })).toBeVisible()
         expect(calls.filter(call => call.method === 'turn/start' || /\/prompt$/.test(call.path) || call.method === 'POST' && call.path === '/agent-api/sessions')).toHaveLength(0)
         expect(errors).toEqual([])
-        results.push({ viewport, theme, sharedLeadingActions: true, centeredMobilePicker: mobile, dshDraftRestored: true, newDshChatNavigated: true, modelRequests: 0, requests: calls.length, pageErrors: 0 })
+        results.push({ viewport, theme, codexActionsPreserved: true, centeredMobilePicker: mobile, dshNativeEmbedded: true, duplicateSidebar: false, acpRequests: 0, modelRequests: 0, requests: calls.length, pageErrors: 0 })
         await context.close()
       }
     }
