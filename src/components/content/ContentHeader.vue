@@ -1,7 +1,10 @@
 <template>
-  <header class="content-header">
+  <header class="content-header" :class="{ 'has-center': Boolean($slots.center) }">
     <div class="content-leading" :class="{ 'is-accent': accent }">
       <slot name="leading" />
+    </div>
+    <div v-if="$slots.center" class="content-center">
+      <slot name="center" />
     </div>
     <h1 class="content-title" :class="{ 'is-accent': accent }" :title="title">{{ title }}</h1>
     <span
@@ -56,6 +59,50 @@ defineProps<{
 
 .content-leading.is-accent {
   @apply gap-2;
+}
+
+.content-header.has-center {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  column-gap: 0;
+  row-gap: 4px;
+  padding-top: max(8px, env(safe-area-inset-top, 0px));
+}
+
+.has-center .content-leading {
+  grid-column: 1;
+  grid-row: 1;
+  min-width: 0;
+  gap: 0;
+}
+
+.content-center {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: center;
+}
+
+.has-center .content-actions {
+  grid-column: 3;
+  grid-row: 1;
+  min-width: 0;
+  gap: 0;
+  margin-left: 0;
+}
+
+.has-center .content-title {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  max-width: 100%;
+  padding: 4px 24px 0 8px;
+  font-size: 14px;
+}
+
+.has-center .content-header-status-indicator {
+  grid-column: 3;
+  grid-row: 2;
+  justify-self: end;
+  margin-right: 8px;
 }
 
 :global(:root.dark) .content-title.is-accent {

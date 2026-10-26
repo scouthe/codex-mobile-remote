@@ -5,10 +5,25 @@
 .workspace-tool-tabs { display:flex; gap:4px; padding:4px; margin:6px 8px 12px; border:1px solid #e4e4e7; border-radius:10px; background:#ededf0; }
 .workspace-tool-tabs button { flex:1; min-height:36px; border:0; border-radius:7px; background:transparent; color:#71717a; cursor:pointer; }
 .workspace-tool-tabs button[aria-pressed=true] { background:white; color:#18181b; box-shadow:0 1px 3px #00000012; font-weight:500; }
-.workspace-tool-compact { display:flex; align-items:center; max-width:110px; padding:3px 8px; border:1px solid #e4e4e7; border-radius:7px; }
-.workspace-tool-compact .composer-dropdown-trigger { color:#27272a; font-size:12px; }
+.workspace-tool-tabs.workspace-tool-compact { width:128px; flex-shrink:0; gap:2px; margin:0; padding:3px; border:0; border-radius:11px; background:#f4f4f5; }
+.workspace-tool-compact button { min-height:42px; min-width:0; padding:0 6px; font-size:14px; border-radius:8px; }
+.workspace-tool-tabs button:focus-visible { outline:2px solid #71717a; outline-offset:2px; }
+.content-header.has-center .sidebar-thread-controls { gap:0; }
+.content-header.has-center .sidebar-thread-controls-button,
+.content-header.has-center .agent-header-button,
+.content-header.has-center .header-git-dropdown.is-compact .header-git-trigger,
+.content-header.has-center .content-header-terminal-command .composer-dropdown-trigger { display:flex; align-items:center; justify-content:center; width:44px; min-width:44px; height:44px; padding:0; border:0; border-radius:8px; background:transparent; color:#71717a; }
+.content-header.has-center .content-header-terminal-command .composer-dropdown-chevron { display:none; }
+.content-header.has-center .content-header-terminal-command .composer-dropdown-prefix-icon,
+.content-header.has-center .agent-header-button .icon-svg { width:16px; height:16px; }
+.content-header.has-center .sidebar-thread-controls-button:hover,
+.content-header.has-center .agent-header-button:hover,
+.content-header.has-center .header-git-dropdown.is-compact .header-git-trigger:hover,
+.content-header.has-center .content-header-terminal-command .composer-dropdown-trigger:hover { background:#f4f4f5; color:#27272a; }
+.content-header.has-center .header-git-dropdown.is-compact.is-review-open .header-git-trigger,
+.content-header.has-center .content-header-terminal-command.is-open .composer-dropdown-trigger { background:#e4e4e7; color:#18181b; }
 .agent-workspace { display:flex; flex-direction:column; min-width:0; height:100%; background:white; color:#27272a; padding-bottom:env(safe-area-inset-bottom,0px); }
-.agent-workspace .content-header { padding-top:max(12px,env(safe-area-inset-top,0px)); flex-shrink:0; }
+.agent-workspace .content-header { flex-shrink:0; }
 .agent-workspace .conversation-root { flex:1; min-height:0; }
 .agent-sidebar { display:flex; flex-direction:column; gap:10px; height:100%; padding:12px 8px max(12px,env(safe-area-inset-bottom,0px)); color:#27272a; background:#f7f7f8; }
 .agent-sidebar .workspace-tool-tabs { flex-shrink:0; margin:4px 4px 0; }
@@ -27,7 +42,7 @@
 .agent-working-dot { width:7px; height:7px; background:#16a34a; border-radius:50%; flex-shrink:0; }
 .agent-sidebar-footer { display:grid; gap:8px; padding:8px; border-top:1px solid #e4e4e7; font-size:12px; }
 .agent-sidebar-footer button { background:transparent; border:0; text-align:left; padding:6px; color:#71717a; }
-.agent-header-button { min-width:36px; min-height:36px; border:0; border-radius:7px; background:transparent; font-size:18px; }
+.agent-header-button { display:inline-flex; align-items:center; justify-content:center; min-width:36px; min-height:36px; border:0; border-radius:7px; background:transparent; font-size:18px; }
 .agent-header-button:hover { background:#f4f4f5; }
 .agent-more-menu { position:absolute; top:calc(100% - 2px); right:10px; z-index:300; padding:5px; min-width:180px; background:white; border:1px solid #e4e4e7; border-radius:10px; box-shadow:0 6px 24px #0000001c; }
 .agent-more-menu button { display:block; width:100%; text-align:left; padding:10px; background:transparent; border:0; border-radius:6px; font-size:13px; }
@@ -83,8 +98,18 @@
 :root.dark .workspace-tool-tabs { border-color:#3f3f46; background:#27272a; }
 :root.dark .workspace-tool-tabs button { color:#a1a1aa; }
 :root.dark .workspace-tool-tabs button[aria-pressed=true] { color:#fafafa; background:#3f3f46; }
-:root.dark .workspace-tool-compact { border-color:#3f3f46; }
-:root.dark .workspace-tool-compact .composer-dropdown-trigger { color:#e4e4e7; }
+:root.dark .workspace-tool-tabs.workspace-tool-compact { background:#27272a; }
+:root.dark .workspace-tool-compact button[aria-pressed=true] { background:#52525b; }
+:root.dark .content-header.has-center .sidebar-thread-controls-button,
+:root.dark .content-header.has-center .agent-header-button,
+:root.dark .content-header.has-center .header-git-dropdown.is-compact .header-git-trigger,
+:root.dark .content-header.has-center .content-header-terminal-command .composer-dropdown-trigger { color:#a1a1aa; background:transparent; }
+:root.dark .content-header.has-center .sidebar-thread-controls-button:hover,
+:root.dark .content-header.has-center .agent-header-button:hover,
+:root.dark .content-header.has-center .header-git-dropdown.is-compact .header-git-trigger:hover,
+:root.dark .content-header.has-center .content-header-terminal-command .composer-dropdown-trigger:hover { background:#27272a; color:#f4f4f5; }
+:root.dark .content-header.has-center .header-git-dropdown.is-compact.is-review-open .header-git-trigger,
+:root.dark .content-header.has-center .content-header-terminal-command.is-open .composer-dropdown-trigger { background:#3f3f46; color:#fafafa; }
 :root.dark .agent-workspace,:root.dark .agent-composer,:root.dark .agent-more-menu,:root.dark .agent-folder-dialog { background:#18181b; color:#e4e4e7; }
 :root.dark .agent-sidebar { background:#202023; color:#e4e4e7; }
 :root.dark .agent-new { background:#27272a; border-color:#3f3f46; }

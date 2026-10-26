@@ -23,13 +23,20 @@
     <template #content>
       <section class="agent-workspace">
         <ContentHeader :title="native ? 'DSH 原生界面' : detail?.session.title || '新建 DSH 对话'" :status="busy ? 'working' : undefined" status-label="DSH 正在执行">
-          <template #leading>
-            <button class="agent-header-button" type="button" aria-label="打开会话列表" @click="sidebarClosed = !sidebarClosed">☰</button>
+          <template v-if="isMobile" #center>
             <WorkspaceToolPicker current-tool="dsh" compact />
           </template>
+          <template #leading>
+            <SidebarThreadControls
+              :is-sidebar-collapsed="sidebarClosed"
+              :show-new-thread-button="true"
+              @toggle-sidebar="sidebarClosed = !sidebarClosed"
+              @start-new-thread="newChat"
+            />
+            <WorkspaceToolPicker v-if="!isMobile" current-tool="dsh" compact />
+          </template>
           <template #actions>
-            <button class="agent-header-button" type="button" aria-label="新建 DSH 对话" @click="newChat">＋</button>
-            <button class="agent-header-button" type="button" aria-label="更多 DSH 操作" :aria-expanded="moreOpen" @click="moreOpen = !moreOpen">···</button>
+            <button class="agent-header-button" type="button" aria-label="更多 DSH 操作" :aria-expanded="moreOpen" @click="moreOpen = !moreOpen"><IconTablerDots class="icon-svg" /></button>
             <div v-if="moreOpen" class="agent-more-menu"><button type="button" @click="router.push('/dsh/native'); moreOpen = false">打开 DSH 原生界面</button><button type="button" @click="refresh">刷新状态</button><button type="button" @click="toggleTheme">切换外观</button></div>
           </template>
         </ContentHeader>
@@ -78,6 +85,8 @@ import { computed, defineAsyncComponent, nextTick, onActivated, onDeactivated, o
 import { useRoute, useRouter } from 'vue-router'
 import DesktopLayout from '../layout/DesktopLayout.vue'
 import ContentHeader from '../content/ContentHeader.vue'
+import SidebarThreadControls from '../sidebar/SidebarThreadControls.vue'
+import IconTablerDots from '../icons/IconTablerDots.vue'
 import ComposerDropdown from '../content/ComposerDropdown.vue'
 import ThreadConversation from '../content/ThreadConversation.vue'
 import WorkspaceToolPicker from './WorkspaceToolPicker.vue'

@@ -1,5 +1,5 @@
 <template>
-  <div ref="rootRef" class="header-git-dropdown" :class="{ 'is-review-open': reviewOpen }">
+  <div ref="rootRef" class="header-git-dropdown" :class="{ 'is-review-open': reviewOpen, 'is-compact': compact }">
     <button
       class="header-git-trigger"
       type="button"
@@ -8,10 +8,13 @@
       :aria-label="triggerLabel"
       @click="toggleOpen"
     >
-      <IconTablerGitFork class="header-git-trigger-icon" />
-      <span class="header-git-trigger-label">{{ displayLabel }}</span>
-      <span v-if="dirty" class="header-git-dirty-dot" aria-label="Uncommitted changes" />
-      <IconTablerChevronDown class="header-git-trigger-chevron" />
+      <IconTablerDots v-if="compact" class="header-git-trigger-icon" />
+      <template v-else>
+        <IconTablerGitFork class="header-git-trigger-icon" />
+        <span class="header-git-trigger-label">{{ displayLabel }}</span>
+        <span v-if="dirty" class="header-git-dirty-dot" aria-label="Uncommitted changes" />
+        <IconTablerChevronDown class="header-git-trigger-chevron" />
+      </template>
     </button>
 
     <div v-if="isOpen" class="header-git-menu-wrap">
@@ -193,6 +196,7 @@ import type { GitCommitFileChange, GitCommitOption, WorktreeBranchOption } from 
 import IconTablerChevronDown from '../icons/IconTablerChevronDown.vue'
 import IconTablerFilePencil from '../icons/IconTablerFilePencil.vue'
 import IconTablerGitFork from '../icons/IconTablerGitFork.vue'
+import IconTablerDots from '../icons/IconTablerDots.vue'
 import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { copyTextToClipboard } from '../../utils/clipboard'
 
@@ -216,6 +220,7 @@ const props = defineProps<{
   error: string
   reviewOpen: boolean
   showReview?: boolean
+  compact?: boolean
 }>()
 
 const emit = defineEmits<{

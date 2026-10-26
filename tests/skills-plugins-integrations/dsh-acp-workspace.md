@@ -48,6 +48,10 @@ and may make small upstream model requests. All file-tool tests must use tempora
 10. At 1280x900, 375x812 and 768x1024, inspect light/dark themes, model menus, approvals, mobile
     drawer/tool picker and keyboard-safe controls. No horizontal overflow, hidden popup or
     Codex-only Fork/rollback/Goal/Fast action should appear on DSH chats.
+    The header uses the same sidebar/new-chat icons as Codex. On mobile, Codex/DSH tool buttons
+    sit at the top center, with the conversation title below; tool switching takes one click.
+    See `tests/theme-layout-terminal/content-header-actions-remain-right-aligned.md` for the
+    responsive header regression, including draft restoration and desktop sidebar controls.
 11. For native fallback, configure `dsh-bridge.json`, open More → DSH native UI, and verify HTTP
     and WebSocket requests use the authenticated proxy. Existing DSH plugins/config stay unchanged.
 12. Verify `/agent-api/*`, `/dsh/*` and native WebSockets reject unauthorized/cross-origin access
@@ -62,6 +66,7 @@ CODEXUI_TEST_DSH=1 pnpm exec vitest run src/server/agents/dsh.integration.test.t
 CODEXUI_DSH_LIVE_TEST=1 pnpm exec vitest run src/server/agents/dsh.integration.test.ts
 DSH_UI_LIVE_PROMPT=1 node scripts/test-dsh-workspace.cjs
 node scripts/test-dsh-interactions.cjs
+node scripts/test-workspace-header.cjs
 pnpm run build
 node -e "process.argv=['node','codexapp','--help']; require('./dist-cli/index.js')"
 ```

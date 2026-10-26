@@ -80,13 +80,12 @@ async function main() {
       }
     }
     await page.setViewportSize({ width: 375, height: 812 })
-    await page.getByRole('button', { name: '打开会话列表', exact: true }).click()
+    await page.locator('.content-leading .sidebar-thread-controls-button').first().click()
     await expect(page.locator('.mobile-drawer .workspace-tool-tabs')).toBeVisible()
     await page.screenshot({ path: 'output/playwright/dsh-mobile-drawer.png', fullPage: true })
     await page.locator('.mobile-drawer .workspace-tool-tabs').getByRole('button', { name: 'Codex', exact: true }).click()
     await page.waitForURL(url => !url.hash.startsWith('#/dsh'))
     await expect(page.locator('.workspace-tool-compact').first()).toBeVisible()
-    await page.locator('.workspace-tool-compact').first().getByRole('button').click()
     await page.locator('.workspace-tool-compact').first().getByRole('button', { name: 'DSH', exact: true }).click()
     await page.waitForURL(new RegExp(sessionId))
     await expect(page.getByRole('textbox', { name: '向 DSH 发送消息' })).toHaveValue('保留这份 DSH 草稿')

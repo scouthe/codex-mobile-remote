@@ -553,31 +553,22 @@
           :status="isMobile && isSelectedThreadInProgress ? 'working' : undefined"
           :status-label="t('Working')"
         >
-          <template #leading>
+          <template v-if="isMobile" #center>
             <WorkspaceToolPicker current-tool="codex" compact />
+          </template>
+          <template #leading>
             <SidebarThreadControls
-              v-if="isSidebarCollapsed || isMobile"
-              class="sidebar-thread-controls-header-host"
               :is-sidebar-collapsed="isSidebarCollapsed"
               :show-new-thread-button="true"
               @toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"
               @start-new-thread="onStartNewThreadFromToolbar"
             />
-            <span v-if="isSkillsRoute" class="skills-route-header-icon" aria-hidden="true">
+            <WorkspaceToolPicker v-if="!isMobile" current-tool="codex" compact />
+            <span v-if="isSkillsRoute && !isMobile" class="skills-route-header-icon" aria-hidden="true">
               <IconTablerBolt />
             </span>
-            <span v-else-if="isAutomationsRoute" class="skills-route-header-icon automations-route-header-icon" aria-hidden="true">
+            <span v-else-if="isAutomationsRoute && !isMobile" class="skills-route-header-icon automations-route-header-icon" aria-hidden="true">
               <IconTablerBolt />
-            </span>
-            <span
-              v-if="showAndroidObserverBadge"
-              class="android-observer-badge"
-              :title="t('The desktop is the active writer. This device is observing and can queue messages.')"
-              role="status"
-            >
-              <span class="android-observer-badge-primary">{{ t('Android observer') }}</span>
-              <span class="android-observer-badge-separator" aria-hidden="true">·</span>
-              <span>{{ t('Desktop writer') }}</span>
             </span>
           </template>
           <template #actions>
@@ -597,6 +588,7 @@
             <HeaderGitBranchDropdown
               v-if="canShowContentHeaderBranchDropdown"
               class="content-header-branch-dropdown"
+              :compact="isMobile"
               :current-branch="currentThreadBranch"
               :head-sha="currentThreadHeadSha"
               :head-subject="currentThreadHeadSubject"
@@ -2036,9 +2028,6 @@ const isAccountSwitchBlocked = computed(() =>
 const isAndroidRemoteObserver = computed(() => (
   androidBridge.nativeAvailable.value &&
   androidBridge.clientInfo.value?.clientType === 'android'
-))
-const showAndroidObserverBadge = computed(() => (
-  isAndroidRemoteObserver.value && showThreadContextBadge.value
 ))
 
 type AndroidTaskSnapshot = {
@@ -5902,36 +5891,12 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
   @apply truncate text-[11px] font-medium uppercase tracking-[0.18em] text-zinc-500;
 }
 
-.sidebar-thread-controls-header-host {
-  @apply ml-1;
-}
-
 .skills-route-header-icon {
   @apply flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl bg-emerald-600 text-white shadow-[0_16px_32px_-20px_rgba(5,150,105,0.9)];
 }
 
 .automations-route-header-icon {
   @apply bg-amber-500 shadow-[0_16px_32px_-20px_rgba(245,158,11,0.9)];
-}
-
-.android-observer-badge {
-  @apply inline-flex max-w-[min(42vw,15rem)] items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2 py-1 text-[10px] font-medium leading-4 text-sky-700;
-}
-
-.android-observer-badge-primary {
-  @apply font-semibold;
-}
-
-.android-observer-badge-separator {
-  @apply text-sky-400;
-}
-
-:root.dark .android-observer-badge {
-  @apply border-sky-800 bg-sky-950/50 text-sky-300;
-}
-
-:root.dark .android-observer-badge-separator {
-  @apply text-sky-500;
 }
 
 .skills-route-header-icon :deep(svg) {
