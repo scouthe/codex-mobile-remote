@@ -5,8 +5,8 @@
 .workspace-tool-tabs { display:flex; gap:4px; padding:4px; margin:6px 8px 12px; border:1px solid #e4e4e7; border-radius:10px; background:#ededf0; }
 .workspace-tool-tabs button { flex:1; min-height:36px; border:0; border-radius:7px; background:transparent; color:#71717a; cursor:pointer; }
 .workspace-tool-tabs button[aria-pressed=true] { background:white; color:#18181b; box-shadow:0 1px 3px #00000012; font-weight:500; }
-.workspace-tool-tabs.workspace-tool-compact { width:128px; flex-shrink:0; gap:2px; margin:0; padding:3px; border:0; border-radius:11px; background:#f4f4f5; }
-.workspace-tool-compact button { min-height:42px; min-width:0; padding:0 6px; font-size:14px; border-radius:8px; }
+.workspace-tool-compact { display:flex; align-items:center; max-width:110px; padding:3px 8px; border:1px solid #e4e4e7; border-radius:7px; flex-shrink:0; }
+.workspace-tool-compact .composer-dropdown-trigger { min-height:30px; padding:0; border:0; background:transparent; color:#27272a; font-size:12px; }
 .workspace-tool-tabs button:focus-visible { outline:2px solid #71717a; outline-offset:2px; }
 .content-header.has-center .sidebar-thread-controls { gap:0; }
 .content-header.has-center .sidebar-thread-controls-button,
@@ -105,8 +105,8 @@
 :root.dark .workspace-tool-tabs { border-color:#3f3f46; background:#27272a; }
 :root.dark .workspace-tool-tabs button { color:#a1a1aa; }
 :root.dark .workspace-tool-tabs button[aria-pressed=true] { color:#fafafa; background:#3f3f46; }
-:root.dark .workspace-tool-tabs.workspace-tool-compact { background:#27272a; }
-:root.dark .workspace-tool-compact button[aria-pressed=true] { background:#52525b; }
+:root.dark .workspace-tool-compact { border-color:#3f3f46; }
+:root.dark .workspace-tool-compact .composer-dropdown-trigger { color:#e4e4e7; }
 :root.dark .content-header.has-center .sidebar-thread-controls-button,
 :root.dark .content-header.has-center .agent-header-button,
 :root.dark .content-header.has-center .header-git-dropdown.is-compact .header-git-trigger,
@@ -2326,7 +2326,6 @@
 .dsh-header-actions .agent-more-menu button:hover,.dsh-header-actions .agent-more-menu a:hover { background:#f4f4f5; }
 .dsh-native-workspace .content-header.has-center .content-title { display:none; }
 .agent-workspace.dsh-native-workspace .content-header.has-center { min-height:45px; padding-top:env(safe-area-inset-top,0px); padding-bottom:0; row-gap:0; }
-.dsh-native-workspace .content-header.has-center .workspace-tool-compact { padding:1px 3px; }
 .dsh-panel.is-embedded .dsh-loading { inset:0 0 auto; }
 :root.dark .dsh-native-workspace .content-header { border-color:#303139; }
 :root.dark .dsh-header-actions .agent-more-menu button:hover,:root.dark .dsh-header-actions .agent-more-menu a:hover { background:#27272a; }

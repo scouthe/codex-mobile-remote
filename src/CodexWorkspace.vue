@@ -553,17 +553,14 @@
           :status="isMobile && isSelectedThreadInProgress ? 'working' : undefined"
           :status-label="t('Working')"
         >
-          <template v-if="isMobile" #center>
-            <WorkspaceToolPicker current-tool="codex" compact />
-          </template>
           <template #leading>
+            <WorkspaceToolPicker current-tool="codex" compact />
             <SidebarThreadControls
               :is-sidebar-collapsed="isSidebarCollapsed"
               :show-new-thread-button="true"
               @toggle-sidebar="setSidebarCollapsed(!isSidebarCollapsed)"
               @start-new-thread="onStartNewThreadFromToolbar"
             />
-            <WorkspaceToolPicker v-if="!isMobile" current-tool="codex" compact />
             <span v-if="isSkillsRoute && !isMobile" class="skills-route-header-icon" aria-hidden="true">
               <IconTablerBolt />
             </span>

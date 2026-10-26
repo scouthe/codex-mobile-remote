@@ -73,21 +73,27 @@ async function main() {
         async function checkHeader(currentTool) {
           const header = page.locator('.content-header')
           await expect(header.locator('.workspace-tool-compact')).toBeVisible()
-          await expect(header.getByRole('button', { name: currentTool, exact: true })).toHaveAttribute('aria-pressed', 'true')
+          await expect(header.locator('.workspace-tool-compact .composer-dropdown-trigger')).toHaveAttribute('aria-label', currentTool)
           await expect(header.locator('.sidebar-thread-controls-button')).toHaveCount(currentTool === 'Codex' ? 2 : 0)
+          await expect(header).toHaveClass(currentTool === 'DSH' && mobile ? /has-center/ : /^(?!.*\bhas-center\b)/)
           await expect(page.locator('.android-observer-badge')).toHaveCount(0)
           const boxes = await header.evaluate(element => {
             const rect = value => { const r = value.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height } }
             const canvas = document.createElement('canvas'), ctx = canvas.getContext('2d')
             const color = node => { ctx.clearRect(0, 0, 1, 1); ctx.fillStyle = getComputedStyle(node).backgroundColor; ctx.fillRect(0, 0, 1, 1); return [...ctx.getImageData(0, 0, 1, 1).data] }
-            return { header: rect(element), picker: rect(element.querySelector('.workspace-tool-compact')), leading: [...element.querySelectorAll('.sidebar-thread-controls-button')].map(rect), title: rect(element.querySelector('.content-title')), actions: [...element.querySelector('.content-actions').querySelectorAll('button')].filter(button => button.getClientRects().length && button.closest('.header-git-trigger, .composer-dropdown-trigger, .agent-header-button')).map(rect), overflow: document.documentElement.scrollWidth > innerWidth + 1, background: color(element), selectedBackground: color(element.querySelector('.workspace-tool-compact [aria-pressed="true"]')) }
+            return { header: rect(element), picker: rect(element.querySelector('.workspace-tool-compact')), leading: [...element.querySelectorAll('.sidebar-thread-controls-button')].map(rect), title: rect(element.querySelector('.content-title')), actions: [...element.querySelector('.content-actions').querySelectorAll('button')].filter(button => button.getClientRects().length && button.closest('.header-git-trigger, .composer-dropdown-trigger, .agent-header-button')).map(rect), overflow: document.documentElement.scrollWidth > innerWidth + 1, background: color(element), selectedBackground: color(element.querySelector('.workspace-tool-compact')) }
           })
           expect(boxes.overflow).toBe(false)
           if (mobile) {
-            expect(Math.abs(boxes.picker.x + boxes.picker.width / 2 - (boxes.header.x + boxes.header.width / 2))).toBeLessThan(1)
-            if (boxes.leading.length) expect(boxes.leading.at(-1).x + boxes.leading.at(-1).width).toBeLessThanOrEqual(boxes.picker.x + 1)
-            if (currentTool === 'Codex') expect(boxes.title.y).toBeGreaterThanOrEqual(boxes.picker.y + boxes.picker.height)
-            for (const action of boxes.actions) expect(action.x).toBeGreaterThanOrEqual(boxes.picker.x + boxes.picker.width - 1)
+            if (currentTool === 'DSH') {
+              expect(Math.abs(boxes.picker.x + boxes.picker.width / 2 - (boxes.header.x + boxes.header.width / 2))).toBeLessThan(1)
+              for (const action of boxes.actions) expect(action.x).toBeGreaterThanOrEqual(boxes.picker.x + boxes.picker.width - 1)
+            } else {
+              expect(Math.abs(boxes.picker.y - (boxes.header.y + (boxes.header.height - boxes.picker.height) / 2))).toBeLessThanOrEqual(2)
+              expect(boxes.title.y).toBeGreaterThanOrEqual(boxes.header.y)
+              expect(boxes.title.y + boxes.title.height).toBeLessThanOrEqual(boxes.header.y + boxes.header.height)
+              expect(boxes.title.height).toBeLessThanOrEqual(boxes.picker.height)
+            }
           }
           if (theme === 'dark') {
             expect(Math.max(...boxes.background.slice(0, 3))).toBeLessThan(64)
@@ -106,7 +112,12 @@ async function main() {
         await page.waitForTimeout(2200)
         await page.screenshot({ path: `output/playwright/workspace-header-${viewport.width}-${theme}-codex.png`, fullPage: true })
         tool = 'dsh'
-        await page.locator('.content-header').getByRole('button', { name: 'DSH', exact: true }).click()
+        async function switchTool(value) {
+          const picker = page.locator('.content-header .workspace-tool-compact')
+          await picker.locator('.composer-dropdown-trigger').click()
+          await picker.locator('.composer-dropdown-option', { hasText: value }).click()
+        }
+        await switchTool('DSH')
         await expect(page.frameLocator('.dsh-frame').getByRole('heading', { name: 'DSH_NATIVE_HEADER_READY', exact: true })).toBeVisible()
         await expect(page).toHaveURL(/#\/dsh$/)
         await checkHeader('DSH')
@@ -118,13 +129,13 @@ async function main() {
         await page.getByRole('button', { name: '更多 DSH 操作', exact: true }).click()
         await page.waitForTimeout(2200)
         await page.screenshot({ path: `output/playwright/workspace-header-${viewport.width}-${theme}-dsh.png`, fullPage: true })
-        await page.locator('.content-header').getByRole('button', { name: 'Codex', exact: true }).click()
+        await switchTool('Codex')
         await expect(page.getByText('CODEX_HEADER_READY', { exact: true })).toBeVisible()
-        await page.locator('.content-header').getByRole('button', { name: 'DSH', exact: true }).click()
+        await switchTool('DSH')
         await expect(page.frameLocator('.dsh-frame').getByRole('heading', { name: 'DSH_NATIVE_HEADER_READY', exact: true })).toBeVisible()
         expect(calls.filter(call => call.method === 'turn/start' || /\/prompt$/.test(call.path) || call.method === 'POST' && call.path === '/agent-api/sessions')).toHaveLength(0)
         expect(errors).toEqual([])
-        results.push({ viewport, theme, codexActionsPreserved: true, centeredMobilePicker: mobile, dshNativeEmbedded: true, duplicateSidebar: false, acpRequests: 0, modelRequests: 0, requests: calls.length, pageErrors: 0 })
+        results.push({ viewport, theme, codexActionsPreserved: true, codexMobileHeaderSingleRow: mobile, dshMobilePickerCentered: mobile, dshNativeEmbedded: true, duplicateSidebar: false, acpRequests: 0, modelRequests: 0, requests: calls.length, pageErrors: 0 })
         await context.close()
       }
     }

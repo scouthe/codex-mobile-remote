@@ -10,6 +10,11 @@ async function main() {
     for (const viewport of [{ width: 375, height: 812 }, { width: 768, height: 1024 }, { width: 1280, height: 900 }]) for (const theme of ['light', 'dark']) {
       const context = await browser.newContext({ viewport, colorScheme: theme })
       const page = await context.newPage(), errors = [], calls = [], sockets = []
+      async function switchTool(value) {
+        const picker = page.locator('.content-header .workspace-tool-compact')
+        await picker.locator('.composer-dropdown-trigger').click()
+        await picker.locator('.composer-dropdown-option', { hasText: value }).click()
+      }
       await page.addInitScript(theme => localStorage.setItem('codex-web-local.dark-mode.v1', theme), theme)
       page.on('pageerror', error => errors.push(error.message))
       page.on('request', request => {
@@ -70,7 +75,7 @@ async function main() {
           await expect(page).toHaveURL(/#\/dsh$/)
         }
         expect(errors).toEqual([])
-        await page.locator('.content-header').getByRole('button', { name: 'Codex', exact: true }).click()
+        await switchTool('Codex')
         await expect(page.locator('.dsh-frame')).toHaveCount(0)
         await expect.poll(() => sockets.every(row => row.closed), { timeout: 10000 }).toBe(true)
         expect(calls.filter(path => path.startsWith('/agent-api/'))).toHaveLength(0)
