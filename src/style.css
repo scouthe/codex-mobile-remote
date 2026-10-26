@@ -2325,6 +2325,8 @@
 .dsh-header-actions .agent-more-menu a { display:block; padding:10px; color:inherit; border-radius:6px; font-size:13px; text-decoration:none; white-space:nowrap; }
 .dsh-header-actions .agent-more-menu button:hover,.dsh-header-actions .agent-more-menu a:hover { background:#f4f4f5; }
 .dsh-native-workspace .content-header.has-center .content-title { display:none; }
+.agent-workspace.dsh-native-workspace .content-header.has-center { min-height:45px; padding-top:env(safe-area-inset-top,0px); padding-bottom:0; row-gap:0; }
+.dsh-native-workspace .content-header.has-center .workspace-tool-compact { padding:1px 3px; }
 .dsh-panel.is-embedded .dsh-loading { inset:0 0 auto; }
 :root.dark .dsh-native-workspace .content-header { border-color:#303139; }
 :root.dark .dsh-header-actions .agent-more-menu button:hover,:root.dark .dsh-header-actions .agent-more-menu a:hover { background:#27272a; }

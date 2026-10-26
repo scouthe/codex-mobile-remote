@@ -83,6 +83,31 @@ backend ACP display data and DSH's original profiles/history remain on disk.
 
 ![Embedded native DSH on mobile](../../output/playwright/dsh-embedded-375-light.png)
 
+## Compact mobile outer header
+
+Prerequisites: the current checkout on 4173 and the existing native DSH bridge. Open `#/dsh`
+at 375x812 in light/dark; also check 768x1024 to confirm the desktop layout remains intact.
+The regular `node scripts/test-workspace-header.cjs` and `node scripts/test-dsh-workspace.cjs`
+commands above exercise the changed controls and real frame. Browser Use is unavailable here,
+so these use Playwright CJS without changing native DSH preferences or sending prompts.
+
+Expected: the mobile outer header is 45 px high when the top safe-area inset is zero (previously
+65 px), the tool picker remains centered and 44 px high, and the More hit area stays 44 px high.
+Top safe-area inset is still honored. The native frame begins at y=45 and gains 20 px of reading
+space. There is no hidden title row, extra vertical gap, overlap or horizontal overflow; desktop
+header sizing stays unchanged. Screenshots: `output/playwright/dsh-embedded-375-{light,dark}.png`
+and `workspace-header-{320,375,768,1280}-{light,dark}-dsh.png`, at `http://127.0.0.1:4173/#/dsh`.
+
+Performance: this is a scoped CSS layout adjustment. It adds no requests, event handlers, timers,
+DOM nodes or iframe remounts; native status loading and connection lifetime remain unchanged.
+The measured mobile header shrank 65 → 45 px, with the iframe top moving by exactly 20 px.
+Physical phone frame timing was not measured. Cleanup is limited to closing the browser contexts;
+rollback by reverting the spacing styles, rebuilding the frontend and restarting 5900.
+
+Verified with the frontend build, both browser scripts and the deployed StarBridge HTTPS page
+at 375x812. Production measured header/frame top 45 px and tool/More controls 44 px; screenshot:
+`output/playwright/dsh-compact-production-mobile.png`. No browser assertion failed in the final runs.
+
 ## Verified Locally (2026-10-25)
 
 - Real original DSH UI loaded through the bridge in all six combinations of 1440×1000, 375×812, 768×1024 and light/dark themes. Outer page errors and horizontal overflows were zero. An original session's history was readable and remained listed after reload. No model prompt was sent.
